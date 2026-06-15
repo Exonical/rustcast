@@ -135,23 +135,63 @@ unsafe impl Send for HwDevice {}
 unsafe impl Sync for HwDevice {}
 
 impl HwDevice {
-    /// Open the default VA-API device (DRI render node chosen by libva).
+    /// Open a VA-API device, targeting a DRM render node explicitly.
+    ///
+    /// libva's default (null device) auto-detection relies on an X11 `DISPLAY`
+    /// and fails on headless / Wayland sessions, and a machine may expose more
+    /// than one render node (e.g. an iGPU + a discrete GPU). So try each
+    /// candidate node in turn and finally fall back to the libva default. The
+    /// candidate list is, in order: `$FLUX_VAAPI_DEVICE` if set, then
+    /// `/dev/dri/renderD128..renderD135`, then null (libva default).
     fn open() -> Result<Self> {
+        let mut last_ret = 0;
+        for device in vaapi_device_candidates() {
+            match Self::open_device(device.as_deref()) {
+                Ok(dev) => {
+                    match device {
+                        Some(path) => tracing::info!(device = %path, "opened VA-API device"),
+                        None => tracing::info!("opened VA-API device (libva default)"),
+                    }
+                    return Ok(dev);
+                }
+                Err(ret) => {
+                    tracing::debug!(
+                        device = device.as_deref().unwrap_or("<default>"),
+                        ret,
+                        "VA-API device open failed, trying next candidate"
+                    );
+                    last_ret = ret;
+                }
+            }
+        }
+        Err(FluxError::EncoderInit(format!(
+            "failed to create VA-API device context for any DRM render node \
+             (av_hwdevice_ctx_create returned {last_ret}); is a VA-API driver \
+             installed? (mesa-va-drivers / vainfo)"
+        )))
+    }
+
+    /// Try to open one VA-API device by path (or the libva default when
+    /// `device` is `None`). Returns the libav error code on failure.
+    fn open_device(device: Option<&str>) -> std::result::Result<Self, c_int> {
+        let c_device = device.and_then(|d| std::ffi::CString::new(d).ok());
+        let device_ptr = c_device
+            .as_ref()
+            .map_or(ptr::null(), |s| s.as_ptr());
         let mut ptr: *mut ff::ffi::AVBufferRef = ptr::null_mut();
-        // SAFETY: out-pointer is valid; null device/options select the default.
+        // SAFETY: out-pointer is valid; `device_ptr` is either null or a valid
+        // NUL-terminated string that outlives this call.
         let ret = unsafe {
             ff::ffi::av_hwdevice_ctx_create(
                 &mut ptr,
                 ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                ptr::null(),
+                device_ptr,
                 ptr::null_mut(),
                 0,
             )
         };
         if ret < 0 || ptr.is_null() {
-            return Err(FluxError::EncoderInit(format!(
-                "failed to create VA-API device context (av_hwdevice_ctx_create returned {ret})"
-            )));
+            return Err(ret);
         }
         Ok(Self(ptr))
     }
@@ -169,6 +209,27 @@ impl Drop for HwDevice {
         // SAFETY: `self.0` was obtained from `av_hwdevice_ctx_create`/`av_buffer_ref`.
         unsafe { ff::ffi::av_buffer_unref(&mut self.0) };
     }
+}
+
+/// VA-API device paths to try opening, in priority order. `None` is the libva
+/// default (no explicit device), tried last as a fallback.
+fn vaapi_device_candidates() -> Vec<Option<String>> {
+    let mut candidates = Vec::new();
+    if let Ok(dev) = std::env::var("FLUX_VAAPI_DEVICE") {
+        if !dev.is_empty() {
+            candidates.push(Some(dev));
+        }
+    }
+    // DRM render nodes are numbered from 128. Probe the low range; a host
+    // typically has one or two GPUs (renderD128/129).
+    for node in 128..=135 {
+        let path = format!("/dev/dri/renderD{node}");
+        if std::path::Path::new(&path).exists() {
+            candidates.push(Some(path));
+        }
+    }
+    candidates.push(None);
+    candidates
 }
 
 /// RAII owner of a VA-API hardware frame pool (`AVBufferRef*`).
