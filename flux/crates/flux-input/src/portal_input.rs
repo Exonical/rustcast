@@ -239,8 +239,13 @@ async fn forward_commands(
                     .notify_pointer_button(session, button, key_state(down))
                     .await
             }
-            // `finish = true` marks each scroll a self-contained event.
-            Cmd::Axis { dx, dy } => remote_desktop.notify_pointer_axis(session, dx, dy, true).await,
+            // The portal spec expects the deltas to be 0 when `finish` is set,
+            // so deliver the motion with `finish = false` and then a terminating
+            // `(0, 0, finish = true)` to close the scroll sequence.
+            Cmd::Axis { dx, dy } => match remote_desktop.notify_pointer_axis(session, dx, dy, false).await {
+                Ok(()) => remote_desktop.notify_pointer_axis(session, 0.0, 0.0, true).await,
+                Err(e) => Err(e),
+            },
             Cmd::Key { keycode, down } => {
                 remote_desktop
                     .notify_keyboard_keycode(session, keycode, key_state(down))

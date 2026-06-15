@@ -108,7 +108,10 @@ mod tests {
 
     #[test]
     fn noop_backend_accepts_all_events() {
-        let be = select_input_backend(InputBackendKind::Portal);
+        // Construct directly rather than via `select_input_backend`: with the
+        // `input-portal` feature that selector would negotiate a real portal
+        // session (blocking on a consent dialog) for `Portal`.
+        let be: Box<dyn InputBackend> = Box::new(NoopInputBackend::new(InputBackendKind::Portal));
         assert_eq!(be.name(), "noop");
         assert!(be.supports_absolute());
         be.pointer_motion(1.0, -2.0).unwrap();
