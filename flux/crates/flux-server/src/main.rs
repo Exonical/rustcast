@@ -394,7 +394,9 @@ fn build_encode_session_for(
         rate_control: flux_core::types::RateControlMode::Cbr,
         dynamic_range: flux_core::types::DynamicRange::Sdr,
         chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
-        gop_size: 0,
+        // Emit a keyframe every ~2s so a late joiner or any decode desync
+        // recovers on its own without depending solely on a PLI/IDR request.
+        gop_size: target_fps.saturating_mul(2).max(1),
         b_frames: 0,
         max_ref_frames: 1,
     };

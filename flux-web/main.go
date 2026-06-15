@@ -125,8 +125,20 @@ func readFrames(conn net.Conn) error {
 // ---------------------------------------------------------------------------
 
 func framePusher() {
-	frameDuration := time.Millisecond * 22 // ~45fps actual capture rate
-	var sampleCount uint64
+	// The capture source (e.g. a Wayland/mutter screen-cast) delivers frames at
+	// a variable, damage-driven rate, not a fixed cadence. Drive the RTP
+	// timestamp from the measured wall-clock gap between frames so the
+	// browser's playout clock tracks real arrival time; a fixed duration makes
+	// the receiver run ahead and stall/freeze when the real rate dips.
+	const (
+		defaultFrameDuration = 16 * time.Millisecond  // ~60fps for the first sample
+		minFrameDuration     = 4 * time.Millisecond   // clamp absurdly fast bursts
+		maxFrameDuration     = 500 * time.Millisecond // clamp long idle gaps
+	)
+	var (
+		sampleCount uint64
+		lastSample  time.Time
+	)
 
 	for frame := range frameChan {
 		idr := isIDRFrame(frame)
@@ -138,6 +150,18 @@ func framePusher() {
 		if sess == nil || sess.VideoTrack == nil {
 			continue
 		}
+
+		now := time.Now()
+		frameDuration := defaultFrameDuration
+		if !lastSample.IsZero() {
+			frameDuration = now.Sub(lastSample)
+			if frameDuration < minFrameDuration {
+				frameDuration = minFrameDuration
+			} else if frameDuration > maxFrameDuration {
+				frameDuration = maxFrameDuration
+			}
+		}
+		lastSample = now
 
 		sampleCount++
 
