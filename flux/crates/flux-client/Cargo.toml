@@ -1,0 +1,23 @@
+[package]
+name = "flux-client"
+description = "Flux remote streaming client (viewer) — connects to a Flux server, decodes, and renders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flux-client"
+path = "src/main.rs"
+
+[dependencies]
+flux-core = { workspace = true }
+flux-transport = { workspace = true }
+flux-crypto = { workspace = true }
+flux-protocol = { workspace = true }
+flux-input = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }

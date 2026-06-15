@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flux-core",
+    "crates/flux-capture",
+    "crates/flux-encode",
+    "crates/flux-audio",
+    "crates/flux-input",
+    "crates/flux-transport",
+    "crates/flux-crypto",
+    "crates/flux-protocol",
+    "crates/flux-server",
+    "crates/flux-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/flux"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal crates
+flux-core = { path = "crates/flux-core" }
+flux-capture = { path = "crates/flux-capture" }
+flux-encode = { path = "crates/flux-encode" }
+flux-audio = { path = "crates/flux-audio" }
+flux-input = { path = "crates/flux-input" }
+flux-transport = { path = "crates/flux-transport" }
+flux-crypto = { path = "crates/flux-crypto" }
+flux-protocol = { path = "crates/flux-protocol" }
+
+# Async runtime
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+futures = "0.3.31"
+async-trait = "0.1.89"
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.8"
+
+# Logging / tracing
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0.18"
+anyhow = "1.0.101"
+
+# CLI
+clap = { version = "4.5.58", features = ["derive"] }
+
+# Byte manipulation
+bytes = "1.11"
+byteorder = "1.5.0"
+
+# GPU / Vulkan
+ash = "0.38.0"
+
+# Crypto
+ring = "0.17.14"
+aes-gcm = "0.10"
+rcgen = "0.14"
+rustls = { version = "0.23.27", default-features = false, features = ["ring"] }
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18"
+
+# Networking
+quinn = "0.11.9"
+
+# Windows platform
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_LibraryLoader",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# System tray
+tray-icon = "0.21"
+muda = "0.17"
+image = { version = "0.25.9", default-features = false, features = ["png", "jpeg"] }
+
+# HTTP server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Misc
+uuid = { version = "1.21", features = ["v4", "serde"] }
+bitflags = { version = "2.11", features = ["serde"] }
+parking_lot = "0.12.5"
+crossbeam-channel = "0.5.15"

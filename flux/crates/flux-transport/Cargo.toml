@@ -1,0 +1,17 @@
+[package]
+name = "flux-transport"
+description = "Network transport layer for Flux: RTP packetization, FEC error correction, QUIC tunneling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+parking_lot = { workspace = true }

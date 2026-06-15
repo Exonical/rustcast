@@ -1,0 +1,16 @@
+[package]
+name = "flux-input"
+description = "Input forwarding for Flux: keyboard, mouse, and gamepad events across platforms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+bitflags = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }

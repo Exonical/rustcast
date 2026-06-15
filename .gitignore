@@ -1,0 +1,54 @@
+# ───────────────────────────────────────────────
+# rustcast — only flux/ and flux-web/ are tracked
+# ───────────────────────────────────────────────
+
+# Vendored / third-party projects (not part of rustcast)
+/AMF/
+/Sunshine/
+/obs-studio/
+/kvm/
+/moonshine/
+
+# ── Rust ──
+target/
+**/*.rs.bk
+*.pdb
+
+# ── Node / Next.js ──
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+
+# ── Go ──
+*.exe
+*.test
+*.out
+
+# ── Binaries / build artifacts ──
+*.dll
+*.so
+*.dylib
+*.o
+*.d
+
+# ── Test / capture artifacts ──
+*.h264
+flux/~/
+
+# ── Secrets / config ──
+*.pem
+*.key
+*.cert
+flux.toml
+.env*
+
+# ── IDE / OS ──
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

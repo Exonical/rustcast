@@ -1,0 +1,14 @@
+[package]
+name = "flux-protocol"
+description = "Wire protocol definitions and session negotiation for Flux remote streaming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

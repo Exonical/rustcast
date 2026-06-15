@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.d
+*.o
+
+# Config files with secrets
+*.pem
+*.key
+*.cert
+flux.toml

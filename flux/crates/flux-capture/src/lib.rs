@@ -1,0 +1,39 @@
+pub mod backend;
+pub mod traits;
+
+pub use traits::{CaptureSession, ScreenCapture};
+
+use flux_core::error::Result;
+use flux_core::types::CaptureBackend;
+
+/// Create the best available capture backend for this platform.
+pub fn create_capture(backend: Option<CaptureBackend>) -> Result<Box<dyn ScreenCapture>> {
+    let backend = backend.unwrap_or_else(default_backend);
+
+    tracing::info!("Initializing capture backend: {:?}", backend);
+
+    match backend {
+        #[cfg(target_os = "windows")]
+        CaptureBackend::Dxgi => Ok(Box::new(backend::dxgi::DxgiCapture::new()?)),
+
+        #[cfg(target_os = "linux")]
+        CaptureBackend::PipeWire => Ok(Box::new(backend::pipewire::PipeWireCapture::new()?)),
+
+        #[cfg(target_os = "linux")]
+        CaptureBackend::Drm => Ok(Box::new(backend::drm::DrmCapture::new()?)),
+
+        #[allow(unreachable_patterns)]
+        _other => Err(flux_core::FluxError::NoCaptureBackend),
+    }
+}
+
+fn default_backend() -> CaptureBackend {
+    #[cfg(target_os = "windows")]
+    {
+        CaptureBackend::Dxgi
+    }
+    #[cfg(target_os = "linux")]
+    {
+        CaptureBackend::PipeWire
+    }
+}

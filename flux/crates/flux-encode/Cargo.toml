@@ -1,0 +1,18 @@
+[package]
+name = "flux-encode"
+description = "GPU-accelerated video encoding backends for Flux: NVENC, AMF, VA-API, Vulkan Video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ash = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+windows = { workspace = true }

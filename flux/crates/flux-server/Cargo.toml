@@ -1,0 +1,32 @@
+[package]
+name = "flux-server"
+description = "Flux remote streaming server (host) — captures, encodes, and streams the desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flux-server"
+path = "src/main.rs"
+
+[dependencies]
+flux-core = { workspace = true }
+flux-capture = { workspace = true }
+flux-encode = { workspace = true }
+flux-audio = { workspace = true }
+flux-input = { workspace = true }
+flux-transport = { workspace = true }
+flux-crypto = { workspace = true }
+flux-protocol = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde_json = { workspace = true }
+tray-icon = { workspace = true }
+muda = { workspace = true }
