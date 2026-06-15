@@ -23,8 +23,8 @@ pub use pipewire_source::PipewireStreamSource;
 pub use portal::XdgPortalSession;
 #[cfg(unix)]
 pub use session::{
-    BufferKind, CursorMode, FormatPrefs, NegotiatedFormat, PipewireFrameSource, PortalGrant, PortalOptions,
-    PortalSession, PortalStream, SourceKind,
+    select_stream, BufferKind, CursorMode, FormatPrefs, NegotiatedFormat, PipewireFrameSource, PortalGrant,
+    PortalOptions, PortalSession, PortalStream, SourceKind,
 };
 pub use traits::{CaptureSession, ScreenCapture};
 
