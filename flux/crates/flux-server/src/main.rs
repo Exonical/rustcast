@@ -147,7 +147,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
-    let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<Vec<u8>>>(8);
+    // Each message carries the frame's capture timestamp (microseconds since
+    // capture start) so downstream playout can pace by true capture spacing
+    // rather than bursty network arrival time.
+    let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(8);
     let h264_tx2 = h264_tx.clone();
 
     // IDR request channel: Frame server (TCP) -> Capture thread
@@ -200,11 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// TCP frame server: accepts connections and streams length-prefixed H.264 NALUs.
-/// Protocol: [4-byte big-endian length][H.264 data] per packet.
+/// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
+/// Protocol: [8-byte BE capture-timestamp µs][4-byte BE length][H.264 data] per packet.
 async fn frame_server(
     listener: tokio::net::TcpListener,
-    h264_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
@@ -291,7 +294,7 @@ async fn frame_server(
             });
 
             loop {
-                let data = match rx.recv().await {
+                let msg = match rx.recv().await {
                     Ok(d) => d,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Frame client {} lagged by {} frames", addr, n);
@@ -299,17 +302,22 @@ async fn frame_server(
                     }
                     Err(_) => break,
                 };
+                let (ts_micros, data) = (msg.0, &msg.1);
 
                 if data.is_empty() {
                     continue;
                 }
 
-                // Write length-prefixed frame: [4-byte BE len][data]
+                // Write timestamped frame: [8-byte BE ts µs][4-byte BE len][data]
+                let ts_bytes = ts_micros.to_be_bytes();
                 let len_bytes = (data.len() as u32).to_be_bytes();
+                if writer.write_all(&ts_bytes).await.is_err() {
+                    break;
+                }
                 if writer.write_all(&len_bytes).await.is_err() {
                     break;
                 }
-                if writer.write_all(&data).await.is_err() {
+                if writer.write_all(data).await.is_err() {
                     break;
                 }
                 frames_sent += 1;
@@ -418,7 +426,7 @@ fn build_encode_session_for(
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 fn capture_loop(
-    h264_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
@@ -543,6 +551,10 @@ fn capture_loop(
 
         // ── Hardware H.264 encode ───────────────────────────────────
         let t1 = std::time::Instant::now();
+        let ts_micros = frame
+            .timestamp
+            .saturating_duration_since(loop_start)
+            .as_micros() as u64;
         if let Some(ref mut enc) = encode_session {
             match enc.encode(&frame) {
                 Ok(packets) => {
@@ -563,7 +575,7 @@ fn capture_loop(
                             );
                         }
 
-                        let _ = h264_tx.send(Arc::new(pkt.data.clone()));
+                        let _ = h264_tx.send(Arc::new((ts_micros, pkt.data.clone())));
                     }
                 }
                 Err(e) => {

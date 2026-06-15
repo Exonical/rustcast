@@ -28,7 +28,7 @@ var (
 	currentSessionMu sync.Mutex
 
 	// Latest H.264 frame from the Rust capture server
-	frameChan = make(chan []byte, 120)
+	frameChan = make(chan frameMsg, 120)
 
 	// Command channel to send requests to the Rust server
 	upstreamCommandChan = make(chan []byte, 100)
@@ -44,6 +44,15 @@ type Session struct {
 // ---------------------------------------------------------------------------
 // TCP frame reader — connects to flux-server's frame server
 // ---------------------------------------------------------------------------
+
+// frameMsg is one encoded H.264 access unit plus the capture timestamp
+// (microseconds since capture start) reported by the Rust server. The
+// timestamp lets the pusher pace playout by true capture spacing instead of
+// bursty network arrival time.
+type frameMsg struct {
+	tsMicros uint64
+	data     []byte
+}
 
 func connectFrameServer(addr string) {
 	for {
@@ -85,12 +94,13 @@ func connectFrameServer(addr string) {
 func readFrames(conn net.Conn) error {
 	var frameCount uint64
 	for {
-		// Read 4-byte big-endian length prefix
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-			return fmt.Errorf("read length: %w", err)
+		// Protocol: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
+		var hdr [12]byte
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			return fmt.Errorf("read header: %w", err)
 		}
-		frameLen := binary.BigEndian.Uint32(lenBuf[:])
+		tsMicros := binary.BigEndian.Uint64(hdr[0:8])
+		frameLen := binary.BigEndian.Uint32(hdr[8:12])
 		if frameLen == 0 || frameLen > 10*1024*1024 {
 			return fmt.Errorf("invalid frame length: %d", frameLen)
 		}
@@ -106,16 +116,17 @@ func readFrames(conn net.Conn) error {
 			log.Printf("[frame] received %d frames (last=%d bytes)", frameCount, frameLen)
 		}
 
+		msg := frameMsg{tsMicros: tsMicros, data: data}
 		// Non-blocking send to frameChan
 		select {
-		case frameChan <- data:
+		case frameChan <- msg:
 		default:
 			// Drop oldest frame if channel is full
 			select {
 			case <-frameChan:
 			default:
 			}
-			frameChan <- data
+			frameChan <- msg
 		}
 	}
 }
@@ -126,10 +137,11 @@ func readFrames(conn net.Conn) error {
 
 func framePusher() {
 	// The capture source (e.g. a Wayland/mutter screen-cast) delivers frames at
-	// a variable, damage-driven rate, not a fixed cadence. Drive the RTP
-	// timestamp from the measured wall-clock gap between frames so the
-	// browser's playout clock tracks real arrival time; a fixed duration makes
-	// the receiver run ahead and stall/freeze when the real rate dips.
+	// a variable, damage-driven rate and the server drains backlogs in bursts,
+	// so network arrival time is a poor clock. Pace the RTP timestamp by the
+	// frame's capture timestamp (reported by the server) instead, so the
+	// browser's jitter buffer can absorb bursts and play at true capture
+	// cadence rather than running ahead and stalling.
 	const (
 		defaultFrameDuration = 16 * time.Millisecond  // ~60fps for the first sample
 		minFrameDuration     = 4 * time.Millisecond   // clamp absurdly fast bursts
@@ -137,11 +149,12 @@ func framePusher() {
 	)
 	var (
 		sampleCount uint64
-		lastSample  time.Time
+		lastTs      uint64
+		haveLastTs  bool
 	)
 
-	for frame := range frameChan {
-		idr := isIDRFrame(frame)
+	for msg := range frameChan {
+		idr := isIDRFrame(msg.data)
 
 		currentSessionMu.Lock()
 		sess := currentSession
@@ -151,18 +164,6 @@ func framePusher() {
 			continue
 		}
 
-		now := time.Now()
-		frameDuration := defaultFrameDuration
-		if !lastSample.IsZero() {
-			frameDuration = now.Sub(lastSample)
-			if frameDuration < minFrameDuration {
-				frameDuration = minFrameDuration
-			} else if frameDuration > maxFrameDuration {
-				frameDuration = maxFrameDuration
-			}
-		}
-		lastSample = now
-
 		sampleCount++
 
 		// New session: skip P-frames until the next live IDR arrives.
@@ -171,18 +172,33 @@ func framePusher() {
 			if !idr {
 				continue
 			}
-			log.Printf("[webrtc] live IDR arrived (%d bytes), starting stream for new session", len(frame))
+			log.Printf("[webrtc] live IDR arrived (%d bytes), starting stream for new session", len(msg.data))
 			sess.needsIDR = false
 		}
 
+		// Duration = capture-time gap since the previous sent sample. The
+		// server timestamp resets on reconnect, so guard against going
+		// backwards and fall back to the nominal duration.
+		frameDuration := defaultFrameDuration
+		if haveLastTs && msg.tsMicros > lastTs {
+			frameDuration = time.Duration(msg.tsMicros-lastTs) * time.Microsecond
+			if frameDuration < minFrameDuration {
+				frameDuration = minFrameDuration
+			} else if frameDuration > maxFrameDuration {
+				frameDuration = maxFrameDuration
+			}
+		}
+		lastTs = msg.tsMicros
+		haveLastTs = true
+
 		// Log first few frames and IDRs for diagnostics
 		if sampleCount <= 5 || (idr && sampleCount > 5) {
-			naluTypes := describeNALUs(frame)
-			log.Printf("[webrtc] sample #%d: %d bytes, NALUs: %s", sampleCount, len(frame), naluTypes)
+			naluTypes := describeNALUs(msg.data)
+			log.Printf("[webrtc] sample #%d: %d bytes, NALUs: %s", sampleCount, len(msg.data), naluTypes)
 		}
 
 		err := sess.VideoTrack.WriteSample(media.Sample{
-			Data:     frame,
+			Data:     msg.data,
 			Duration: frameDuration,
 		})
 		if err != nil {
