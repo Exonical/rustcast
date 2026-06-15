@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+#[cfg(feature = "tray")]
 use parking_lot::RwLock;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -10,11 +11,13 @@ use tracing_subscriber::EnvFilter;
 mod http;
 mod pipeline;
 mod session;
+#[cfg(feature = "tray")]
 mod tray;
 
 use flux_core::config::FluxConfig;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
+#[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
 #[derive(Parser, Debug)]
@@ -89,55 +92,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("paired_clients.json");
     let _ = authenticator.load_paired_clients(&paired_clients_path);
 
-    // Initialize tray state.
-    let tray_state = Arc::new(RwLock::new(TrayState {
-        active_sessions: 0,
-        server_name: config.name.clone(),
-        bind_address: format!("{}:{}", config.bind_address, config.server.signaling_port),
-    }));
-
-    // Spawn system tray on a dedicated OS thread (requires main-thread message pump on Windows).
-    let tray_state_clone = tray_state.clone();
-    let (tray_quit_tx, mut tray_quit_rx) = tokio::sync::oneshot::channel::<()>();
-    let _tray_handle = std::thread::Builder::new()
-        .name("flux-tray".into())
-        .spawn(move || {
-            match FluxTray::new(tray_state_clone) {
-                Ok(tray) => {
-                    tracing::info!("System tray initialized");
-                    // Simple event loop — poll tray events
-                    loop {
-                        if let Some(action) = tray.poll_event() {
-                            match action {
-                                TrayAction::ShowPin => {
-                                    tracing::info!("Tray: Show PIN requested");
-                                    // TODO: Generate and display PIN
-                                }
-                                TrayAction::OpenConfig => {
-                                    tracing::info!("Tray: Open config requested");
-                                    // TODO: Open config file in default editor
-                                }
-                                TrayAction::Quit => {
-                                    tracing::info!("Tray: Quit requested");
-                                    let _ = tray_quit_tx.send(());
-                                    return;
-                                }
-                                TrayAction::ShowStatus => {
-                                    tray.update_state();
+    // Spawn the system tray on a dedicated OS thread (requires a main-thread
+    // message pump on Windows). Gated behind the `tray` feature so a headless /
+    // Wayland-pure build needs no GTK/X11 (`libxdo`) libraries.
+    #[cfg(feature = "tray")]
+    let mut tray_quit_rx = {
+        let tray_state = Arc::new(RwLock::new(TrayState {
+            active_sessions: 0,
+            server_name: config.name.clone(),
+            bind_address: format!("{}:{}", config.bind_address, config.server.signaling_port),
+        }));
+        let (tray_quit_tx, tray_quit_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("flux-tray".into())
+            .spawn(move || {
+                match FluxTray::new(tray_state) {
+                    Ok(tray) => {
+                        tracing::info!("System tray initialized");
+                        // Simple event loop — poll tray events
+                        loop {
+                            if let Some(action) = tray.poll_event() {
+                                match action {
+                                    TrayAction::ShowPin => {
+                                        tracing::info!("Tray: Show PIN requested");
+                                        // TODO: Generate and display PIN
+                                    }
+                                    TrayAction::OpenConfig => {
+                                        tracing::info!("Tray: Open config requested");
+                                        // TODO: Open config file in default editor
+                                    }
+                                    TrayAction::Quit => {
+                                        tracing::info!("Tray: Quit requested");
+                                        let _ = tray_quit_tx.send(());
+                                        return;
+                                    }
+                                    TrayAction::ShowStatus => {
+                                        tray.update_state();
+                                    }
                                 }
                             }
+                            tray.update_state();
+                            std::thread::sleep(std::time::Duration::from_millis(100));
                         }
-                        tray.update_state();
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create system tray: {}. Server will run without tray.", e);
+                        // Block until quit signal
+                        std::thread::park();
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to create system tray: {}. Server will run without tray.", e);
-                    // Block until quit signal
-                    std::thread::park();
-                }
-            }
-        })?;
+            })?;
+        tray_quit_rx
+    };
 
     // ── Start DXGI capture → AMF H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
@@ -172,7 +178,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Flux Server is ready and waiting for connections.");
 
-    // Wait for shutdown signal (Ctrl+C or tray quit).
+    // Wait for shutdown signal (Ctrl+C or, with the tray, its Quit item).
+    #[cfg(feature = "tray")]
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");
@@ -180,6 +187,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = &mut tray_quit_rx => {
             tracing::info!("Quit requested from system tray, shutting down...");
         }
+    }
+    #[cfg(not(feature = "tray"))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl+C, shutting down...");
     }
 
     frame_handle.abort();
