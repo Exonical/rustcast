@@ -1,0 +1,734 @@
+//! Real FFmpeg (libavcodec) VA-API encoder.
+//!
+//! Drives the `h264_vaapi` / `hevc_vaapi` encoders through `ffmpeg-next`,
+//! complementing the cros-codecs H.264 backend by adding HEVC (and HDR10 via
+//! HEVC Main10). libavcodec handles all bitstream synthesis (VPS/SPS/PPS, slice
+//! headers, HRD), so this backend focuses on hardware setup + frame upload.
+//!
+//! Like the cros-codecs path, an `AVCodecContext` is `!Send`, so the whole
+//! encode pipeline runs on one dedicated thread and the public
+//! [`EncodeSession`] talks to it over channels.
+//!
+//! Frame flow (CPU-upload path, mirroring the Phase 2 SHM approach):
+//!
+//! ```text
+//! CapturedFrame (BGRA/RGBA) ──swscale──▶ sw NV12/P010 AVFrame
+//!                            ──av_hwframe_transfer_data──▶ VA-API surface
+//!                            ──send_frame/receive_packet──▶ Annex-B / HEVC NAL
+//! ```
+//!
+//! Zero-copy DMA-BUF import (binding a PipeWire DMA-BUF directly as a VA-API
+//! surface) is a later slice; CPU frames are colour-converted and uploaded.
+//! The live hardware path requires an AMD/Intel VA-API driver and is validated
+//! on real hardware (like the Phase 1/2 portal/VA paths), not in unit tests —
+//! the pure config-mapping helpers below are unit-tested.
+
+use std::ffi::c_int;
+use std::ptr;
+use std::thread::{self, JoinHandle};
+
+use crossbeam_channel::{bounded, unbounded, Sender};
+use ff::format::Pixel;
+use ff::util::error::EAGAIN;
+use ff::Error as FfError;
+use ffmpeg_next as ff;
+
+use flux_core::error::{FluxError, Result};
+use flux_core::frame::{CapturedFrame, EncodedPacket};
+use flux_core::types::{DynamicRange, PixelFormat, Resolution, VideoCodec};
+
+use crate::traits::{EncodeConfig, EncodeSession, EncoderCapabilities, VideoEncoder};
+
+/// VA-API surfaces kept in the encoder's hardware frame pool.
+const HW_POOL_SIZE: i32 = 20;
+
+// ───────────────────────── pure config mapping ─────────────────────────
+
+/// libavcodec encoder name for a codec on the VA-API hwaccel, or `None` when
+/// this backend does not drive the codec (AV1 has no broadly-available
+/// `av1_vaapi` encoder yet, so it is left to other backends).
+fn encoder_name(codec: VideoCodec) -> Option<&'static str> {
+    match codec {
+        VideoCodec::H264 => Some("h264_vaapi"),
+        VideoCodec::H265 => Some("hevc_vaapi"),
+        VideoCodec::Av1 => None,
+    }
+}
+
+/// The libavutil pixel format a [`CapturedFrame`] is presented as to swscale.
+fn source_pixel_format(format: PixelFormat) -> Option<Pixel> {
+    match format {
+        PixelFormat::Bgra8 => Some(Pixel::BGRA),
+        PixelFormat::Rgba8 => Some(Pixel::RGBA),
+        // NV12/I420/P010 inputs aren't wired through the FFmpeg upload path yet
+        // (the cros-codecs backend handles already-YUV SHM frames); the live
+        // PipeWire RGB capture path produces packed BGRA/RGBA.
+        PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => None,
+    }
+}
+
+/// The software (CPU-side) pixel format uploaded into the VA-API surface pool:
+/// 8-bit NV12 for SDR, 10-bit P010 for HDR10.
+fn surface_sw_format(range: DynamicRange) -> Pixel {
+    match range {
+        DynamicRange::Sdr => Pixel::NV12,
+        DynamicRange::Hdr10 => Pixel::P010LE,
+    }
+}
+
+/// Resolve the GOP length passed to libavcodec. The config uses `0` to mean an
+/// "infinite" GOP (IDR frames requested explicitly); libavcodec wants a finite
+/// number, so map it to a large interval while still allowing periodic IDRs.
+fn effective_gop(gop_size: u32) -> u32 {
+    if gop_size == 0 {
+        i32::MAX as u32
+    } else {
+        gop_size
+    }
+}
+
+/// Low-latency private options handed to the VA-API encoder at open time.
+///
+/// `rc_mode` selects the rate-control algorithm; `async_depth=1` keeps the
+/// driver from queuing extra frames (lower latency at a small throughput cost).
+fn low_latency_options(config: &EncodeConfig) -> Vec<(&'static str, String)> {
+    use flux_core::types::RateControlMode;
+    let rc_mode = match config.rate_control {
+        RateControlMode::Cbr => "CBR",
+        RateControlMode::Vbr => "VBR",
+        RateControlMode::Cqp => "CQP",
+    };
+    vec![("rc_mode", rc_mode.to_string()), ("async_depth", "1".to_string())]
+}
+
+/// Reject configurations this backend cannot drive before touching hardware.
+fn validate(config: &EncodeConfig) -> Result<()> {
+    if encoder_name(config.codec).is_none() {
+        return Err(FluxError::EncoderInit(format!(
+            "FFmpeg VA-API backend does not encode {:?} (no VA-API encoder)",
+            config.codec
+        )));
+    }
+    if config.dynamic_range == DynamicRange::Hdr10 && config.codec != VideoCodec::H265 {
+        return Err(FluxError::EncoderInit(
+            "HDR10 encode requires HEVC (Main10) on the FFmpeg VA-API backend".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ───────────────────────────── encoder ─────────────────────────────
+
+/// A refcounted VA-API hardware device context (`AVBufferRef*`).
+///
+/// libavutil hardware device contexts are reference-counted and safe to share
+/// across threads, so the raw pointer is `Send`; each session takes its own ref
+/// and runs on the encode thread.
+struct HwDevice(*mut ff::ffi::AVBufferRef);
+
+// SAFETY: an `AVBufferRef` to an `AVHWDeviceContext` is internally refcounted;
+// `av_buffer_ref`/`av_buffer_unref` are thread-safe and the context is only
+// used to derive frame pools, never mutated through this pointer.
+unsafe impl Send for HwDevice {}
+// SAFETY: the only `&self` operation is `new_ref` (atomic `av_buffer_ref`), so
+// sharing a reference across threads is sound.
+unsafe impl Sync for HwDevice {}
+
+impl HwDevice {
+    /// Open the default VA-API device (DRI render node chosen by libva).
+    fn open() -> Result<Self> {
+        let mut ptr: *mut ff::ffi::AVBufferRef = ptr::null_mut();
+        // SAFETY: out-pointer is valid; null device/options select the default.
+        let ret = unsafe {
+            ff::ffi::av_hwdevice_ctx_create(
+                &mut ptr,
+                ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if ret < 0 || ptr.is_null() {
+            return Err(FluxError::EncoderInit(format!(
+                "failed to create VA-API device context (av_hwdevice_ctx_create returned {ret})"
+            )));
+        }
+        Ok(Self(ptr))
+    }
+
+    /// Take a new owned reference to the same underlying device context.
+    fn new_ref(&self) -> Self {
+        // SAFETY: `self.0` is a valid `AVBufferRef`; `av_buffer_ref` returns a
+        // new ref to the same buffer.
+        Self(unsafe { ff::ffi::av_buffer_ref(self.0) })
+    }
+}
+
+impl Drop for HwDevice {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was obtained from `av_hwdevice_ctx_create`/`av_buffer_ref`.
+        unsafe { ff::ffi::av_buffer_unref(&mut self.0) };
+    }
+}
+
+/// FFmpeg VA-API hardware encoder (Linux, AMD/Intel via Mesa/iHD).
+pub struct FfmpegVaapiEncoder {
+    capabilities: EncoderCapabilities,
+    device: HwDevice,
+}
+
+impl FfmpegVaapiEncoder {
+    pub fn new() -> Result<Self> {
+        ff::init().map_err(|e| FluxError::EncoderInit(format!("ffmpeg init failed: {e}")))?;
+        tracing::info!("Initializing FFmpeg VA-API encoder");
+
+        let device = HwDevice::open()?;
+
+        let mut supported = Vec::new();
+        if ff::encoder::find_by_name("h264_vaapi").is_some() {
+            supported.push(VideoCodec::H264);
+        }
+        let h265 = ff::encoder::find_by_name("hevc_vaapi").is_some();
+        if h265 {
+            supported.push(VideoCodec::H265);
+        }
+        if supported.is_empty() {
+            return Err(FluxError::EncoderInit(
+                "FFmpeg build exposes no VA-API video encoder (need h264_vaapi/hevc_vaapi)".into(),
+            ));
+        }
+
+        let capabilities = EncoderCapabilities {
+            name: "ffmpeg-vaapi",
+            supported_codecs: supported.clone(),
+            // HDR10 (HEVC Main10) rides on the HEVC VA-API encoder.
+            supports_hdr: h265,
+            supports_yuv444: false,
+            max_resolution: Resolution::new(7680, 4320),
+            max_framerate: 240,
+        };
+        tracing::info!(codecs = ?capabilities.supported_codecs, "FFmpeg VA-API encoder ready");
+        Ok(Self { capabilities, device })
+    }
+}
+
+impl VideoEncoder for FfmpegVaapiEncoder {
+    fn name(&self) -> &'static str {
+        "ffmpeg-vaapi"
+    }
+
+    fn capabilities(&self) -> Result<EncoderCapabilities> {
+        Ok(self.capabilities.clone())
+    }
+
+    fn validate_config(&self, config: &EncodeConfig) -> Result<()> {
+        validate(config)?;
+        if !self.capabilities.supported_codecs.contains(&config.codec) {
+            return Err(FluxError::EncoderInit(format!(
+                "FFmpeg build has no VA-API encoder for {:?}",
+                config.codec
+            )));
+        }
+        let max = self.capabilities.max_resolution;
+        if config.resolution.width > max.width || config.resolution.height > max.height {
+            return Err(FluxError::EncoderInit(format!(
+                "resolution {} exceeds FFmpeg VA-API maximum {}",
+                config.resolution, max
+            )));
+        }
+        Ok(())
+    }
+
+    fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        self.validate_config(&config)?;
+        Ok(Box::new(FfmpegSession::spawn(config, self.device.new_ref())?))
+    }
+}
+
+// ───────────────────────────── session ─────────────────────────────
+
+enum Cmd {
+    Encode {
+        frame: Box<CapturedFrame>,
+        reply: Sender<Result<Vec<EncodedPacket>>>,
+    },
+    RequestIdr,
+    SetBitrate(u32),
+    Flush {
+        reply: Sender<Result<Vec<EncodedPacket>>>,
+    },
+    Stop,
+}
+
+/// Handle to an FFmpeg VA-API encode session running on its own thread.
+pub struct FfmpegSession {
+    tx: Sender<Cmd>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl FfmpegSession {
+    fn spawn(config: EncodeConfig, device: HwDevice) -> Result<Self> {
+        let (tx, rx) = unbounded::<Cmd>();
+        let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
+
+        let handle = thread::Builder::new()
+            .name("flux-ffmpeg-encode".into())
+            .spawn(move || run_encode_thread(config, device, rx, ready_tx))
+            .map_err(|e| FluxError::EncoderInit(format!("failed to spawn encode thread: {e}")))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                handle: Some(handle),
+            }),
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(FluxError::EncoderInit(
+                    "encode thread exited before signalling readiness".into(),
+                ))
+            }
+        }
+    }
+
+    fn request(&self, make: impl FnOnce(Sender<Result<Vec<EncodedPacket>>>) -> Cmd) -> Result<Vec<EncodedPacket>> {
+        let (reply_tx, reply_rx) = bounded::<Result<Vec<EncodedPacket>>>(1);
+        self.tx
+            .send(make(reply_tx))
+            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| FluxError::EncoderInit("encode thread dropped the reply".into()))?
+    }
+}
+
+impl EncodeSession for FfmpegSession {
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+        let frame = Box::new(frame.clone());
+        self.request(|reply| Cmd::Encode { frame, reply })
+    }
+
+    fn request_idr(&mut self) {
+        let _ = self.tx.send(Cmd::RequestIdr);
+    }
+
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        self.request(|reply| Cmd::Flush { reply })
+    }
+
+    fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
+        self.tx
+            .send(Cmd::SetBitrate(bitrate_kbps))
+            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))
+    }
+}
+
+impl Drop for FfmpegSession {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Cmd::Stop);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ─────────────────────────── encode thread ───────────────────────────
+
+fn run_encode_thread(
+    config: EncodeConfig,
+    device: HwDevice,
+    rx: crossbeam_channel::Receiver<Cmd>,
+    ready_tx: Sender<Result<()>>,
+) {
+    let mut state = match EncoderState::new(&config, device) {
+        Ok(state) => {
+            let _ = ready_tx.send(Ok(()));
+            state
+        }
+        Err(e) => {
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    };
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Encode { frame, reply } => {
+                let _ = reply.send(state.encode(&frame));
+            }
+            Cmd::Flush { reply } => {
+                let _ = reply.send(state.flush());
+            }
+            Cmd::RequestIdr => state.force_idr = true,
+            Cmd::SetBitrate(kbps) => state.set_bitrate(kbps),
+            Cmd::Stop => break,
+        }
+    }
+}
+
+/// All `!Send` FFmpeg state, owned by the encode thread.
+struct EncoderState {
+    encoder: ff::encoder::Video,
+    /// VA-API hardware frame pool (`AVBufferRef*`); kept alive to allocate
+    /// hardware frames for each upload.
+    frames_ctx: *mut ff::ffi::AVBufferRef,
+    /// Owned device ref, kept alive for the lifetime of the frame pool.
+    _device: HwDevice,
+    scaler: ff::software::scaling::Context,
+    src_format: Pixel,
+    sw_format: Pixel,
+    width: u32,
+    height: u32,
+    force_idr: bool,
+    pts: i64,
+}
+
+impl EncoderState {
+    fn new(config: &EncodeConfig, device: HwDevice) -> Result<Self> {
+        let name = encoder_name(config.codec).ok_or_else(|| FluxError::EncoderInit("unsupported codec".into()))?;
+        let codec = ff::encoder::find_by_name(name)
+            .ok_or_else(|| FluxError::EncoderInit(format!("FFmpeg encoder {name} not found")))?;
+
+        let width = config.resolution.width;
+        let height = config.resolution.height;
+        let sw_format = surface_sw_format(config.dynamic_range);
+        let src_format = source_pixel_format(PixelFormat::Bgra8).expect("BGRA always mappable");
+
+        // Build a hardware frame pool (VA-API surfaces with the chosen sw format).
+        let frames_ctx = create_hw_frames_ctx(&device, sw_format, width, height)?;
+
+        let mut octx = ff::codec::context::Context::new_with_codec(codec);
+        // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
+        unsafe {
+            let ctx = octx.as_mut_ptr();
+            (*ctx).width = width as c_int;
+            (*ctx).height = height as c_int;
+            (*ctx).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*ctx).time_base = ff::ffi::AVRational {
+                num: 1,
+                den: config.framerate.max(1) as c_int,
+            };
+            (*ctx).framerate = ff::ffi::AVRational {
+                num: config.framerate.max(1) as c_int,
+                den: 1,
+            };
+            (*ctx).gop_size = effective_gop(config.gop_size) as c_int;
+            (*ctx).max_b_frames = config.b_frames as c_int;
+            (*ctx).refs = config.max_ref_frames.max(1) as c_int;
+            let bits = (config.bitrate_kbps as i64) * 1000;
+            (*ctx).bit_rate = bits;
+            (*ctx).rc_max_rate = bits;
+            (*ctx).rc_buffer_size = bits as c_int;
+            // Bind the hardware frame pool; the encoder ingests VA-API surfaces.
+            (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames_ctx);
+        }
+
+        let mut opts = ff::Dictionary::new();
+        for (k, v) in low_latency_options(config) {
+            opts.set(k, &v);
+        }
+
+        let video = octx
+            .encoder()
+            .video()
+            .map_err(|e| FluxError::EncoderInit(format!("encoder setup failed: {e}")))?;
+        let encoder = video
+            .open_with(opts)
+            .map_err(|e| FluxError::EncoderInit(format!("failed to open {name}: {e}")))?;
+
+        let scaler = ff::software::scaling::Context::get(
+            src_format,
+            width,
+            height,
+            sw_format,
+            width,
+            height,
+            ff::software::scaling::Flags::BILINEAR,
+        )
+        .map_err(|e| FluxError::EncoderInit(format!("swscale init failed: {e}")))?;
+
+        Ok(Self {
+            encoder,
+            frames_ctx,
+            _device: device,
+            scaler,
+            src_format,
+            sw_format,
+            width,
+            height,
+            force_idr: true,
+            pts: 0,
+        })
+    }
+
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+        let src_format = source_pixel_format(frame.format).ok_or_else(|| FluxError::Encode {
+            frame: frame.sequence,
+            reason: format!(
+                "FFmpeg VA-API backend needs packed RGB input; {:?} not supported yet",
+                frame.format
+            ),
+        })?;
+        if src_format != self.src_format {
+            return Err(FluxError::Encode {
+                frame: frame.sequence,
+                reason: "input pixel format changed mid-session".into(),
+            });
+        }
+        if frame.resolution.width != self.width || frame.resolution.height != self.height {
+            return Err(FluxError::Encode {
+                frame: frame.sequence,
+                reason: format!(
+                    "frame resolution {} does not match encoder {}x{}",
+                    frame.resolution, self.width, self.height
+                ),
+            });
+        }
+        if frame.data.is_empty() {
+            return Err(FluxError::Encode {
+                frame: frame.sequence,
+                reason: "frame has no CPU pixel data to upload (DMA-BUF import not yet wired)".into(),
+            });
+        }
+
+        // 1. Wrap the captured pixels in a source AVFrame and colour-convert to
+        //    the surface software format (NV12/P010) with swscale.
+        let mut src = ff::frame::Video::new(self.src_format, self.width, self.height);
+        copy_packed_rgb(&mut src, frame)?;
+        let mut sw = ff::frame::Video::new(self.sw_format, self.width, self.height);
+        self.scaler
+            .run(&src, &mut sw)
+            .map_err(|e| self.enc_err(frame.sequence, format!("swscale failed: {e}")))?;
+
+        // 2. Upload the software frame into a pooled VA-API surface.
+        let mut hw = self.alloc_hw_frame(frame.sequence)?;
+        // SAFETY: both frames are valid; transfer copies sw planes into the surface.
+        let ret = unsafe { ff::ffi::av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0) };
+        if ret < 0 {
+            return Err(self.enc_err(frame.sequence, format!("hwframe upload failed ({ret})")));
+        }
+
+        hw.set_pts(Some(self.pts));
+        if self.force_idr {
+            // SAFETY: `hw` owns a valid `AVFrame`; requesting an I picture forces an IDR.
+            unsafe {
+                (*hw.as_mut_ptr()).pict_type = ff::ffi::AVPictureType::AV_PICTURE_TYPE_I;
+            }
+            self.force_idr = false;
+        }
+        self.pts += 1;
+
+        // 3. Encode and drain any available packets.
+        self.encoder
+            .send_frame(&hw)
+            .map_err(|e| self.enc_err(frame.sequence, format!("send_frame failed: {e}")))?;
+        self.drain(frame.sequence)
+    }
+
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        self.encoder
+            .send_eof()
+            .map_err(|e| self.enc_err(self.pts as u64, format!("send_eof failed: {e}")))?;
+        self.drain(self.pts as u64)
+    }
+
+    /// Drain `receive_packet` until the encoder needs more input / hits EOF.
+    fn drain(&mut self, frame: u64) -> Result<Vec<EncodedPacket>> {
+        let mut out = Vec::new();
+        loop {
+            let mut packet = ff::codec::packet::Packet::empty();
+            match self.encoder.receive_packet(&mut packet) {
+                Ok(()) => {
+                    if let Some(data) = packet.data() {
+                        out.push(EncodedPacket {
+                            frame_index: packet.pts().unwrap_or(self.pts) as u64,
+                            pts: packet.pts().unwrap_or(self.pts) as u64,
+                            is_keyframe: packet.is_key(),
+                            data: data.to_vec(),
+                        });
+                    }
+                }
+                Err(FfError::Other { errno }) if errno == EAGAIN => break,
+                Err(FfError::Eof) => break,
+                Err(e) => return Err(self.enc_err(frame, format!("receive_packet failed: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Allocate a hardware frame backed by the VA-API surface pool.
+    fn alloc_hw_frame(&self, frame: u64) -> Result<ff::frame::Video> {
+        let mut hw = ff::frame::Video::empty();
+        // SAFETY: `frames_ctx` is a valid hwframe context; `hw` is a fresh frame.
+        let ret = unsafe { ff::ffi::av_hwframe_get_buffer(self.frames_ctx, hw.as_mut_ptr(), 0) };
+        if ret < 0 {
+            return Err(self.enc_err(frame, format!("hwframe pool exhausted ({ret})")));
+        }
+        Ok(hw)
+    }
+
+    fn set_bitrate(&mut self, kbps: u32) {
+        let bits = (kbps as i64) * 1000;
+        // SAFETY: encoder owns a valid, opened `AVCodecContext`.
+        unsafe {
+            let ctx = self.encoder.as_mut_ptr();
+            (*ctx).bit_rate = bits;
+            (*ctx).rc_max_rate = bits;
+        }
+    }
+
+    fn enc_err(&self, frame: u64, reason: String) -> FluxError {
+        FluxError::Encode { frame, reason }
+    }
+}
+
+impl Drop for EncoderState {
+    fn drop(&mut self) {
+        // SAFETY: `frames_ctx` was obtained from `av_hwframe_ctx_alloc`.
+        unsafe { ff::ffi::av_buffer_unref(&mut self.frames_ctx) };
+    }
+}
+
+// ─────────────────────────── ffi helpers ───────────────────────────
+
+/// Allocate and initialize a VA-API hardware frame pool for `sw_format`.
+fn create_hw_frames_ctx(
+    device: &HwDevice,
+    sw_format: Pixel,
+    width: u32,
+    height: u32,
+) -> Result<*mut ff::ffi::AVBufferRef> {
+    // SAFETY: `device.0` is a valid device context; we configure the returned
+    // frames context's public fields before initializing it.
+    unsafe {
+        let frames_ref = ff::ffi::av_hwframe_ctx_alloc(device.0);
+        if frames_ref.is_null() {
+            return Err(FluxError::EncoderInit("av_hwframe_ctx_alloc failed".into()));
+        }
+        let frames_ctx = (*frames_ref).data as *mut ff::ffi::AVHWFramesContext;
+        (*frames_ctx).format = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*frames_ctx).sw_format = pixel_to_ffi(sw_format);
+        (*frames_ctx).width = width as c_int;
+        (*frames_ctx).height = height as c_int;
+        (*frames_ctx).initial_pool_size = HW_POOL_SIZE;
+        let ret = ff::ffi::av_hwframe_ctx_init(frames_ref);
+        if ret < 0 {
+            let mut r = frames_ref;
+            ff::ffi::av_buffer_unref(&mut r);
+            return Err(FluxError::EncoderInit(format!("av_hwframe_ctx_init failed ({ret})")));
+        }
+        Ok(frames_ref)
+    }
+}
+
+/// Convert an `ffmpeg-next` `Pixel` to the raw libavutil `AVPixelFormat`.
+fn pixel_to_ffi(p: Pixel) -> ff::ffi::AVPixelFormat {
+    p.into()
+}
+
+/// Copy packed-RGB pixels from a [`CapturedFrame`] into a source AVFrame,
+/// honouring the captured stride vs. the AVFrame's own line size.
+fn copy_packed_rgb(dst: &mut ff::frame::Video, frame: &CapturedFrame) -> Result<()> {
+    let w = frame.resolution.width as usize;
+    let h = frame.resolution.height as usize;
+    let row_bytes = w * 4;
+    let src_stride = (frame.stride as usize).max(row_bytes);
+    if frame.data.len() < src_stride * h {
+        return Err(FluxError::Encode {
+            frame: frame.sequence,
+            reason: format!(
+                "RGB buffer too small: {} bytes, need stride {src_stride} * height {h}",
+                frame.data.len()
+            ),
+        });
+    }
+    let dst_stride = dst.stride(0);
+    let dst_data = dst.data_mut(0);
+    for row in 0..h {
+        let s = row * src_stride;
+        let d = row * dst_stride;
+        dst_data[d..d + row_bytes].copy_from_slice(&frame.data[s..s + row_bytes]);
+    }
+    Ok(())
+}
+
+// ───────────────────────────── tests ─────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_core::types::RateControlMode;
+
+    fn cfg(codec: VideoCodec) -> EncodeConfig {
+        EncodeConfig {
+            codec,
+            ..EncodeConfig::default()
+        }
+    }
+
+    #[test]
+    fn encoder_name_maps_codecs() {
+        assert_eq!(encoder_name(VideoCodec::H264), Some("h264_vaapi"));
+        assert_eq!(encoder_name(VideoCodec::H265), Some("hevc_vaapi"));
+        assert_eq!(encoder_name(VideoCodec::Av1), None);
+    }
+
+    #[test]
+    fn source_format_only_accepts_packed_rgb() {
+        assert_eq!(source_pixel_format(PixelFormat::Bgra8), Some(Pixel::BGRA));
+        assert_eq!(source_pixel_format(PixelFormat::Rgba8), Some(Pixel::RGBA));
+        assert_eq!(source_pixel_format(PixelFormat::Nv12), None);
+        assert_eq!(source_pixel_format(PixelFormat::I420), None);
+        assert_eq!(source_pixel_format(PixelFormat::P010), None);
+    }
+
+    #[test]
+    fn surface_format_tracks_dynamic_range() {
+        assert_eq!(surface_sw_format(DynamicRange::Sdr), Pixel::NV12);
+        assert_eq!(surface_sw_format(DynamicRange::Hdr10), Pixel::P010LE);
+    }
+
+    #[test]
+    fn infinite_gop_maps_to_large_finite_value() {
+        assert_eq!(effective_gop(0), i32::MAX as u32);
+        assert_eq!(effective_gop(60), 60);
+    }
+
+    #[test]
+    fn low_latency_options_select_rate_control_and_async_depth() {
+        let mut c = cfg(VideoCodec::H265);
+        c.rate_control = RateControlMode::Cbr;
+        let opts = low_latency_options(&c);
+        assert!(opts.contains(&("rc_mode", "CBR".to_string())));
+        assert!(opts.contains(&("async_depth", "1".to_string())));
+
+        c.rate_control = RateControlMode::Vbr;
+        assert!(low_latency_options(&c).contains(&("rc_mode", "VBR".to_string())));
+    }
+
+    #[test]
+    fn validate_rejects_av1() {
+        let err = validate(&cfg(VideoCodec::Av1));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn validate_accepts_h264_and_h265() {
+        assert!(validate(&cfg(VideoCodec::H264)).is_ok());
+        assert!(validate(&cfg(VideoCodec::H265)).is_ok());
+    }
+
+    #[test]
+    fn validate_requires_hevc_for_hdr10() {
+        let mut c = cfg(VideoCodec::H264);
+        c.dynamic_range = DynamicRange::Hdr10;
+        assert!(validate(&c).is_err());
+
+        let mut c = cfg(VideoCodec::H265);
+        c.dynamic_range = DynamicRange::Hdr10;
+        assert!(validate(&c).is_ok());
+    }
+}

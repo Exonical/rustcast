@@ -12,3 +12,6 @@ pub mod amf {
 
 #[cfg(target_os = "linux")]
 pub mod vaapi;
+
+#[cfg(target_os = "linux")]
+pub mod ffmpeg;

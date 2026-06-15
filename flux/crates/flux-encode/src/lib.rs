@@ -25,6 +25,9 @@ pub fn create_encoder(backend: Option<EncoderBackend>) -> Result<Box<dyn VideoEn
         #[cfg(target_os = "linux")]
         EncoderBackend::Vaapi => Ok(Box::new(backend::vaapi::VaapiEncoder::new()?)),
 
+        #[cfg(target_os = "linux")]
+        EncoderBackend::FfmpegVaapi => Ok(Box::new(backend::ffmpeg::FfmpegVaapiEncoder::new()?)),
+
         #[cfg(target_os = "windows")]
         EncoderBackend::Amf => Ok(Box::new(backend::amf::AmfEncoder::new()?)),
 
@@ -79,6 +82,28 @@ fn to_core_encode_caps(
         av1: supported.contains(&VideoCodec::Av1),
         hdr10: supports_hdr,
     }
+}
+
+/// Probe the FFmpeg VA-API backend and report its drivable encode
+/// capabilities (H.264 + HEVC, plus HDR10 when HEVC is present).
+///
+/// Opens a VA-API hardware device and checks which `*_vaapi` encoders the
+/// FFmpeg build exposes. Reported as [`EncoderBackend::FfmpegVaapi`] so
+/// negotiation can prefer it for codecs the cros-codecs path can't drive
+/// (HEVC/HDR). Returns `None` when no VA-API device/encoder is available.
+#[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+pub fn probe_ffmpeg_encode_capabilities() -> Option<flux_core::capability::EncodeCapabilities> {
+    use flux_core::types::VideoCodec;
+    let encoder = backend::ffmpeg::FfmpegVaapiEncoder::new().ok()?;
+    let caps = encoder.capabilities().ok()?;
+    Some(flux_core::capability::EncodeCapabilities {
+        backend: Some(EncoderBackend::FfmpegVaapi),
+        driver: None,
+        h264: caps.supported_codecs.contains(&VideoCodec::H264),
+        h265: caps.supported_codecs.contains(&VideoCodec::H265),
+        av1: caps.supported_codecs.contains(&VideoCodec::Av1),
+        hdr10: caps.supports_hdr,
+    })
 }
 
 #[cfg(all(target_os = "linux", feature = "encoder-vaapi", test))]
