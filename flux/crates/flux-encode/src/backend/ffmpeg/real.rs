@@ -171,6 +171,34 @@ impl Drop for HwDevice {
     }
 }
 
+/// RAII owner of a VA-API hardware frame pool (`AVBufferRef*`).
+///
+/// Owning the pool in a guard frees it via `Drop` if encoder setup fails before
+/// the [`EncoderState`] is constructed (otherwise a failed init would leak the
+/// whole surface pool). On success, [`Self::into_raw`] transfers ownership to
+/// `EncoderState`, whose own `Drop` then frees it.
+struct HwFramesCtx(*mut ff::ffi::AVBufferRef);
+
+impl HwFramesCtx {
+    fn raw(&self) -> *mut ff::ffi::AVBufferRef {
+        self.0
+    }
+
+    /// Relinquish ownership without freeing; caller becomes responsible.
+    fn into_raw(self) -> *mut ff::ffi::AVBufferRef {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
+}
+
+impl Drop for HwFramesCtx {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was obtained from `av_hwframe_ctx_alloc`.
+        unsafe { ff::ffi::av_buffer_unref(&mut self.0) };
+    }
+}
+
 /// FFmpeg VA-API hardware encoder (Linux, AMD/Intel via Mesa/iHD).
 pub struct FfmpegVaapiEncoder {
     capabilities: EncoderCapabilities,
@@ -377,8 +405,9 @@ struct EncoderState {
     frames_ctx: *mut ff::ffi::AVBufferRef,
     /// Owned device ref, kept alive for the lifetime of the frame pool.
     _device: HwDevice,
-    scaler: ff::software::scaling::Context,
-    src_format: Pixel,
+    /// swscale context, cached and (re)built lazily for the input format the
+    /// capture path actually delivers (BGRA or RGBA).
+    scaler: Option<(Pixel, ff::software::scaling::Context)>,
     sw_format: Pixel,
     width: u32,
     height: u32,
@@ -395,10 +424,11 @@ impl EncoderState {
         let width = config.resolution.width;
         let height = config.resolution.height;
         let sw_format = surface_sw_format(config.dynamic_range);
-        let src_format = source_pixel_format(PixelFormat::Bgra8).expect("BGRA always mappable");
 
-        // Build a hardware frame pool (VA-API surfaces with the chosen sw format).
-        let frames_ctx = create_hw_frames_ctx(&device, sw_format, width, height)?;
+        // Build a hardware frame pool (VA-API surfaces with the chosen sw
+        // format). Held in an RAII guard so it is freed if any `?` below bails
+        // out before `EncoderState` (whose `Drop` then owns it) is constructed.
+        let frames = create_hw_frames_ctx(&device, sw_format, width, height)?;
 
         let mut octx = ff::codec::context::Context::new_with_codec(codec);
         // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
@@ -421,9 +451,11 @@ impl EncoderState {
             let bits = (config.bitrate_kbps as i64) * 1000;
             (*ctx).bit_rate = bits;
             (*ctx).rc_max_rate = bits;
-            (*ctx).rc_buffer_size = bits as c_int;
+            // `rc_buffer_size` is a C `int`; clamp so huge bitrates don't wrap
+            // to a negative buffer size.
+            (*ctx).rc_buffer_size = bits.min(i32::MAX as i64) as c_int;
             // Bind the hardware frame pool; the encoder ingests VA-API surfaces.
-            (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames_ctx);
+            (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames.raw());
         }
 
         let mut opts = ff::Dictionary::new();
@@ -439,29 +471,42 @@ impl EncoderState {
             .open_with(opts)
             .map_err(|e| FluxError::EncoderInit(format!("failed to open {name}: {e}")))?;
 
-        let scaler = ff::software::scaling::Context::get(
-            src_format,
-            width,
-            height,
-            sw_format,
-            width,
-            height,
-            ff::software::scaling::Flags::BILINEAR,
-        )
-        .map_err(|e| FluxError::EncoderInit(format!("swscale init failed: {e}")))?;
-
         Ok(Self {
             encoder,
-            frames_ctx,
+            // Init succeeded; transfer pool ownership to `EncoderState::drop`.
+            frames_ctx: frames.into_raw(),
             _device: device,
-            scaler,
-            src_format,
+            scaler: None,
             sw_format,
             width,
             height,
             force_idr: true,
             pts: 0,
         })
+    }
+
+    /// Return a swscale context converting `src_format` → `sw_format`, building
+    /// (and caching) it on first use or whenever the input format changes.
+    fn scaler_for(&mut self, src_format: Pixel) -> Result<&mut ff::software::scaling::Context> {
+        let needs_rebuild = self
+            .scaler
+            .as_ref()
+            .map(|(fmt, _)| *fmt != src_format)
+            .unwrap_or(true);
+        if needs_rebuild {
+            let ctx = ff::software::scaling::Context::get(
+                src_format,
+                self.width,
+                self.height,
+                self.sw_format,
+                self.width,
+                self.height,
+                ff::software::scaling::Flags::BILINEAR,
+            )
+            .map_err(|e| FluxError::EncoderInit(format!("swscale init failed: {e}")))?;
+            self.scaler = Some((src_format, ctx));
+        }
+        Ok(&mut self.scaler.as_mut().expect("scaler just set").1)
     }
 
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
@@ -472,12 +517,6 @@ impl EncoderState {
                 frame.format
             ),
         })?;
-        if src_format != self.src_format {
-            return Err(FluxError::Encode {
-                frame: frame.sequence,
-                reason: "input pixel format changed mid-session".into(),
-            });
-        }
         if frame.resolution.width != self.width || frame.resolution.height != self.height {
             return Err(FluxError::Encode {
                 frame: frame.sequence,
@@ -496,12 +535,16 @@ impl EncoderState {
 
         // 1. Wrap the captured pixels in a source AVFrame and colour-convert to
         //    the surface software format (NV12/P010) with swscale.
-        let mut src = ff::frame::Video::new(self.src_format, self.width, self.height);
+        let mut src = ff::frame::Video::new(src_format, self.width, self.height);
         copy_packed_rgb(&mut src, frame)?;
         let mut sw = ff::frame::Video::new(self.sw_format, self.width, self.height);
-        self.scaler
+        let seq = frame.sequence;
+        self.scaler_for(src_format)?
             .run(&src, &mut sw)
-            .map_err(|e| self.enc_err(frame.sequence, format!("swscale failed: {e}")))?;
+            .map_err(|e| FluxError::Encode {
+                frame: seq,
+                reason: format!("swscale failed: {e}"),
+            })?;
 
         // 2. Upload the software frame into a pooled VA-API surface.
         let mut hw = self.alloc_hw_frame(frame.sequence)?;
@@ -570,6 +613,10 @@ impl EncoderState {
         Ok(hw)
     }
 
+    /// Best-effort runtime bitrate update. VA-API encoders configure their
+    /// rate controller at `avcodec_open2`, so most drivers ignore changes to
+    /// these fields on an open context; this updates them for drivers/codecs
+    /// that do re-read them, and is a no-op otherwise.
     fn set_bitrate(&mut self, kbps: u32) {
         let bits = (kbps as i64) * 1000;
         // SAFETY: encoder owns a valid, opened `AVCodecContext`.
@@ -594,13 +641,14 @@ impl Drop for EncoderState {
 
 // ─────────────────────────── ffi helpers ───────────────────────────
 
-/// Allocate and initialize a VA-API hardware frame pool for `sw_format`.
+/// Allocate and initialize a VA-API hardware frame pool for `sw_format`,
+/// returned in an RAII guard that frees it on drop.
 fn create_hw_frames_ctx(
     device: &HwDevice,
     sw_format: Pixel,
     width: u32,
     height: u32,
-) -> Result<*mut ff::ffi::AVBufferRef> {
+) -> Result<HwFramesCtx> {
     // SAFETY: `device.0` is a valid device context; we configure the returned
     // frames context's public fields before initializing it.
     unsafe {
@@ -620,7 +668,7 @@ fn create_hw_frames_ctx(
             ff::ffi::av_buffer_unref(&mut r);
             return Err(FluxError::EncoderInit(format!("av_hwframe_ctx_init failed ({ret})")));
         }
-        Ok(frames_ref)
+        Ok(HwFramesCtx(frames_ref))
     }
 }
 
