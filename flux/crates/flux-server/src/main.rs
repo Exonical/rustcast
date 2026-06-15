@@ -376,6 +376,43 @@ fn create_encode_session(
     }
 }
 
+/// Build an H.264 encode session for a concrete capture resolution, preferring
+/// the platform hardware encoder and falling back to software when it can't be
+/// opened (e.g. no VA-API driver). Returns the session and the backend used.
+fn build_encode_session_for(
+    target_fps: u32,
+    resolution: flux_core::types::Resolution,
+) -> (
+    Option<Box<dyn flux_encode::traits::EncodeSession>>,
+    flux_core::types::EncoderBackend,
+) {
+    let encoder_config = flux_encode::traits::EncodeConfig {
+        codec: flux_core::types::VideoCodec::H264,
+        resolution,
+        framerate: target_fps,
+        bitrate_kbps: 10_000,
+        rate_control: flux_core::types::RateControlMode::Cbr,
+        dynamic_range: flux_core::types::DynamicRange::Sdr,
+        chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
+        gop_size: 0,
+        b_frames: 0,
+        max_ref_frames: 1,
+    };
+
+    let preferred = preferred_encoder_backend();
+    let mut backend = preferred;
+    let mut session = create_encode_session(preferred, encoder_config.clone());
+    if session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
+        tracing::warn!(
+            "{:?} encoder unavailable; falling back to software H.264 encoding",
+            preferred
+        );
+        backend = flux_core::types::EncoderBackend::Software;
+        session = create_encode_session(backend, encoder_config);
+    }
+    (session, backend)
+}
+
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 fn capture_loop(
@@ -440,35 +477,13 @@ fn capture_loop(
         }
     };
 
-    // ── Initialize the hardware encoder ─────────────────────────────
-    let encode_resolution = primary.native_resolution;
-    let encoder_config = flux_encode::traits::EncodeConfig {
-        codec: flux_core::types::VideoCodec::H264,
-        resolution: encode_resolution,
-        framerate: target_fps,
-        bitrate_kbps: 10_000,
-        rate_control: flux_core::types::RateControlMode::Cbr,
-        dynamic_range: flux_core::types::DynamicRange::Sdr,
-        chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
-        gop_size: 0,
-        b_frames: 0,
-        max_ref_frames: 1,
-    };
-
-    // Prefer the platform hardware encoder; if it can't be opened (e.g. no
-    // VA-API driver installed), fall back to the software encoder so the
-    // pipeline still produces a stream.
-    let preferred = preferred_encoder_backend();
-    let mut backend = preferred;
-    let mut encode_session = create_encode_session(preferred, encoder_config.clone());
-    if encode_session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
-        tracing::warn!(
-            "{:?} encoder unavailable; falling back to software H.264 encoding",
-            preferred
-        );
-        backend = flux_core::types::EncoderBackend::Software;
-        encode_session = create_encode_session(backend, encoder_config.clone());
-    }
+    // ── Encoder is initialized lazily from the first captured frame ──
+    // The capture server fixates the real resolution at negotiation time,
+    // which can differ from the display's reported native size (e.g. rotated
+    // monitors). Build the encoder from the frame the capture path actually
+    // delivers, and rebuild it if the resolution changes mid-stream.
+    let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
+    let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
     // Verification file (first ~5 seconds)
     let h264_path = std::path::PathBuf::from("flux_capture_test.h264");
@@ -477,9 +492,8 @@ fn capture_loop(
     let mut total_encoded_bytes: u64 = 0;
 
     tracing::info!(
-        "Capture+encode loop: {}x{}@{}fps → {:?} H.264 (verify: {})",
-        encode_resolution.width, encode_resolution.height, target_fps,
-        backend,
+        "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame; verify: {})",
+        target_fps,
         h264_path.display()
     );
 
@@ -508,6 +522,22 @@ fn capture_loop(
 
         let t_capture = t0.elapsed();
         frame_count += 1;
+
+        // (Re)build the encoder once the negotiated capture resolution is
+        // known or whenever it changes (e.g. display rotation / mode switch),
+        // so the encoder dimensions always match the frames it receives.
+        if encode_resolution != frame.resolution {
+            let (sess, backend) = build_encode_session_for(target_fps, frame.resolution);
+            encode_session = sess;
+            encode_resolution = frame.resolution;
+            tracing::info!(
+                "Capture+encode loop: {}x{}@{}fps → {:?} H.264",
+                encode_resolution.width, encode_resolution.height, target_fps, backend
+            );
+            if let Some(ref mut enc) = encode_session {
+                enc.request_idr();
+            }
+        }
 
         // ── Hardware H.264 encode ───────────────────────────────────
         let t1 = std::time::Instant::now();
