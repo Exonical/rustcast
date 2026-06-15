@@ -8,11 +8,23 @@ pub mod mock;
 pub mod session;
 pub mod traits;
 
+// Real Linux backends: xdg-desktop-portal negotiation (ashpd) and the live
+// PipeWire stream. Gated on Linux + the `capture-pipewire` feature so default
+// and Windows builds don't pull in the portal/PipeWire system dependencies.
+#[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+pub mod pipewire_source;
+#[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+pub mod portal;
+
 pub use bridge::{FrameBridge, FrameSink, FrameSource};
+#[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+pub use pipewire_source::PipewireStreamSource;
+#[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+pub use portal::XdgPortalSession;
 #[cfg(unix)]
 pub use session::{
-    BufferKind, CursorMode, FormatPrefs, NegotiatedFormat, PipewireFrameSource, PortalGrant,
-    PortalOptions, PortalSession, PortalStream, SourceKind,
+    BufferKind, CursorMode, FormatPrefs, NegotiatedFormat, PipewireFrameSource, PortalGrant, PortalOptions,
+    PortalSession, PortalStream, SourceKind,
 };
 pub use traits::{CaptureSession, ScreenCapture};
 

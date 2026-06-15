@@ -191,4 +191,51 @@ mod tests {
         assert!(source.recv_frame(Duration::ZERO).is_err());
         assert!(source.negotiated_format().is_none());
     }
+
+    /// End-to-end: negotiate a (mock) portal session, then push frames from a
+    /// producer thread through the latest-wins [`FrameBridge`] and pull them
+    /// from the consumer side — the same wiring the real portal + PipeWire
+    /// stream uses, minus the OS dependencies.
+    #[tokio::test]
+    async fn portal_then_bridge_pipeline_delivers_frames() {
+        use crate::bridge::FrameBridge;
+
+        let mut portal = MockPortalSession::single_monitor();
+        let grant = portal.negotiate(PortalOptions::default()).await.unwrap();
+        let node_id = grant.streams[0].node_id;
+        assert_eq!(node_id, 42);
+
+        let res = Resolution::new(320, 240);
+        let (sink, source) = FrameBridge::new();
+
+        // Producer thread stands in for the PipeWire `process` callback.
+        let producer = std::thread::spawn(move || {
+            for seq in 1..=5u64 {
+                sink.push(CapturedFrame {
+                    sequence: seq,
+                    timestamp: std::time::Instant::now(),
+                    format: PixelFormat::Bgra8,
+                    resolution: res,
+                    stride: res.width * 4,
+                    data: vec![0u8; (res.width * res.height * 4) as usize],
+                    gpu_handle: None,
+                });
+            }
+            sink.close();
+        });
+
+        // Consumer drains until the bridge is closed; latest-wins means we may
+        // observe fewer than 5 frames, but the last must be frame 5.
+        let mut last = 0;
+        let mut count = 0;
+        while let Some(frame) = source.recv(Duration::from_millis(200)) {
+            assert!(frame.sequence >= last);
+            last = frame.sequence;
+            count += 1;
+        }
+        producer.join().unwrap();
+
+        assert!(count >= 1, "expected at least one frame");
+        assert_eq!(last, 5, "the most recent frame must always arrive");
+    }
 }
