@@ -10,7 +10,11 @@ name = "flux-server"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["tray"]
+# System-tray icon. Pulls in tray-icon/muda, which link GTK/X11 (`libxdo`) on
+# Linux. Disable it (`--no-default-features`) for a headless or Wayland-pure
+# host that should not depend on those libraries.
+tray = ["dep:tray-icon", "dep:muda"]
 # Forward the Linux-only real capture/encode backends so the pipeline can probe
 # live portal + VA-API capabilities (otherwise it runs on the base probe).
 capture-pipewire = ["flux-capture/capture-pipewire"]
@@ -36,5 +40,5 @@ parking_lot = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 serde_json = { workspace = true }
-tray-icon = { workspace = true }
-muda = { workspace = true }
+tray-icon = { workspace = true, optional = true }
+muda = { workspace = true, optional = true }

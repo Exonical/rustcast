@@ -15,9 +15,9 @@
 #[cfg(feature = "encoder-ffmpeg")]
 mod real;
 #[cfg(feature = "encoder-ffmpeg")]
-pub use real::FfmpegVaapiEncoder;
+pub use real::{FfmpegSoftwareEncoder, FfmpegVaapiEncoder};
 
 #[cfg(not(feature = "encoder-ffmpeg"))]
 mod stub;
 #[cfg(not(feature = "encoder-ffmpeg"))]
-pub use stub::FfmpegVaapiEncoder;
+pub use stub::{FfmpegSoftwareEncoder, FfmpegVaapiEncoder};

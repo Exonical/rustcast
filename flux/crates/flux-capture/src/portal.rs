@@ -62,12 +62,15 @@ impl XdgPortalSession {
         let screencast = Screencast::new().await.map_err(portal_err)?;
         let session = remote_desktop.create_session().await.map_err(portal_err)?;
 
+        // RemoteDesktop sessions cannot persist (the portal rejects a restore
+        // token / persist mode with `InvalidArgument: Remote desktop sessions
+        // cannot persist`), so this combined session is always non-persistent.
         remote_desktop
             .select_devices(
                 &session,
                 DeviceType::Keyboard | DeviceType::Pointer,
-                opts.restore_token.as_deref(),
-                persist_mode(opts),
+                None,
+                PersistMode::DoNot,
             )
             .await
             .map_err(portal_err)?;
@@ -78,8 +81,8 @@ impl XdgPortalSession {
                 to_xdp_cursor_mode(opts.cursor_mode),
                 to_source_types(&opts.source_kinds),
                 opts.multiple,
-                opts.restore_token.as_deref(),
-                persist_mode(opts),
+                None,
+                PersistMode::DoNot,
             )
             .await
             .map_err(portal_err)?;
@@ -209,9 +212,11 @@ fn portal_err(e: ashpd::Error) -> FluxError {
     FluxError::Capture(format!("xdg-desktop-portal: {e}"))
 }
 
+/// Persistence mode for a ScreenCast-only session. Requesting a restore token
+/// lets a later reconnection skip the consent prompt; the grant stays valid
+/// until the user explicitly revokes it. (RemoteDesktop sessions can't persist,
+/// so the combined input path passes `PersistMode::DoNot` directly instead.)
 fn persist_mode(_opts: &PortalOptions) -> PersistMode {
-    // Request a restore token so a later reconnection can skip the consent
-    // prompt; the grant stays valid until the user explicitly revokes it.
     PersistMode::ExplicitlyRevoked
 }
 

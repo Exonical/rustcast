@@ -286,7 +286,10 @@ fn build_format_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
         ChoiceFlags::empty(),
         ChoiceEnum::Range {
             default: Fraction { num: fps, denom: 1 },
-            min: Fraction { num: 1, denom: 1 },
+            // Compositors (notably mutter) advertise screen-cast framerate as a
+            // variable `0/1`; the offered range must include 0 or the formats
+            // are rejected outright ("no more input formats").
+            min: Fraction { num: 0, denom: 1 },
             max: Fraction { num: 1000, denom: 1 },
         },
     )));

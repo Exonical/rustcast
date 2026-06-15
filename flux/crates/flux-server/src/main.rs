@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+#[cfg(feature = "tray")]
 use parking_lot::RwLock;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -10,11 +11,13 @@ use tracing_subscriber::EnvFilter;
 mod http;
 mod pipeline;
 mod session;
+#[cfg(feature = "tray")]
 mod tray;
 
 use flux_core::config::FluxConfig;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
+#[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
 #[derive(Parser, Debug)]
@@ -89,59 +92,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("paired_clients.json");
     let _ = authenticator.load_paired_clients(&paired_clients_path);
 
-    // Initialize tray state.
-    let tray_state = Arc::new(RwLock::new(TrayState {
-        active_sessions: 0,
-        server_name: config.name.clone(),
-        bind_address: format!("{}:{}", config.bind_address, config.server.signaling_port),
-    }));
-
-    // Spawn system tray on a dedicated OS thread (requires main-thread message pump on Windows).
-    let tray_state_clone = tray_state.clone();
-    let (tray_quit_tx, mut tray_quit_rx) = tokio::sync::oneshot::channel::<()>();
-    let _tray_handle = std::thread::Builder::new()
-        .name("flux-tray".into())
-        .spawn(move || {
-            match FluxTray::new(tray_state_clone) {
-                Ok(tray) => {
-                    tracing::info!("System tray initialized");
-                    // Simple event loop — poll tray events
-                    loop {
-                        if let Some(action) = tray.poll_event() {
-                            match action {
-                                TrayAction::ShowPin => {
-                                    tracing::info!("Tray: Show PIN requested");
-                                    // TODO: Generate and display PIN
-                                }
-                                TrayAction::OpenConfig => {
-                                    tracing::info!("Tray: Open config requested");
-                                    // TODO: Open config file in default editor
-                                }
-                                TrayAction::Quit => {
-                                    tracing::info!("Tray: Quit requested");
-                                    let _ = tray_quit_tx.send(());
-                                    return;
-                                }
-                                TrayAction::ShowStatus => {
-                                    tray.update_state();
+    // Spawn the system tray on a dedicated OS thread (requires a main-thread
+    // message pump on Windows). Gated behind the `tray` feature so a headless /
+    // Wayland-pure build needs no GTK/X11 (`libxdo`) libraries.
+    #[cfg(feature = "tray")]
+    let mut tray_quit_rx = {
+        let tray_state = Arc::new(RwLock::new(TrayState {
+            active_sessions: 0,
+            server_name: config.name.clone(),
+            bind_address: format!("{}:{}", config.bind_address, config.server.signaling_port),
+        }));
+        let (tray_quit_tx, tray_quit_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("flux-tray".into())
+            .spawn(move || {
+                match FluxTray::new(tray_state) {
+                    Ok(tray) => {
+                        tracing::info!("System tray initialized");
+                        // Simple event loop — poll tray events
+                        loop {
+                            if let Some(action) = tray.poll_event() {
+                                match action {
+                                    TrayAction::ShowPin => {
+                                        tracing::info!("Tray: Show PIN requested");
+                                        // TODO: Generate and display PIN
+                                    }
+                                    TrayAction::OpenConfig => {
+                                        tracing::info!("Tray: Open config requested");
+                                        // TODO: Open config file in default editor
+                                    }
+                                    TrayAction::Quit => {
+                                        tracing::info!("Tray: Quit requested");
+                                        let _ = tray_quit_tx.send(());
+                                        return;
+                                    }
+                                    TrayAction::ShowStatus => {
+                                        tray.update_state();
+                                    }
                                 }
                             }
+                            tray.update_state();
+                            std::thread::sleep(std::time::Duration::from_millis(100));
                         }
-                        tray.update_state();
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create system tray: {}. Server will run without tray.", e);
+                        // Block until quit signal
+                        std::thread::park();
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to create system tray: {}. Server will run without tray.", e);
-                    // Block until quit signal
-                    std::thread::park();
-                }
-            }
-        })?;
+            })?;
+        tray_quit_rx
+    };
 
-    // ── Start DXGI capture → AMF H.264 encode ──────────────────────
+    // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
-    let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<Vec<u8>>>(8);
+    // Each message carries the frame's capture timestamp (microseconds since
+    // capture start) so downstream playout can pace by true capture spacing
+    // rather than bursty network arrival time.
+    let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(8);
     let h264_tx2 = h264_tx.clone();
 
     // IDR request channel: Frame server (TCP) -> Capture thread
@@ -172,7 +181,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Flux Server is ready and waiting for connections.");
 
-    // Wait for shutdown signal (Ctrl+C or tray quit).
+    // Wait for shutdown signal (Ctrl+C or, with the tray, its Quit item).
+    #[cfg(feature = "tray")]
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received Ctrl+C, shutting down...");
@@ -181,6 +191,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Quit requested from system tray, shutting down...");
         }
     }
+    #[cfg(not(feature = "tray"))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl+C, shutting down...");
+    }
 
     frame_handle.abort();
     server.shutdown().await;
@@ -188,11 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// TCP frame server: accepts connections and streams length-prefixed H.264 NALUs.
-/// Protocol: [4-byte big-endian length][H.264 data] per packet.
+/// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
+/// Protocol: [8-byte BE capture-timestamp µs][4-byte BE length][H.264 data] per packet.
 async fn frame_server(
     listener: tokio::net::TcpListener,
-    h264_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
@@ -279,7 +294,7 @@ async fn frame_server(
             });
 
             loop {
-                let data = match rx.recv().await {
+                let msg = match rx.recv().await {
                     Ok(d) => d,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Frame client {} lagged by {} frames", addr, n);
@@ -287,17 +302,22 @@ async fn frame_server(
                     }
                     Err(_) => break,
                 };
+                let (ts_micros, data) = (msg.0, &msg.1);
 
                 if data.is_empty() {
                     continue;
                 }
 
-                // Write length-prefixed frame: [4-byte BE len][data]
+                // Write timestamped frame: [8-byte BE ts µs][4-byte BE len][data]
+                let ts_bytes = ts_micros.to_be_bytes();
                 let len_bytes = (data.len() as u32).to_be_bytes();
+                if writer.write_all(&ts_bytes).await.is_err() {
+                    break;
+                }
                 if writer.write_all(&len_bytes).await.is_err() {
                     break;
                 }
-                if writer.write_all(&data).await.is_err() {
+                if writer.write_all(data).await.is_err() {
                     break;
                 }
                 frames_sent += 1;
@@ -309,10 +329,104 @@ async fn frame_server(
     }
 }
 
-/// Background thread: DXGI capture → AMF H.264 encode → broadcast channel.
+/// The hardware H.264 encoder backend to prefer for this build/platform:
+/// AMF on Windows, FFmpeg-VA-API or cros-codecs VA-API on Linux (depending on
+/// which encoder feature is compiled in), falling back to the software encoder.
+fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
+    use flux_core::types::EncoderBackend;
+    #[cfg(target_os = "windows")]
+    {
+        EncoderBackend::Amf
+    }
+    #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+    {
+        EncoderBackend::FfmpegVaapi
+    }
+    #[cfg(all(target_os = "linux", feature = "encoder-vaapi", not(feature = "encoder-ffmpeg")))]
+    {
+        EncoderBackend::Vaapi
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", feature = "encoder-ffmpeg"),
+        all(target_os = "linux", feature = "encoder-vaapi"),
+    )))]
+    {
+        EncoderBackend::Software
+    }
+}
+
+/// Create an encoder of the given backend and open a session, returning `None`
+/// (with a warning logged) if either the encoder or the session can't be built.
+fn create_encode_session(
+    backend: flux_core::types::EncoderBackend,
+    config: flux_encode::traits::EncodeConfig,
+) -> Option<Box<dyn flux_encode::traits::EncodeSession>> {
+    let encoder = match flux_encode::create_encoder(Some(backend)) {
+        Ok(enc) => {
+            tracing::info!("Encoder created: {} ({:?})", enc.name(), backend);
+            enc
+        }
+        Err(e) => {
+            tracing::warn!("{:?} encoder not available: {}", backend, e);
+            return None;
+        }
+    };
+    match encoder.create_session(config) {
+        Ok(s) => {
+            tracing::info!("{:?} H.264 encode session started", backend);
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create {:?} encode session: {}", backend, e);
+            None
+        }
+    }
+}
+
+/// Build an H.264 encode session for a concrete capture resolution, preferring
+/// the platform hardware encoder and falling back to software when it can't be
+/// opened (e.g. no VA-API driver). Returns the session and the backend used.
+fn build_encode_session_for(
+    target_fps: u32,
+    resolution: flux_core::types::Resolution,
+) -> (
+    Option<Box<dyn flux_encode::traits::EncodeSession>>,
+    flux_core::types::EncoderBackend,
+) {
+    let encoder_config = flux_encode::traits::EncodeConfig {
+        codec: flux_core::types::VideoCodec::H264,
+        resolution,
+        framerate: target_fps,
+        bitrate_kbps: 10_000,
+        rate_control: flux_core::types::RateControlMode::Cbr,
+        dynamic_range: flux_core::types::DynamicRange::Sdr,
+        chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
+        // Emit a keyframe every ~2s so a late joiner or any decode desync
+        // recovers on its own without depending solely on a PLI/IDR request.
+        gop_size: target_fps.saturating_mul(2).max(1),
+        b_frames: 0,
+        max_ref_frames: 1,
+    };
+
+    let preferred = preferred_encoder_backend();
+    let mut backend = preferred;
+    let mut session = create_encode_session(preferred, encoder_config.clone());
+    if session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
+        tracing::warn!(
+            "{:?} encoder unavailable; falling back to software H.264 encoding",
+            preferred
+        );
+        backend = flux_core::types::EncoderBackend::Software;
+        session = create_encode_session(backend, encoder_config);
+    }
+    (session, backend)
+}
+
+/// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 fn capture_loop(
-    h264_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
@@ -373,44 +487,13 @@ fn capture_loop(
         }
     };
 
-    // ── Initialize AMF encoder ──────────────────────────────────────
-    let encode_resolution = primary.native_resolution;
-    let encoder_config = flux_encode::traits::EncodeConfig {
-        codec: flux_core::types::VideoCodec::H264,
-        resolution: encode_resolution,
-        framerate: target_fps,
-        bitrate_kbps: 10_000,
-        rate_control: flux_core::types::RateControlMode::Cbr,
-        dynamic_range: flux_core::types::DynamicRange::Sdr,
-        chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
-        gop_size: 0,
-        b_frames: 0,
-        max_ref_frames: 1,
-    };
-
-    let amf_encoder = match flux_encode::create_encoder(Some(flux_core::types::EncoderBackend::Amf)) {
-        Ok(enc) => {
-            tracing::info!("AMF encoder created: {}", enc.name());
-            Some(enc)
-        }
-        Err(e) => {
-            tracing::warn!("AMF encoder not available, H.264 encoding disabled: {}", e);
-            None
-        }
-    };
-
-    let mut encode_session = amf_encoder.and_then(|enc| {
-        match enc.create_session(encoder_config) {
-            Ok(s) => {
-                tracing::info!("AMF H.264 encode session started");
-                Some(s)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create AMF session: {}", e);
-                None
-            }
-        }
-    });
+    // ── Encoder is initialized lazily from the first captured frame ──
+    // The capture server fixates the real resolution at negotiation time,
+    // which can differ from the display's reported native size (e.g. rotated
+    // monitors). Build the encoder from the frame the capture path actually
+    // delivers, and rebuild it if the resolution changes mid-stream.
+    let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
+    let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
     // Verification file (first ~5 seconds)
     let h264_path = std::path::PathBuf::from("flux_capture_test.h264");
@@ -419,8 +502,8 @@ fn capture_loop(
     let mut total_encoded_bytes: u64 = 0;
 
     tracing::info!(
-        "Capture+encode loop: {}x{}@{}fps → AMF H.264 (verify: {})",
-        encode_resolution.width, encode_resolution.height, target_fps,
+        "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame; verify: {})",
+        target_fps,
         h264_path.display()
     );
 
@@ -450,8 +533,28 @@ fn capture_loop(
         let t_capture = t0.elapsed();
         frame_count += 1;
 
-        // ── AMF H.264 encode ────────────────────────────────────────
+        // (Re)build the encoder once the negotiated capture resolution is
+        // known or whenever it changes (e.g. display rotation / mode switch),
+        // so the encoder dimensions always match the frames it receives.
+        if encode_resolution != frame.resolution {
+            let (sess, backend) = build_encode_session_for(target_fps, frame.resolution);
+            encode_session = sess;
+            encode_resolution = frame.resolution;
+            tracing::info!(
+                "Capture+encode loop: {}x{}@{}fps → {:?} H.264",
+                encode_resolution.width, encode_resolution.height, target_fps, backend
+            );
+            if let Some(ref mut enc) = encode_session {
+                enc.request_idr();
+            }
+        }
+
+        // ── Hardware H.264 encode ───────────────────────────────────
         let t1 = std::time::Instant::now();
+        let ts_micros = frame
+            .timestamp
+            .saturating_duration_since(loop_start)
+            .as_micros() as u64;
         if let Some(ref mut enc) = encode_session {
             match enc.encode(&frame) {
                 Ok(packets) => {
@@ -472,11 +575,11 @@ fn capture_loop(
                             );
                         }
 
-                        let _ = h264_tx.send(Arc::new(pkt.data.clone()));
+                        let _ = h264_tx.send(Arc::new((ts_micros, pkt.data.clone())));
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("AMF encode error on frame {}: {}", frame_count, e);
+                    tracing::warn!("Encode error on frame {}: {}", frame_count, e);
                 }
             }
         }
