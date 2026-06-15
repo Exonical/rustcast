@@ -13,6 +13,15 @@ ash = { workspace = true }
 parking_lot = { workspace = true }
 crossbeam-channel = { workspace = true }
 
+[features]
+default = []
+# Real Linux encoder backends. The libva bindings are attached as optional
+# deps in Phase 2; the GpuFrameImport scaffolding lands first under these flags.
+encoder-vaapi = []
+encoder-vulkan = []
+# Optional FFmpeg VA-API backend for breadth/debugging (Phase 4+).
+encoder-ffmpeg = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 windows = { workspace = true }

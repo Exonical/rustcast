@@ -1,6 +1,19 @@
 pub mod backend;
+pub mod bridge;
+// The Wayland portal / PipeWire interfaces are fd-based and only compile on
+// unix; Windows uses the DXGI backend instead.
+#[cfg(all(unix, any(test, feature = "mock")))]
+pub mod mock;
+#[cfg(unix)]
+pub mod session;
 pub mod traits;
 
+pub use bridge::{FrameBridge, FrameSink, FrameSource};
+#[cfg(unix)]
+pub use session::{
+    BufferKind, CursorMode, FormatPrefs, NegotiatedFormat, PipewireFrameSource, PortalGrant,
+    PortalOptions, PortalSession, PortalStream, SourceKind,
+};
 pub use traits::{CaptureSession, ScreenCapture};
 
 use flux_core::error::Result;

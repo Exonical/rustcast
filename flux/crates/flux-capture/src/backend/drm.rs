@@ -5,7 +5,7 @@
 //! Wayland compositors).
 
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::{CapturedFrame, DmaBufHandle, GpuFrameHandle};
+use flux_core::frame::CapturedFrame;
 use flux_core::types::{PixelFormat, Resolution};
 
 use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
@@ -58,9 +58,7 @@ impl ScreenCapture for DrmCapture {
             framerate
         );
 
-        Ok(Box::new(DrmCaptureSession::new(
-            display_id, resolution, framerate,
-        )?))
+        Ok(Box::new(DrmCaptureSession::new(display_id, resolution, framerate)?))
     }
 }
 
@@ -96,7 +94,10 @@ impl CaptureSession for DrmCaptureSession {
         }
         self.frame_sequence += 1;
 
-        // TODO: drmModeGetFB2 → export DMA-BUF fd via drmPrimeHandleToFD
+        // TODO: drmModeGetFB2 → export DMA-BUF fd via drmPrimeHandleToFD, then
+        // populate `GpuFrameHandle::DmaBuf` with the exported plane fds. Until
+        // the real implementation lands we return an empty CPU frame so the
+        // pipeline can be exercised without fabricating an invalid fd.
         Ok(CapturedFrame {
             sequence: self.frame_sequence,
             timestamp: std::time::Instant::now(),
@@ -104,14 +105,7 @@ impl CaptureSession for DrmCaptureSession {
             resolution: self.resolution,
             stride: self.resolution.width * 4,
             data: Vec::new(),
-            gpu_handle: Some(GpuFrameHandle::DmaBuf(DmaBufHandle {
-                fd: -1,
-                offset: 0,
-                stride: self.resolution.width * 4,
-                modifier: 0,
-                width: self.resolution.width,
-                height: self.resolution.height,
-            })),
+            gpu_handle: None,
         })
     }
 

@@ -1,7 +1,13 @@
 pub mod backend;
 pub mod color;
+// DMA-BUF GPU import is a unix/Linux concept (VA-API/Vulkan); Windows imports
+// DXGI shared textures directly inside the AMF backend.
+#[cfg(unix)]
+pub mod import;
 pub mod traits;
 
+#[cfg(unix)]
+pub use import::{classify_frame, GpuFrameImport, ImportPath};
 pub use traits::{EncodeSession, VideoEncoder};
 
 use flux_core::error::Result;

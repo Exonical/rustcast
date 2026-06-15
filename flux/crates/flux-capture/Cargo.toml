@@ -14,5 +14,18 @@ tokio = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 
+[features]
+default = []
+# Expose the mock portal / PipeWire sources to downstream crates (tests).
+mock = []
+# Real Linux capture backends. The PipeWire/portal system crates (ashpd,
+# pipewire, libspa, drm-fourcc) are attached as optional deps in Phase 1/2;
+# the trait scaffolding and bridge land first under these flags.
+capture-pipewire = []
+capture-drm = []
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

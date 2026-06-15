@@ -5,7 +5,7 @@
 //! zero-copy GPU encode.
 
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::{CapturedFrame, DmaBufHandle, GpuFrameHandle};
+use flux_core::frame::CapturedFrame;
 use flux_core::types::{PixelFormat, Resolution};
 
 use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
@@ -111,6 +111,9 @@ impl PipeWireCaptureSession {
 
         self.frame_sequence += 1;
 
+        // Until the real PipeWire stream is wired up (see `bridge` module and
+        // the `PipewireFrameSource` trait), return an empty CPU frame rather
+        // than fabricating an invalid DMA-BUF fd.
         Ok(CapturedFrame {
             sequence: self.frame_sequence,
             timestamp: std::time::Instant::now(),
@@ -118,14 +121,7 @@ impl PipeWireCaptureSession {
             resolution: self.resolution,
             stride: self.resolution.width * 4,
             data: Vec::new(),
-            gpu_handle: Some(GpuFrameHandle::DmaBuf(DmaBufHandle {
-                fd: -1, // placeholder
-                offset: 0,
-                stride: self.resolution.width * 4,
-                modifier: 0,
-                width: self.resolution.width,
-                height: self.resolution.height,
-            })),
+            gpu_handle: None,
         })
     }
 }
