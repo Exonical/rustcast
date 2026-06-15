@@ -430,6 +430,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitreader"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "886559b1e163d56c765bc3a985febb4eee8009f625244511d8ee3c432e08c066"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,6 +698,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "cros-codecs"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4862478feb3de946be3e4b7f316b18957a45d88d1c3695c606bdf6e76a2d2bfb"
+dependencies = [
+ "anyhow",
+ "bitreader",
+ "byteorder",
+ "bytes",
+ "crc32fast",
+ "cros-libva",
+ "enumn",
+ "log",
+ "nix 0.29.0",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cros-libva"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b1546af142fbf11a5cad3d1ee2ef64e4d7b69a28b244a79484024a1bc931c17"
+dependencies = [
+ "bitflags 2.11.0",
+ "log",
+ "pkg-config",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,6 +882,17 @@ name = "enumflags2_derive"
 version = "0.7.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.115",
+]
+
+[[package]]
+name = "enumn"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f9ed6b3789237c8a0c1c505af1c7eb2c560df6186f01b098c3a1064ea532f38"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1022,6 +1072,8 @@ name = "flux-encode"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "cros-codecs",
+ "cros-libva",
  "crossbeam-channel",
  "flux-core",
  "parking_lot",

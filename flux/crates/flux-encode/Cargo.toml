@@ -15,12 +15,19 @@ crossbeam-channel = { workspace = true }
 
 [features]
 default = []
-# Real Linux encoder backends. The libva bindings are attached as optional
-# deps in Phase 2; the GpuFrameImport scaffolding lands first under these flags.
-encoder-vaapi = []
+# Real Linux VA-API encoder: cros-codecs synthesizes the H.264/H.265 bitstream
+# on top of libva (cros-libva). Pulls in the libva runtime + headers, so it is
+# optional and only meaningful on Linux.
+encoder-vaapi = ["dep:cros-codecs", "dep:libva"]
 encoder-vulkan = []
 # Optional FFmpeg VA-API backend for breadth/debugging (Phase 4+).
 encoder-ffmpeg = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Hardware H.264/H.265 VA-API encoder (bitstream synthesis + VA pipeline).
+cros-codecs = { version = "0.0.5", default-features = false, features = ["vaapi"], optional = true }
+# Safe libva wrappers (Display / Surface / Image) for surface upload.
+libva = { package = "cros-libva", version = "0.0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
