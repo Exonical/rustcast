@@ -603,7 +603,12 @@ impl EncoderState {
 
         let width = config.resolution.width;
         let height = config.resolution.height;
-        let sw_format = surface_sw_format(config.dynamic_range);
+        // Hardware VA-API surfaces take NV12 (SDR) / P010 (HDR); the software
+        // encoders (libx264/libopenh264) take planar YUV420P.
+        let sw_format = match accel {
+            Accel::Hardware => surface_sw_format(config.dynamic_range),
+            Accel::Software => Pixel::YUV420P,
+        };
 
         let mut octx = ff::codec::context::Context::new_with_codec(codec);
 
