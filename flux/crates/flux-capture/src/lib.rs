@@ -31,6 +31,39 @@ pub use traits::{CaptureSession, ScreenCapture};
 use flux_core::error::Result;
 use flux_core::types::CaptureBackend;
 
+/// Probe which Wayland portal interfaces are reachable on the session bus.
+///
+/// Builds the `ScreenCast` / `RemoteDesktop` proxies, each of which reads the
+/// interface `version` property on construction and fails with
+/// `PortalNotFound` when the portal is absent — so successful construction
+/// means the interface is available. Runs on a throwaway current-thread
+/// runtime; returns an all-false [`PortalCapabilities`] if no session bus /
+/// portal is present.
+#[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+pub fn probe_portal_capabilities() -> flux_core::capability::PortalCapabilities {
+    use ashpd::desktop::remote_desktop::RemoteDesktop;
+    use ashpd::desktop::screencast::Screencast;
+    use flux_core::capability::PortalCapabilities;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!("portal probe: could not build runtime: {e}");
+            return PortalCapabilities::default();
+        }
+    };
+
+    runtime.block_on(async {
+        PortalCapabilities {
+            screencast: Screencast::new().await.is_ok(),
+            remote_desktop: RemoteDesktop::new().await.is_ok(),
+            // ashpd does not expose the negotiated interface version publicly.
+            screencast_version: None,
+            remote_desktop_version: None,
+        }
+    })
+}
+
 /// Create the best available capture backend for this platform.
 pub fn create_capture(backend: Option<CaptureBackend>) -> Result<Box<dyn ScreenCapture>> {
     let backend = backend.unwrap_or_else(default_backend);
