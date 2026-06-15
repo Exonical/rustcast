@@ -35,19 +35,48 @@ pub struct CapturedFrame {
 /// Opaque handle to a GPU-resident frame.
 #[derive(Debug, Clone)]
 pub enum GpuFrameHandle {
-    /// DMA-BUF descriptor (Linux).
+    /// DMA-BUF descriptor (Linux/unix only — see [`DmaBufHandle`]).
+    #[cfg(unix)]
     DmaBuf(DmaBufHandle),
     /// DXGI shared texture handle (Windows).
     DxgiSharedTexture(DxgiTextureHandle),
 }
 
+/// A single plane of a DMA-BUF frame.
+///
+/// Multi-planar formats (e.g. NV12, P010) and some tiled/compressed DRM
+/// modifiers split a frame across up to four planes, each with its own
+/// file descriptor, byte offset, and row stride.
+///
+/// The descriptor is wrapped in `Arc<OwnedFd>` so that:
+/// - the fd is closed exactly once when the last clone is dropped, and
+/// - `CapturedFrame` (which owns this) can stay `Clone` without `dup(2)`-ing
+///   the fd on every clone — clones share the same underlying DMA-BUF.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct DmaBufPlane {
+    /// Owned DMA-BUF file descriptor for this plane.
+    pub fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    /// Byte offset of the plane within the buffer referenced by `fd`.
+    pub offset: u32,
+    /// Row stride in bytes.
+    pub stride: u32,
+}
+
 /// Linux DMA-BUF frame descriptor.
+///
+/// Describes a GPU-resident frame that can be imported into an encoder (e.g.
+/// VA-API via `VASurfaceAttribExternalBuffers` / `DRM_PRIME_2`) with no CPU
+/// copy.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct DmaBufHandle {
-    pub fd: i32,
-    pub offset: u32,
-    pub stride: u32,
+    /// One entry per plane (1 for packed RGB/BGRx, 2 for NV12/P010, …).
+    pub planes: Vec<DmaBufPlane>,
+    /// DRM format modifier shared by all planes (`DRM_FORMAT_MOD_*`).
     pub modifier: u64,
+    /// DRM FourCC pixel format (`DRM_FORMAT_*`, e.g. `XR24`, `NV12`).
+    pub fourcc: u32,
     pub width: u32,
     pub height: u32,
 }

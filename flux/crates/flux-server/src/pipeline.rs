@@ -3,36 +3,49 @@
 //! Orchestrates the full media pipeline for a single session. Each pipeline
 //! runs on its own thread (capture/encode are synchronous GPU operations)
 //! with async I/O for network transmission.
+//!
+//! This is the Phase 0 skeleton: it performs capability detection, selects the
+//! capture/encoder/input backends, constructs them, and builds the encoder
+//! configuration. The dedicated capture→encode→transmit thread and the audio
+//! path are wired up in later phases (see the project plan).
 
+use parking_lot::Mutex;
+
+use flux_capture::CaptureSession;
+use flux_core::capability::{BaseCapabilityProbe, InputBackendKind, PlatformCapabilities};
 use flux_core::config::FluxConfig;
-use flux_core::error::Result;
+use flux_core::error::{FluxError, Result};
 use flux_core::platform::PlatformInfo;
+use flux_core::types::{CaptureBackend, EncoderBackend};
+use flux_encode::traits::EncodeConfig;
+use flux_encode::EncodeSession;
+use flux_input::{select_input_backend, InputBackend};
 
 use crate::session::SessionParams;
 
 /// The full capture → encode → transmit pipeline for one session.
 #[allow(dead_code)]
 pub struct StreamingPipeline {
-    // Pipeline state
     running: bool,
-    // TODO: Handles to the capture, encode, and transmit subsystems
-    //   - CaptureSession (from flux-capture)
-    //   - EncodeSession (from flux-encode)
-    //   - AudioCaptureSession + OpusEncoder (from flux-audio)
-    //   - Packetizer (from flux-transport)
-    //   - UDP sockets or QUIC connection for output
-    //   - InputSink (from flux-input)
-    //   - Thread handles for the pipeline loops
+    /// Probed host capabilities used to drive backend selection.
+    capabilities: PlatformCapabilities,
+    capture_backend: CaptureBackend,
+    encoder_backend: EncoderBackend,
+    encode_config: EncodeConfig,
+    /// Active capture session (Phase 1+ feeds this from PipeWire).
+    capture: Mutex<Box<dyn CaptureSession>>,
+    /// Active encode session.
+    encode: Mutex<Box<dyn EncodeSession>>,
+    /// Input injection backend, present when input forwarding is enabled.
+    input: Option<Box<dyn InputBackend>>,
 }
 
+// Accessors and live controls (request_idr/set_bitrate) are consumed by the
+// HTTP control path wired up in later phases; allow them ahead of that.
 #[allow(dead_code)]
 impl StreamingPipeline {
-    /// Create and initialize all pipeline components.
-    pub fn new(
-        _config: &FluxConfig,
-        _platform: &PlatformInfo,
-        params: &SessionParams,
-    ) -> Result<Self> {
+    /// Create and initialize the pipeline components.
+    pub fn new(config: &FluxConfig, platform: &PlatformInfo, params: &SessionParams) -> Result<Self> {
         tracing::info!(
             "Initializing streaming pipeline: {} {}@{}fps {}kbps",
             params.codec,
@@ -41,130 +54,165 @@ impl StreamingPipeline {
             params.video_bitrate_kbps,
         );
 
-        // ── Step 1: Initialize screen capture ────────────────────────
-        //
-        // let capture_backend = platform.available_capture_backends.first()
-        //     .ok_or(FluxError::NoCaptureBackend)?;
-        // let capture = flux_capture::create_capture(Some(*capture_backend))?;
-        // let capture_session = capture.start_capture(
-        //     None, // primary display
-        //     params.resolution,
-        //     params.fps,
-        // )?;
+        let capabilities = BaseCapabilityProbe::from_platform_info(platform);
 
-        // ── Step 2: Initialize GPU video encoder ─────────────────────
-        //
-        // let encoder_backend = platform.available_encoder_backends.first()
-        //     .ok_or(FluxError::NoEncoderBackend)?;
-        // let encoder = flux_encode::create_encoder(Some(*encoder_backend))?;
-        // let encode_config = flux_encode::traits::EncodeConfig {
-        //     codec: params.codec,
-        //     resolution: params.resolution,
-        //     framerate: params.fps,
-        //     bitrate_kbps: params.video_bitrate_kbps,
-        //     ..Default::default()
-        // };
-        // let encode_session = encoder.create_session(encode_config)?;
+        // ── Select backends ─────────────────────────────────────────
+        let capture_backend = *capabilities
+            .capture_backends
+            .first()
+            .ok_or(FluxError::NoCaptureBackend)?;
+        let encoder_backend = *capabilities
+            .encoder_backends
+            .first()
+            .ok_or(FluxError::NoEncoderBackend)?;
 
-        // ── Step 3: Initialize audio capture + Opus encoder ──────────
-        //
-        // let mut audio_capture = flux_audio::create_audio_capture()?;
-        // audio_capture.start(None)?;
-        // let opus_encoder = flux_audio::create_audio_encoder(
-        //     flux_audio::encoder::OpusEncoderConfig {
-        //         bitrate_bps: params.audio_bitrate_kbps * 1000,
-        //         ..Default::default()
-        //     }
-        // )?;
+        tracing::info!(
+            "Selected backends: capture={:?} encoder={:?} input={:?}",
+            capture_backend,
+            encoder_backend,
+            capabilities.input_backend,
+        );
 
-        // ── Step 4: Initialize input sink ────────────────────────────
-        //
-        // let input_sink = if params.enable_input {
-        //     Some(flux_input::InputSink::new(
-        //         params.resolution.width,
-        //         params.resolution.height,
-        //     )?)
-        // } else {
-        //     None
-        // };
+        // ── Capture ──────────────────────────────────────────────────
+        let capture_factory = flux_capture::create_capture(Some(capture_backend))?;
+        let capture_session = capture_factory.start_capture(None, params.resolution, params.fps)?;
 
-        // ── Step 5: Initialize network transport ─────────────────────
-        //
-        // let packetizer = flux_transport::packetizer::Packetizer::new(
-        //     config.video.fec_percentage,
-        //     rand::random::<u32>(), // SSRC
-        // );
-        //
-        // let video_socket = std::net::UdpSocket::bind((
-        //     config.bind_address.as_str(),
-        //     config.video.rtp_port,
-        // ))?;
-        //
-        // let audio_socket = std::net::UdpSocket::bind((
-        //     config.bind_address.as_str(),
-        //     config.audio.rtp_port,
-        // ))?;
+        // ── Encoder ──────────────────────────────────────────────────
+        let encode_config = EncodeConfig {
+            codec: params.codec,
+            resolution: params.resolution,
+            framerate: params.fps,
+            bitrate_kbps: params.video_bitrate_kbps,
+            ..Default::default()
+        };
+        let encoder = flux_encode::create_encoder(Some(encoder_backend))?;
+        encoder.validate_config(&encode_config)?;
+        let encode_session = encoder.create_session(encode_config.clone())?;
 
-        // ── Step 6: Spawn pipeline threads ───────────────────────────
-        //
-        // Video pipeline thread (dedicated, non-async for GPU sync):
-        //   loop {
-        //     let frame = capture_session.next_frame()?;
-        //     let packets = encode_session.encode(&frame)?;
-        //     for packet in packets {
-        //         let rtp_packets = packetizer.packetize(
-        //             &packet.data,
-        //             packet.is_keyframe,
-        //             frame_number,
-        //             &mut seq_num,
-        //             rtp_timestamp,
-        //             config.video.max_packet_size as usize,
-        //             payload_type,
-        //         );
-        //         for rtp in rtp_packets {
-        //             video_socket.send_to(&rtp, client_addr)?;
-        //         }
-        //     }
-        //   }
-        //
-        // Audio pipeline thread:
-        //   loop {
-        //     let samples = audio_capture.next_samples()?;
-        //     let encoded = opus_encoder.encode(&samples)?;
-        //     // RTP packetize and send
-        //   }
-        //
-        // Input receiver (async task):
-        //   loop {
-        //     let event = input_socket.recv().await;
-        //     input_sink.handle_event(&event)?;
-        //   }
+        // ── Input ────────────────────────────────────────────────────
+        let input = if params.enable_input {
+            Some(select_input_backend(capabilities.input_backend))
+        } else {
+            None
+        };
 
-        Ok(Self { running: true })
+        // ── Transport / threads (Phase 1+) ───────────────────────────
+        // The dedicated capture→encode loop and UDP/RTP transmit path are
+        // wired up once the real PipeWire capture and VA-API encode backends
+        // land. `config` is retained for that work.
+        let _ = config;
+
+        Ok(Self {
+            running: true,
+            capabilities,
+            capture_backend,
+            encoder_backend,
+            encode_config,
+            capture: Mutex::new(capture_session),
+            encode: Mutex::new(encode_session),
+            input,
+        })
     }
 
-    /// Request an IDR frame from the encoder.
+    /// The capture backend selected for this session.
+    pub fn capture_backend(&self) -> CaptureBackend {
+        self.capture_backend
+    }
+
+    /// The encoder backend selected for this session.
+    pub fn encoder_backend(&self) -> EncoderBackend {
+        self.encoder_backend
+    }
+
+    /// The encoder configuration in use.
+    pub fn encode_config(&self) -> &EncodeConfig {
+        &self.encode_config
+    }
+
+    /// The input backend kind, if input forwarding is enabled.
+    pub fn input_backend(&self) -> Option<InputBackendKind> {
+        self.input.as_ref().map(|_| self.capabilities.input_backend)
+    }
+
+    /// Whether the pipeline is running.
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Request an IDR / key-frame from the encoder.
     pub fn request_idr(&self) {
-        // TODO: Send IDR request to encode session via channel
+        self.encode.lock().request_idr();
         tracing::debug!("IDR frame requested");
     }
 
     /// Update the target video bitrate.
     pub fn set_bitrate(&self, bitrate_kbps: u32) -> Result<()> {
-        // TODO: Send bitrate update to encode session via channel
+        self.encode.lock().set_bitrate(bitrate_kbps)?;
         tracing::info!("Video bitrate updated to {} kbps", bitrate_kbps);
         Ok(())
     }
 
-    /// Stop all pipeline threads and release resources.
+    /// Stop the pipeline and release resources.
     pub fn stop(self) -> Result<()> {
         tracing::info!("Stopping streaming pipeline");
-        // TODO:
-        //   1. Signal all threads to stop (via AtomicBool or channel)
-        //   2. Join pipeline threads
-        //   3. Flush encoder
-        //   4. Close sockets
-        //   5. Release capture session
+        self.capture.lock().stop()?;
+        let _ = self.encode.lock().flush();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_core::platform::Os;
+    use flux_core::types::{GpuVendor, Resolution, VideoCodec};
+
+    fn linux_amd_platform() -> PlatformInfo {
+        PlatformInfo {
+            os: Os::Linux,
+            gpu_vendor: GpuVendor::Amd,
+            available_capture_backends: vec![CaptureBackend::PipeWire, CaptureBackend::Drm],
+            available_encoder_backends: vec![EncoderBackend::Vaapi, EncoderBackend::Software],
+        }
+    }
+
+    fn params(enable_input: bool) -> SessionParams {
+        SessionParams {
+            client_name: "test".into(),
+            codec: VideoCodec::H264,
+            resolution: Resolution::new(1280, 720),
+            fps: 60,
+            video_bitrate_kbps: 8000,
+            audio_bitrate_kbps: 128,
+            enable_input,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builds_and_selects_linux_amd_backends() {
+        let config = FluxConfig::default();
+        let platform = linux_amd_platform();
+        let pipeline = StreamingPipeline::new(&config, &platform, &params(true)).unwrap();
+
+        assert_eq!(pipeline.capture_backend(), CaptureBackend::PipeWire);
+        assert_eq!(pipeline.encoder_backend(), EncoderBackend::Vaapi);
+        assert_eq!(pipeline.encode_config().codec, VideoCodec::H264);
+        assert_eq!(pipeline.encode_config().bitrate_kbps, 8000);
+        assert_eq!(pipeline.input_backend(), Some(InputBackendKind::Portal));
+        assert!(pipeline.is_running());
+
+        pipeline.request_idr();
+        pipeline.set_bitrate(4000).unwrap();
+        pipeline.stop().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_disabled_has_no_backend() {
+        let config = FluxConfig::default();
+        let platform = linux_amd_platform();
+        let pipeline = StreamingPipeline::new(&config, &platform, &params(false)).unwrap();
+        assert!(pipeline.input_backend().is_none());
     }
 }
