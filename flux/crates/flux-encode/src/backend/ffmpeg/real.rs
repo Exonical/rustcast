@@ -101,6 +101,41 @@ fn low_latency_options(config: &EncodeConfig) -> Vec<(&'static str, String)> {
     vec![("rc_mode", rc_mode.to_string()), ("async_depth", "1".to_string())]
 }
 
+/// Whether this session encodes on the GPU (VA-API surfaces) or the CPU
+/// (libx264/libx265 software fallback).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Accel {
+    Hardware,
+    Software,
+}
+
+/// libavcodec software encoder name for a codec, picking the first one the
+/// FFmpeg build actually exposes. Used by the CPU fallback when no VA-API
+/// driver is available.
+fn sw_encoder_name(codec: VideoCodec) -> Option<&'static str> {
+    let candidates: &[&'static str] = match codec {
+        VideoCodec::H264 => &["libx264", "libopenh264"],
+        VideoCodec::H265 => &["libx265"],
+        VideoCodec::Av1 => &[],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|name| ff::encoder::find_by_name(name).is_some())
+}
+
+/// Low-latency private options for a software encoder. x264/x265 take the
+/// `ultrafast`/`zerolatency` preset+tune; other encoders are left at defaults.
+fn sw_low_latency_options(encoder_name: &str) -> Vec<(&'static str, String)> {
+    match encoder_name {
+        "libx264" | "libx265" => vec![
+            ("preset", "ultrafast".to_string()),
+            ("tune", "zerolatency".to_string()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Reject configurations this backend cannot drive before touching hardware.
 fn validate(config: &EncodeConfig) -> Result<()> {
     if encoder_name(config.codec).is_none() {
@@ -330,7 +365,79 @@ impl VideoEncoder for FfmpegVaapiEncoder {
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
-        Ok(Box::new(FfmpegSession::spawn(config, self.device.new_ref())?))
+        Ok(Box::new(FfmpegSession::spawn(
+            config,
+            Accel::Hardware,
+            Some(self.device.new_ref()),
+        )?))
+    }
+}
+
+/// FFmpeg software (libx264/libx265) encoder — the CPU fallback used when no
+/// VA-API driver is available. Reuses the same swscale + session machinery as
+/// the hardware path, but encodes the CPU frame directly (no VA-API surfaces).
+pub struct FfmpegSoftwareEncoder {
+    capabilities: EncoderCapabilities,
+}
+
+impl FfmpegSoftwareEncoder {
+    pub fn new() -> Result<Self> {
+        ff::init().map_err(|e| FluxError::EncoderInit(format!("ffmpeg init failed: {e}")))?;
+        tracing::info!("Initializing FFmpeg software (libx264/libx265) encoder");
+
+        let mut supported = Vec::new();
+        if sw_encoder_name(VideoCodec::H264).is_some() {
+            supported.push(VideoCodec::H264);
+        }
+        if sw_encoder_name(VideoCodec::H265).is_some() {
+            supported.push(VideoCodec::H265);
+        }
+        if supported.is_empty() {
+            return Err(FluxError::EncoderInit(
+                "FFmpeg build exposes no software H.264/H.265 encoder (need libx264/libx265)".into(),
+            ));
+        }
+
+        let capabilities = EncoderCapabilities {
+            name: "ffmpeg-software",
+            supported_codecs: supported.clone(),
+            supports_hdr: false,
+            supports_yuv444: false,
+            max_resolution: Resolution::new(7680, 4320),
+            max_framerate: 240,
+        };
+        tracing::info!(codecs = ?capabilities.supported_codecs, "FFmpeg software encoder ready");
+        Ok(Self { capabilities })
+    }
+}
+
+impl VideoEncoder for FfmpegSoftwareEncoder {
+    fn name(&self) -> &'static str {
+        "ffmpeg-software"
+    }
+
+    fn capabilities(&self) -> Result<EncoderCapabilities> {
+        Ok(self.capabilities.clone())
+    }
+
+    fn validate_config(&self, config: &EncodeConfig) -> Result<()> {
+        if !self.capabilities.supported_codecs.contains(&config.codec) {
+            return Err(FluxError::EncoderInit(format!(
+                "FFmpeg software backend has no encoder for {:?}",
+                config.codec
+            )));
+        }
+        if config.dynamic_range == DynamicRange::Hdr10 {
+            return Err(FluxError::EncoderInit(
+                "HDR10 is not supported by the FFmpeg software fallback".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        self.validate_config(&config)?;
+        Ok(Box::new(FfmpegSession::spawn(config, Accel::Software, None)?))
     }
 }
 
@@ -356,13 +463,13 @@ pub struct FfmpegSession {
 }
 
 impl FfmpegSession {
-    fn spawn(config: EncodeConfig, device: HwDevice) -> Result<Self> {
+    fn spawn(config: EncodeConfig, accel: Accel, device: Option<HwDevice>) -> Result<Self> {
         let (tx, rx) = unbounded::<Cmd>();
         let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
 
         let handle = thread::Builder::new()
             .name("flux-ffmpeg-encode".into())
-            .spawn(move || run_encode_thread(config, device, rx, ready_tx))
+            .spawn(move || run_encode_thread(config, accel, device, rx, ready_tx))
             .map_err(|e| FluxError::EncoderInit(format!("failed to spawn encode thread: {e}")))?;
 
         match ready_rx.recv() {
@@ -428,11 +535,12 @@ impl Drop for FfmpegSession {
 
 fn run_encode_thread(
     config: EncodeConfig,
-    device: HwDevice,
+    accel: Accel,
+    device: Option<HwDevice>,
     rx: crossbeam_channel::Receiver<Cmd>,
     ready_tx: Sender<Result<()>>,
 ) {
-    let mut state = match EncoderState::new(&config, device) {
+    let mut state = match EncoderState::new(&config, accel, device) {
         Ok(state) => {
             let _ = ready_tx.send(Ok(()));
             state
@@ -461,11 +569,13 @@ fn run_encode_thread(
 /// All `!Send` FFmpeg state, owned by the encode thread.
 struct EncoderState {
     encoder: ff::encoder::Video,
-    /// VA-API hardware frame pool (`AVBufferRef*`); kept alive to allocate
-    /// hardware frames for each upload.
-    frames_ctx: *mut ff::ffi::AVBufferRef,
-    /// Owned device ref, kept alive for the lifetime of the frame pool.
-    _device: HwDevice,
+    /// VA-API hardware frame pool (`AVBufferRef*`) for the hardware path; kept
+    /// alive to allocate hardware frames for each upload. `None` on the
+    /// software path, which encodes CPU frames directly.
+    frames_ctx: Option<*mut ff::ffi::AVBufferRef>,
+    /// Owned device ref, kept alive for the lifetime of the frame pool
+    /// (hardware path only).
+    _device: Option<HwDevice>,
     /// swscale context, cached and (re)built lazily for the input format the
     /// capture path actually delivers (BGRA or RGBA).
     scaler: Option<(Pixel, ff::software::scaling::Context)>,
@@ -477,8 +587,17 @@ struct EncoderState {
 }
 
 impl EncoderState {
-    fn new(config: &EncodeConfig, device: HwDevice) -> Result<Self> {
-        let name = encoder_name(config.codec).ok_or_else(|| FluxError::EncoderInit("unsupported codec".into()))?;
+    fn new(config: &EncodeConfig, accel: Accel, device: Option<HwDevice>) -> Result<Self> {
+        let name = match accel {
+            Accel::Hardware => encoder_name(config.codec)
+                .ok_or_else(|| FluxError::EncoderInit("unsupported codec".into()))?,
+            Accel::Software => sw_encoder_name(config.codec).ok_or_else(|| {
+                FluxError::EncoderInit(format!(
+                    "no software FFmpeg encoder for {:?} (need libx264/libx265)",
+                    config.codec
+                ))
+            })?,
+        };
         let codec = ff::encoder::find_by_name(name)
             .ok_or_else(|| FluxError::EncoderInit(format!("FFmpeg encoder {name} not found")))?;
 
@@ -486,18 +605,43 @@ impl EncoderState {
         let height = config.resolution.height;
         let sw_format = surface_sw_format(config.dynamic_range);
 
-        // Build a hardware frame pool (VA-API surfaces with the chosen sw
-        // format). Held in an RAII guard so it is freed if any `?` below bails
-        // out before `EncoderState` (whose `Drop` then owns it) is constructed.
-        let frames = create_hw_frames_ctx(&device, sw_format, width, height)?;
-
         let mut octx = ff::codec::context::Context::new_with_codec(codec);
+
+        // Hardware: build a VA-API surface pool and feed the encoder VAAPI
+        // surfaces. Software: the encoder ingests the CPU frame directly in its
+        // `sw_format`. The pool is held in an RAII guard so it is freed if any
+        // `?` below bails out before `EncoderState` (whose `Drop` then owns it)
+        // is constructed.
+        let frames_ctx = match accel {
+            Accel::Hardware => {
+                let device_ref = device.as_ref().ok_or_else(|| {
+                    FluxError::EncoderInit("hardware encode requires a VA-API device".into())
+                })?;
+                let frames = create_hw_frames_ctx(device_ref, sw_format, width, height)?;
+                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
+                unsafe {
+                    let ctx = octx.as_mut_ptr();
+                    (*ctx).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                    // Bind the hardware frame pool; the encoder ingests VA-API surfaces.
+                    (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames.raw());
+                }
+                // Init succeeded so far; transfer ownership to `EncoderState::drop`.
+                Some(frames.into_raw())
+            }
+            Accel::Software => {
+                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
+                unsafe {
+                    (*octx.as_mut_ptr()).pix_fmt = pixel_to_ffi(sw_format);
+                }
+                None
+            }
+        };
+
         // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
         unsafe {
             let ctx = octx.as_mut_ptr();
             (*ctx).width = width as c_int;
             (*ctx).height = height as c_int;
-            (*ctx).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
             (*ctx).time_base = ff::ffi::AVRational {
                 num: 1,
                 den: config.framerate.max(1) as c_int,
@@ -515,12 +659,14 @@ impl EncoderState {
             // `rc_buffer_size` is a C `int`; clamp so huge bitrates don't wrap
             // to a negative buffer size.
             (*ctx).rc_buffer_size = bits.min(i32::MAX as i64) as c_int;
-            // Bind the hardware frame pool; the encoder ingests VA-API surfaces.
-            (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames.raw());
         }
 
         let mut opts = ff::Dictionary::new();
-        for (k, v) in low_latency_options(config) {
+        let option_list = match accel {
+            Accel::Hardware => low_latency_options(config),
+            Accel::Software => sw_low_latency_options(name),
+        };
+        for (k, v) in option_list {
             opts.set(k, &v);
         }
 
@@ -534,8 +680,7 @@ impl EncoderState {
 
         Ok(Self {
             encoder,
-            // Init succeeded; transfer pool ownership to `EncoderState::drop`.
-            frames_ctx: frames.into_raw(),
+            frames_ctx,
             _device: device,
             scaler: None,
             sw_format,
@@ -607,19 +752,25 @@ impl EncoderState {
                 reason: format!("swscale failed: {e}"),
             })?;
 
-        // 2. Upload the software frame into a pooled VA-API surface.
-        let mut hw = self.alloc_hw_frame(frame.sequence)?;
-        // SAFETY: both frames are valid; transfer copies sw planes into the surface.
-        let ret = unsafe { ff::ffi::av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0) };
-        if ret < 0 {
-            return Err(self.enc_err(frame.sequence, format!("hwframe upload failed ({ret})")));
-        }
+        // 2. Hardware: upload the software frame into a pooled VA-API surface.
+        //    Software: encode the CPU frame directly.
+        let mut enc_frame = if let Some(frames_ctx) = self.frames_ctx {
+            let mut hw = self.alloc_hw_frame(frames_ctx, frame.sequence)?;
+            // SAFETY: both frames are valid; transfer copies sw planes into the surface.
+            let ret = unsafe { ff::ffi::av_hwframe_transfer_data(hw.as_mut_ptr(), sw.as_ptr(), 0) };
+            if ret < 0 {
+                return Err(self.enc_err(frame.sequence, format!("hwframe upload failed ({ret})")));
+            }
+            hw
+        } else {
+            sw
+        };
 
-        hw.set_pts(Some(self.pts));
+        enc_frame.set_pts(Some(self.pts));
         if self.force_idr {
-            // SAFETY: `hw` owns a valid `AVFrame`; requesting an I picture forces an IDR.
+            // SAFETY: `enc_frame` owns a valid `AVFrame`; requesting an I picture forces an IDR.
             unsafe {
-                (*hw.as_mut_ptr()).pict_type = ff::ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*enc_frame.as_mut_ptr()).pict_type = ff::ffi::AVPictureType::AV_PICTURE_TYPE_I;
             }
             self.force_idr = false;
         }
@@ -627,7 +778,7 @@ impl EncoderState {
 
         // 3. Encode and drain any available packets.
         self.encoder
-            .send_frame(&hw)
+            .send_frame(&enc_frame)
             .map_err(|e| self.enc_err(frame.sequence, format!("send_frame failed: {e}")))?;
         self.drain(frame.sequence)
     }
@@ -664,10 +815,14 @@ impl EncoderState {
     }
 
     /// Allocate a hardware frame backed by the VA-API surface pool.
-    fn alloc_hw_frame(&self, frame: u64) -> Result<ff::frame::Video> {
+    fn alloc_hw_frame(
+        &self,
+        frames_ctx: *mut ff::ffi::AVBufferRef,
+        frame: u64,
+    ) -> Result<ff::frame::Video> {
         let mut hw = ff::frame::Video::empty();
         // SAFETY: `frames_ctx` is a valid hwframe context; `hw` is a fresh frame.
-        let ret = unsafe { ff::ffi::av_hwframe_get_buffer(self.frames_ctx, hw.as_mut_ptr(), 0) };
+        let ret = unsafe { ff::ffi::av_hwframe_get_buffer(frames_ctx, hw.as_mut_ptr(), 0) };
         if ret < 0 {
             return Err(self.enc_err(frame, format!("hwframe pool exhausted ({ret})")));
         }
@@ -695,8 +850,10 @@ impl EncoderState {
 
 impl Drop for EncoderState {
     fn drop(&mut self) {
-        // SAFETY: `frames_ctx` was obtained from `av_hwframe_ctx_alloc`.
-        unsafe { ff::ffi::av_buffer_unref(&mut self.frames_ctx) };
+        // SAFETY: `frames_ctx` (when present) was obtained from `av_hwframe_ctx_alloc`.
+        if let Some(ref mut ctx) = self.frames_ctx {
+            unsafe { ff::ffi::av_buffer_unref(ctx) };
+        }
     }
 }
 

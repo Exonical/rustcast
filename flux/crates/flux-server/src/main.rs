@@ -348,6 +348,34 @@ fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
     }
 }
 
+/// Create an encoder of the given backend and open a session, returning `None`
+/// (with a warning logged) if either the encoder or the session can't be built.
+fn create_encode_session(
+    backend: flux_core::types::EncoderBackend,
+    config: flux_encode::traits::EncodeConfig,
+) -> Option<Box<dyn flux_encode::traits::EncodeSession>> {
+    let encoder = match flux_encode::create_encoder(Some(backend)) {
+        Ok(enc) => {
+            tracing::info!("Encoder created: {} ({:?})", enc.name(), backend);
+            enc
+        }
+        Err(e) => {
+            tracing::warn!("{:?} encoder not available: {}", backend, e);
+            return None;
+        }
+    };
+    match encoder.create_session(config) {
+        Ok(s) => {
+            tracing::info!("{:?} H.264 encode session started", backend);
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create {:?} encode session: {}", backend, e);
+            None
+        }
+    }
+}
+
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 fn capture_loop(
@@ -427,30 +455,20 @@ fn capture_loop(
         max_ref_frames: 1,
     };
 
-    let backend = preferred_encoder_backend();
-    let encoder = match flux_encode::create_encoder(Some(backend)) {
-        Ok(enc) => {
-            tracing::info!("Encoder created: {} ({:?})", enc.name(), backend);
-            Some(enc)
-        }
-        Err(e) => {
-            tracing::warn!("{:?} encoder not available, H.264 encoding disabled: {}", backend, e);
-            None
-        }
-    };
-
-    let mut encode_session = encoder.and_then(|enc| {
-        match enc.create_session(encoder_config) {
-            Ok(s) => {
-                tracing::info!("{:?} H.264 encode session started", backend);
-                Some(s)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create {:?} encode session: {}", backend, e);
-                None
-            }
-        }
-    });
+    // Prefer the platform hardware encoder; if it can't be opened (e.g. no
+    // VA-API driver installed), fall back to the software encoder so the
+    // pipeline still produces a stream.
+    let preferred = preferred_encoder_backend();
+    let mut backend = preferred;
+    let mut encode_session = create_encode_session(preferred, encoder_config.clone());
+    if encode_session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
+        tracing::warn!(
+            "{:?} encoder unavailable; falling back to software H.264 encoding",
+            preferred
+        );
+        backend = flux_core::types::EncoderBackend::Software;
+        encode_session = create_encode_session(backend, encoder_config.clone());
+    }
 
     // Verification file (first ~5 seconds)
     let h264_path = std::path::PathBuf::from("flux_capture_test.h264");

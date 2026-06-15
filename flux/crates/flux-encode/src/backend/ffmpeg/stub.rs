@@ -40,6 +40,37 @@ impl VideoEncoder for FfmpegVaapiEncoder {
     }
 }
 
+/// FFmpeg software encoder (Linux) — disabled build.
+pub struct FfmpegSoftwareEncoder {
+    _private: (),
+}
+
+impl FfmpegSoftwareEncoder {
+    pub fn new() -> Result<Self> {
+        Err(FluxError::EncoderInit(
+            "FFmpeg software backend not compiled in (enable the `encoder-ffmpeg` feature)".into(),
+        ))
+    }
+}
+
+impl VideoEncoder for FfmpegSoftwareEncoder {
+    fn name(&self) -> &'static str {
+        "ffmpeg-software"
+    }
+
+    fn capabilities(&self) -> Result<EncoderCapabilities> {
+        Err(FluxError::EncoderInit("FFmpeg software backend not compiled in".into()))
+    }
+
+    fn validate_config(&self, _config: &EncodeConfig) -> Result<()> {
+        Err(FluxError::EncoderInit("FFmpeg software backend not compiled in".into()))
+    }
+
+    fn create_session(&self, _config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        Err(FluxError::EncoderInit("FFmpeg software backend not compiled in".into()))
+    }
+}
+
 // Silence unused warnings for the trait's frame type in the disabled build.
 #[allow(dead_code)]
 fn _unused(_: &CapturedFrame) -> Option<EncodedPacket> {

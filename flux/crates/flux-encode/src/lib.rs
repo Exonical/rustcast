@@ -33,7 +33,19 @@ pub fn create_encoder(backend: Option<EncoderBackend>) -> Result<Box<dyn VideoEn
 
         EncoderBackend::VulkanVideo => Ok(Box::new(backend::vulkan::VulkanVideoEncoder::new()?)),
 
-        EncoderBackend::Software => Ok(Box::new(backend::software::SoftwareEncoder::new()?)),
+        EncoderBackend::Software => {
+            // On Linux with the FFmpeg backend compiled in, the software path is
+            // a real libx264/libx265 encoder (a usable CPU fallback when no
+            // VA-API driver is present); otherwise it is the placeholder encoder.
+            #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+            {
+                Ok(Box::new(backend::ffmpeg::FfmpegSoftwareEncoder::new()?))
+            }
+            #[cfg(not(all(target_os = "linux", feature = "encoder-ffmpeg")))]
+            {
+                Ok(Box::new(backend::software::SoftwareEncoder::new()?))
+            }
+        }
 
         #[allow(unreachable_patterns)]
         _ => Err(flux_core::FluxError::NoEncoderBackend),
