@@ -56,9 +56,8 @@ impl ScreenCapture for PipeWireCapture {
         resolution: Resolution,
         framerate: u32,
     ) -> Result<Box<dyn CaptureSession>> {
-        let display_id = display_id.unwrap_or(0);
         tracing::info!(
-            "Starting PipeWire capture on display {} at {}@{}fps",
+            "Starting PipeWire capture on display {:?} at {}@{}fps",
             display_id,
             resolution,
             framerate
@@ -66,13 +65,15 @@ impl ScreenCapture for PipeWireCapture {
 
         #[cfg(feature = "capture-pipewire")]
         {
-            real::start_portal_capture(resolution, framerate)
+            real::start_portal_capture(display_id, resolution, framerate)
         }
 
         #[cfg(not(feature = "capture-pipewire"))]
         {
             Ok(Box::new(PipeWireCaptureSession::new(
-                display_id, resolution, framerate,
+                display_id.unwrap_or(0),
+                resolution,
+                framerate,
             )?))
         }
     }
@@ -85,18 +86,30 @@ mod real {
     use super::*;
     use crate::pipewire_source::PipewireStreamSource;
     use crate::portal::XdgPortalSession;
-    use crate::session::{FormatPrefs, FrameSourceSession, PipewireFrameSource, PortalOptions, PortalSession};
+    use crate::session::{
+        select_stream, FormatPrefs, FrameSourceSession, PipewireFrameSource, PortalOptions, PortalSession,
+    };
     use std::time::Duration;
 
     /// Negotiate an `xdg-desktop-portal` ScreenCast+RemoteDesktop session and
-    /// connect a live PipeWire stream to the first granted node.
+    /// connect a live PipeWire stream to the selected granted node.
+    ///
+    /// `display_id`, when set, is the PipeWire `node_id` of the granted stream
+    /// to capture (multi-monitor); `None` selects the primary monitor (the
+    /// stream at the virtual-desktop origin) via [`select_stream`]. When the
+    /// caller wants more than one monitor offered in the dialog, the portal is
+    /// asked to allow multiple sources.
     ///
     /// The portal negotiation is async (zbus) and prompts the user for
     /// consent, so it is driven on a dedicated thread that owns a Tokio
     /// runtime; that runtime is then kept alive inside the returned session so
     /// the portal's D-Bus connection (and therefore the PipeWire stream) stays
     /// open for the capture's lifetime.
-    pub(super) fn start_portal_capture(resolution: Resolution, framerate: u32) -> Result<Box<dyn CaptureSession>> {
+    pub(super) fn start_portal_capture(
+        display_id: Option<u32>,
+        resolution: Resolution,
+        framerate: u32,
+    ) -> Result<Box<dyn CaptureSession>> {
         let prefs = FormatPrefs {
             resolution,
             framerate,
@@ -111,13 +124,15 @@ mod real {
                     .build()
                     .map_err(|e| FluxError::Capture(format!("failed to build portal runtime: {e}")))?;
                 let (portal, node_id, fd) = runtime.block_on(async {
+                    let opts = PortalOptions {
+                        // Offer multiple sources when a specific monitor was
+                        // requested, so the grant can contain it.
+                        multiple: display_id.is_some(),
+                        ..Default::default()
+                    };
                     let mut portal = XdgPortalSession::new();
-                    let grant = portal.negotiate(PortalOptions::default()).await?;
-                    let node_id = grant
-                        .streams
-                        .first()
-                        .map(|s| s.node_id)
-                        .ok_or_else(|| FluxError::Capture("portal granted no streams".into()))?;
+                    let grant = portal.negotiate(opts).await?;
+                    let node_id = select_stream(&grant.streams, display_id)?.node_id;
                     Ok::<_, FluxError>((portal, node_id, grant.pipewire_fd))
                 })?;
                 Ok((runtime, portal, node_id, fd))

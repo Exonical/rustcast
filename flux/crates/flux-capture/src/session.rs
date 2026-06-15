@@ -95,6 +95,32 @@ pub struct PortalGrant {
     pub remote_desktop: bool,
 }
 
+/// Choose which granted [`PortalStream`] to capture.
+///
+/// `requested` is a PipeWire `node_id` — the stable per-stream identifier the
+/// portal reports (and the value [`crate::traits::DisplayInfo::id`] carries for
+/// this backend). When `Some`, the matching stream is returned, or an error if
+/// the compositor didn't grant it. When `None`, the stream positioned at the
+/// virtual-desktop origin `(0, 0)` is preferred (the conventional primary
+/// monitor), falling back to the first granted stream.
+pub fn select_stream(streams: &[PortalStream], requested: Option<u32>) -> Result<&PortalStream> {
+    if let Some(node_id) = requested {
+        return streams
+            .iter()
+            .find(|s| s.node_id == node_id)
+            .ok_or_else(|| {
+                FluxError::Capture(format!(
+                    "requested display (PipeWire node {node_id}) was not granted by the portal"
+                ))
+            });
+    }
+    streams
+        .iter()
+        .find(|s| s.position == Some((0, 0)))
+        .or_else(|| streams.first())
+        .ok_or_else(|| FluxError::Capture("portal granted no streams".into()))
+}
+
 /// Manages a Wayland portal session (async side).
 #[async_trait]
 pub trait PortalSession: Send {
@@ -216,5 +242,53 @@ impl<S: PipewireFrameSource> CaptureSession for FrameSourceSession<S> {
     fn stop(&mut self) -> Result<()> {
         self.running = false;
         self.source.disconnect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(node_id: u32, position: Option<(i32, i32)>) -> PortalStream {
+        PortalStream {
+            node_id,
+            position,
+            size: Some((1920, 1080)),
+            kind: SourceKind::Monitor,
+        }
+    }
+
+    #[test]
+    fn select_by_node_id_matches() {
+        let streams = vec![stream(10, Some((0, 0))), stream(20, Some((1920, 0)))];
+        let s = select_stream(&streams, Some(20)).unwrap();
+        assert_eq!(s.node_id, 20);
+    }
+
+    #[test]
+    fn select_by_unknown_node_id_errors() {
+        let streams = vec![stream(10, None)];
+        assert!(select_stream(&streams, Some(99)).is_err());
+    }
+
+    #[test]
+    fn select_none_prefers_origin_over_first() {
+        // Origin stream is not first; it should still win as the "primary".
+        let streams = vec![stream(20, Some((1920, 0))), stream(10, Some((0, 0)))];
+        let s = select_stream(&streams, None).unwrap();
+        assert_eq!(s.node_id, 10);
+    }
+
+    #[test]
+    fn select_none_falls_back_to_first_without_positions() {
+        let streams = vec![stream(7, None), stream(8, None)];
+        let s = select_stream(&streams, None).unwrap();
+        assert_eq!(s.node_id, 7);
+    }
+
+    #[test]
+    fn select_empty_errors() {
+        assert!(select_stream(&[], None).is_err());
+        assert!(select_stream(&[], Some(1)).is_err());
     }
 }
