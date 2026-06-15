@@ -12,6 +12,12 @@ use flux_core::types::Resolution;
 
 use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
 
+/// Placeholder display id returned by [`PipeWireCapture::enumerate_displays`]
+/// until it can report real per-output PipeWire node ids. It is *not* a real
+/// node id (PipeWire node 0 is the core object), so the portal capture path
+/// treats it as "no specific monitor" (i.e. primary).
+const STUB_DISPLAY_ID: u32 = 0;
+
 /// PipeWire screen-cast capture backend.
 pub struct PipeWireCapture {
     // Will hold PipeWire main-loop, core proxy, etc.
@@ -43,7 +49,7 @@ impl ScreenCapture for PipeWireCapture {
         // TODO: Query available outputs via wl_output or org.freedesktop.portal.ScreenCast.
         tracing::debug!("Enumerating PipeWire displays (stub)");
         Ok(vec![DisplayInfo {
-            id: 0,
+            id: STUB_DISPLAY_ID,
             name: "Primary Display".into(),
             native_resolution: Resolution::new(1920, 1080),
             primary: true,
@@ -65,7 +71,13 @@ impl ScreenCapture for PipeWireCapture {
 
         #[cfg(feature = "capture-pipewire")]
         {
-            real::start_portal_capture(display_id, resolution, framerate)
+            // `enumerate_displays` currently reports a single placeholder id
+            // (not a real PipeWire node id), so callers that forward it — e.g.
+            // the host picking `primary.id` — would otherwise ask
+            // `select_stream` to match a node that doesn't exist. Treat the
+            // placeholder as "primary" until real per-output node ids land.
+            let requested = display_id.filter(|&id| id != STUB_DISPLAY_ID);
+            real::start_portal_capture(requested, resolution, framerate)
         }
 
         #[cfg(not(feature = "capture-pipewire"))]
