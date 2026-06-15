@@ -84,10 +84,21 @@ impl InputBackend for NoopInputBackend {
 
 /// Select an input backend for the given kind.
 ///
-/// Real backends (portal/libei/uinput) are introduced in Phase 3; until then
-/// every kind resolves to [`NoopInputBackend`], which preserves the selection
-/// semantics so the pipeline wiring is exercised.
+/// With the `input-portal` feature on Linux, [`InputBackendKind::Portal`]
+/// resolves to the real `xdg-desktop-portal` RemoteDesktop backend; if its
+/// negotiation fails we fall back to [`NoopInputBackend`] so the pipeline still
+/// runs. Other kinds (libei, uinput) remain placeholders for now.
 pub fn select_input_backend(kind: InputBackendKind) -> Box<dyn InputBackend> {
+    #[cfg(all(target_os = "linux", feature = "input-portal"))]
+    if matches!(kind, InputBackendKind::Portal) {
+        match crate::portal_input::PortalInputBackend::new() {
+            Ok(backend) => return Box::new(backend),
+            Err(e) => {
+                tracing::warn!("portal input backend unavailable ({e}); falling back to noop");
+            }
+        }
+    }
+
     Box::new(NoopInputBackend::new(kind))
 }
 

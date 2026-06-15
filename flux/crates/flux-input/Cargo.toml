@@ -12,5 +12,18 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 bitflags = { workspace = true }
 
+[features]
+default = []
+# Real Wayland input injection via the xdg-desktop-portal RemoteDesktop API
+# (ashpd). Linux-only and optional because it pulls in zbus/tokio and only
+# works against a live Wayland session.
+input-portal = ["dep:ashpd", "dep:tokio"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# XDG desktop portal RemoteDesktop bindings over zbus. Tokio reactor to match
+# the workspace async runtime.
+ashpd = { version = "0.9", default-features = false, features = ["tokio"], optional = true }
+tokio = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_UI_Input_KeyboardAndMouse"] }
