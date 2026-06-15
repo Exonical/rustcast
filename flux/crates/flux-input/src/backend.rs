@@ -84,10 +84,21 @@ impl InputBackend for NoopInputBackend {
 
 /// Select an input backend for the given kind.
 ///
-/// Real backends (portal/libei/uinput) are introduced in Phase 3; until then
-/// every kind resolves to [`NoopInputBackend`], which preserves the selection
-/// semantics so the pipeline wiring is exercised.
+/// With the `input-portal` feature on Linux, [`InputBackendKind::Portal`]
+/// resolves to the real `xdg-desktop-portal` RemoteDesktop backend; if its
+/// negotiation fails we fall back to [`NoopInputBackend`] so the pipeline still
+/// runs. Other kinds (libei, uinput) remain placeholders for now.
 pub fn select_input_backend(kind: InputBackendKind) -> Box<dyn InputBackend> {
+    #[cfg(all(target_os = "linux", feature = "input-portal"))]
+    if matches!(kind, InputBackendKind::Portal) {
+        match crate::portal_input::PortalInputBackend::new() {
+            Ok(backend) => return Box::new(backend),
+            Err(e) => {
+                tracing::warn!("portal input backend unavailable ({e}); falling back to noop");
+            }
+        }
+    }
+
     Box::new(NoopInputBackend::new(kind))
 }
 
@@ -97,7 +108,10 @@ mod tests {
 
     #[test]
     fn noop_backend_accepts_all_events() {
-        let be = select_input_backend(InputBackendKind::Portal);
+        // Construct directly rather than via `select_input_backend`: with the
+        // `input-portal` feature that selector would negotiate a real portal
+        // session (blocking on a consent dialog) for `Portal`.
+        let be: Box<dyn InputBackend> = Box::new(NoopInputBackend::new(InputBackendKind::Portal));
         assert_eq!(be.name(), "noop");
         assert!(be.supports_absolute());
         be.pointer_motion(1.0, -2.0).unwrap();

@@ -4,6 +4,8 @@ pub mod gamepad;
 pub mod keyboard;
 pub mod keymap;
 pub mod mouse;
+#[cfg(all(target_os = "linux", feature = "input-portal"))]
+pub mod portal_input;
 pub mod sink;
 
 pub use backend::{select_input_backend, InputBackend, NoopInputBackend};
