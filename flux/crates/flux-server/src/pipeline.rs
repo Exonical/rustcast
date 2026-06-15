@@ -55,7 +55,14 @@ impl StreamingPipeline {
         );
 
         #[cfg_attr(
-            not(all(target_os = "linux", any(feature = "capture-pipewire", feature = "encoder-vaapi"))),
+            not(all(
+                target_os = "linux",
+                any(
+                    feature = "capture-pipewire",
+                    feature = "encoder-vaapi",
+                    feature = "encoder-ffmpeg"
+                )
+            )),
             allow(unused_mut)
         )]
         let mut capabilities = BaseCapabilityProbe::from_platform_info(platform);
@@ -71,6 +78,14 @@ impl StreamingPipeline {
         #[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
         {
             if let Some(encode) = flux_encode::probe_encode_capabilities() {
+                capabilities.encode = encode;
+            }
+        }
+        // FFmpeg VA-API drives a superset (HEVC + HDR10), so prefer it over the
+        // cros-codecs H.264-only path when both are compiled in.
+        #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+        {
+            if let Some(encode) = flux_encode::probe_ffmpeg_encode_capabilities() {
                 capabilities.encode = encode;
             }
         }

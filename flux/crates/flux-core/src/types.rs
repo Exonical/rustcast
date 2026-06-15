@@ -99,8 +99,10 @@ pub enum EncoderBackend {
     Nvenc,
     /// AMD Advanced Media Framework (Windows).
     Amf,
-    /// VA-API (Linux — AMD & Intel).
+    /// VA-API via cros-codecs (Linux — AMD & Intel). H.264 only today.
     Vaapi,
+    /// VA-API via FFmpeg/libavcodec (Linux — AMD & Intel). Adds HEVC + HDR10.
+    FfmpegVaapi,
     /// Vulkan Video extensions (cross-platform, cross-vendor).
     VulkanVideo,
     /// Software fallback (libx264 / rav1e).

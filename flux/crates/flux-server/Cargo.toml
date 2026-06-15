@@ -15,6 +15,7 @@ default = []
 # live portal + VA-API capabilities (otherwise it runs on the base probe).
 capture-pipewire = ["flux-capture/capture-pipewire"]
 encoder-vaapi = ["flux-encode/encoder-vaapi"]
+encoder-ffmpeg = ["flux-encode/encoder-ffmpeg"]
 
 [dependencies]
 flux-core = { workspace = true }

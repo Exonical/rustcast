@@ -20,14 +20,19 @@ default = []
 # optional and only meaningful on Linux.
 encoder-vaapi = ["dep:cros-codecs", "dep:libva"]
 encoder-vulkan = []
-# Optional FFmpeg VA-API backend for breadth/debugging (Phase 4+).
-encoder-ffmpeg = []
+# Optional FFmpeg (libavcodec) VA-API backend. Drives `h264_vaapi`/`hevc_vaapi`
+# (HEVC + HDR10), complementing the cros-codecs H.264 path. Links the system
+# libav* libraries, so it is optional and only meaningful on Linux.
+encoder-ffmpeg = ["dep:ffmpeg-next"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Hardware H.264/H.265 VA-API encoder (bitstream synthesis + VA pipeline).
 cros-codecs = { version = "0.0.5", default-features = false, features = ["vaapi"], optional = true }
 # Safe libva wrappers (Display / Surface / Image) for surface upload.
 libva = { package = "cros-libva", version = "0.0.7", optional = true }
+# libavcodec/libavutil bindings for the FFmpeg VA-API encoder backend. Pinned to
+# the 7.x line, which builds against the system FFmpeg (>= 4.4) via bindgen.
+ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
