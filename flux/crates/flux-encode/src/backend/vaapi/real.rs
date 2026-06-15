@@ -302,31 +302,32 @@ impl EncoderState {
     }
 
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+        let frame_no = self.timestamp;
         let nv12 = frame_to_nv12(frame, self.width, self.height)?;
 
         let handle = self.pool.get_surface().ok_or_else(|| FluxError::Encode {
-            frame: self.timestamp,
+            frame: frame_no,
             reason: "no free VA surface in pool (encoder backpressure)".into(),
         })?;
 
         let layout = upload_nv12(&self.display, handle.borrow(), self.width, self.height, &nv12).map_err(|e| {
             FluxError::Encode {
-                frame: self.timestamp,
+                frame: frame_no,
                 reason: e,
             }
         })?;
 
         let meta = FrameMetadata {
-            timestamp: self.timestamp,
+            timestamp: frame_no,
             layout,
             force_keyframe: std::mem::take(&mut self.force_idr),
         };
-        self.timestamp += 1;
 
         self.encoder.encode(meta, handle).map_err(|e| FluxError::Encode {
-            frame: self.timestamp,
+            frame: frame_no,
             reason: e.to_string(),
         })?;
+        self.timestamp += 1;
 
         let mut packets = Vec::new();
         self.collect(&mut packets)?;
@@ -412,19 +413,27 @@ fn profile_has_enc(display: &Rc<Display>, profile: VAProfile::Type) -> bool {
 /// Pick the H.264 encode entrypoint, preferring the full-feature `EncSlice`
 /// over the low-power `EncSliceLP`. Returns whether the low-power path is used.
 fn pick_h264_low_power(display: &Rc<Display>) -> Result<bool> {
-    for profile in [
+    const PROFILES: [VAProfile::Type; 3] = [
         VAProfile::VAProfileH264High,
         VAProfile::VAProfileH264Main,
         VAProfile::VAProfileH264ConstrainedBaseline,
-    ] {
-        if let Ok(eps) = display.query_config_entrypoints(profile) {
-            if eps.contains(&VAEntrypoint::VAEntrypointEncSlice) {
-                return Ok(false);
-            }
-            if eps.contains(&VAEntrypoint::VAEntrypointEncSliceLP) {
-                return Ok(true);
-            }
-        }
+    ];
+    let entrypoints = |profile| display.query_config_entrypoints(profile).unwrap_or_default();
+
+    // Prefer the full-feature `EncSlice` on *any* profile before falling back to
+    // the low-power path — some drivers only expose `EncSliceLP` for a subset of
+    // profiles, so a single pass per profile could pick LP prematurely.
+    if PROFILES
+        .iter()
+        .any(|&p| entrypoints(p).contains(&VAEntrypoint::VAEntrypointEncSlice))
+    {
+        return Ok(false);
+    }
+    if PROFILES
+        .iter()
+        .any(|&p| entrypoints(p).contains(&VAEntrypoint::VAEntrypointEncSliceLP))
+    {
+        return Ok(true);
     }
     Err(FluxError::EncoderInit(
         "VA-API driver exposes no H.264 encode entrypoint".into(),
@@ -483,12 +492,12 @@ fn upload_nv12(
         planes: vec![
             PlaneLayout {
                 buffer_index: 0,
-                offset: 0,
+                offset: va_image.offsets[0] as usize,
                 stride: va_image.pitches[0] as usize,
             },
             PlaneLayout {
                 buffer_index: 0,
-                offset: va_image.offsets[0] as usize,
+                offset: va_image.offsets[1] as usize,
                 stride: va_image.pitches[1] as usize,
             },
         ],
