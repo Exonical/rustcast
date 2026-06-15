@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use flux_capture::CaptureSession;
 use flux_core::capability::{BaseCapabilityProbe, InputBackendKind, PlatformCapabilities};
 use flux_core::config::FluxConfig;
-use flux_core::error::{FluxError, Result};
+use flux_core::error::Result;
 use flux_core::platform::PlatformInfo;
 use flux_core::types::{CaptureBackend, EncoderBackend};
 use flux_encode::traits::EncodeConfig;
@@ -56,21 +56,25 @@ impl StreamingPipeline {
 
         let capabilities = BaseCapabilityProbe::from_platform_info(platform);
 
-        // ── Select backends ─────────────────────────────────────────
-        let capture_backend = *capabilities
-            .capture_backends
-            .first()
-            .ok_or(FluxError::NoCaptureBackend)?;
-        let encoder_backend = *capabilities
-            .encoder_backends
-            .first()
-            .ok_or(FluxError::NoEncoderBackend)?;
+        // ── Negotiate backends from probed capabilities ──────────────
+        let plan = capabilities.negotiate(params.codec, params.enable_input)?;
+        let capture_backend = plan.capture;
+        let encoder_backend = plan.encoder;
 
+        if plan.codec != params.codec {
+            tracing::warn!(
+                "requested codec {:?} not supported by encoder; using {:?}",
+                params.codec,
+                plan.codec,
+            );
+        }
         tracing::info!(
-            "Selected backends: capture={:?} encoder={:?} input={:?}",
+            "Negotiated backends: capture={:?} encoder={:?} codec={:?} input={:?} zero_copy={}",
             capture_backend,
             encoder_backend,
-            capabilities.input_backend,
+            plan.codec,
+            plan.input,
+            plan.zero_copy,
         );
 
         // ── Capture ──────────────────────────────────────────────────
@@ -79,7 +83,7 @@ impl StreamingPipeline {
 
         // ── Encoder ──────────────────────────────────────────────────
         let encode_config = EncodeConfig {
-            codec: params.codec,
+            codec: plan.codec,
             resolution: params.resolution,
             framerate: params.fps,
             bitrate_kbps: params.video_bitrate_kbps,
@@ -90,10 +94,9 @@ impl StreamingPipeline {
         let encode_session = encoder.create_session(encode_config.clone())?;
 
         // ── Input ────────────────────────────────────────────────────
-        let input = if params.enable_input {
-            Some(select_input_backend(capabilities.input_backend))
-        } else {
-            None
+        let input = match plan.input {
+            InputBackendKind::None => None,
+            kind => Some(select_input_backend(kind)),
         };
 
         // ── Transport / threads (Phase 1+) ───────────────────────────
