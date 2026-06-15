@@ -18,11 +18,22 @@ parking_lot = { workspace = true }
 default = []
 # Expose the mock portal / PipeWire sources to downstream crates (tests).
 mock = []
-# Real Linux capture backends. The PipeWire/portal system crates (ashpd,
-# pipewire, libspa, drm-fourcc) are attached as optional deps in Phase 1/2;
-# the trait scaffolding and bridge land first under these flags.
-capture-pipewire = []
+# Real Linux capture backend: xdg-desktop-portal negotiation (ashpd) plus a
+# live PipeWire stream (pipewire/libspa). DRM FourCC constants come from
+# `drm-fourcc`. These pull in system libraries (libpipewire-0.3, libspa-0.2),
+# so they are optional and only meaningful on Linux.
+capture-pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:drm-fourcc"]
 capture-drm = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# XDG desktop portal (ScreenCast + RemoteDesktop) bindings over zbus. Use the
+# tokio reactor to match the workspace async runtime.
+ashpd = { version = "0.9", default-features = false, features = ["tokio"], optional = true }
+# Official PipeWire / SPA Rust bindings for the live capture stream.
+pipewire = { version = "0.8", optional = true }
+libspa = { version = "0.8", optional = true }
+# DRM FourCC + modifier constants for DMA-BUF format negotiation.
+drm-fourcc = { version = "2.2", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
