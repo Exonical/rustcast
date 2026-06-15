@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tray_quit_rx
     };
 
-    // ── Start DXGI capture → AMF H.264 encode ──────────────────────
+    // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
     let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<Vec<u8>>>(8);
     let h264_tx2 = h264_tx.clone();
@@ -321,7 +321,34 @@ async fn frame_server(
     }
 }
 
-/// Background thread: DXGI capture → AMF H.264 encode → broadcast channel.
+/// The hardware H.264 encoder backend to prefer for this build/platform:
+/// AMF on Windows, FFmpeg-VA-API or cros-codecs VA-API on Linux (depending on
+/// which encoder feature is compiled in), falling back to the software encoder.
+fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
+    use flux_core::types::EncoderBackend;
+    #[cfg(target_os = "windows")]
+    {
+        EncoderBackend::Amf
+    }
+    #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+    {
+        EncoderBackend::FfmpegVaapi
+    }
+    #[cfg(all(target_os = "linux", feature = "encoder-vaapi", not(feature = "encoder-ffmpeg")))]
+    {
+        EncoderBackend::Vaapi
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", feature = "encoder-ffmpeg"),
+        all(target_os = "linux", feature = "encoder-vaapi"),
+    )))]
+    {
+        EncoderBackend::Software
+    }
+}
+
+/// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 fn capture_loop(
     h264_tx: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
@@ -385,7 +412,7 @@ fn capture_loop(
         }
     };
 
-    // ── Initialize AMF encoder ──────────────────────────────────────
+    // ── Initialize the hardware encoder ─────────────────────────────
     let encode_resolution = primary.native_resolution;
     let encoder_config = flux_encode::traits::EncodeConfig {
         codec: flux_core::types::VideoCodec::H264,
@@ -400,25 +427,26 @@ fn capture_loop(
         max_ref_frames: 1,
     };
 
-    let amf_encoder = match flux_encode::create_encoder(Some(flux_core::types::EncoderBackend::Amf)) {
+    let backend = preferred_encoder_backend();
+    let encoder = match flux_encode::create_encoder(Some(backend)) {
         Ok(enc) => {
-            tracing::info!("AMF encoder created: {}", enc.name());
+            tracing::info!("Encoder created: {} ({:?})", enc.name(), backend);
             Some(enc)
         }
         Err(e) => {
-            tracing::warn!("AMF encoder not available, H.264 encoding disabled: {}", e);
+            tracing::warn!("{:?} encoder not available, H.264 encoding disabled: {}", backend, e);
             None
         }
     };
 
-    let mut encode_session = amf_encoder.and_then(|enc| {
+    let mut encode_session = encoder.and_then(|enc| {
         match enc.create_session(encoder_config) {
             Ok(s) => {
-                tracing::info!("AMF H.264 encode session started");
+                tracing::info!("{:?} H.264 encode session started", backend);
                 Some(s)
             }
             Err(e) => {
-                tracing::warn!("Failed to create AMF session: {}", e);
+                tracing::warn!("Failed to create {:?} encode session: {}", backend, e);
                 None
             }
         }
@@ -431,8 +459,9 @@ fn capture_loop(
     let mut total_encoded_bytes: u64 = 0;
 
     tracing::info!(
-        "Capture+encode loop: {}x{}@{}fps → AMF H.264 (verify: {})",
+        "Capture+encode loop: {}x{}@{}fps → {:?} H.264 (verify: {})",
         encode_resolution.width, encode_resolution.height, target_fps,
+        backend,
         h264_path.display()
     );
 
@@ -462,7 +491,7 @@ fn capture_loop(
         let t_capture = t0.elapsed();
         frame_count += 1;
 
-        // ── AMF H.264 encode ────────────────────────────────────────
+        // ── Hardware H.264 encode ───────────────────────────────────
         let t1 = std::time::Instant::now();
         if let Some(ref mut enc) = encode_session {
             match enc.encode(&frame) {
@@ -488,7 +517,7 @@ fn capture_loop(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("AMF encode error on frame {}: {}", frame_count, e);
+                    tracing::warn!("Encode error on frame {}: {}", frame_count, e);
                 }
             }
         }
