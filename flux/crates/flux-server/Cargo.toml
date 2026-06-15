@@ -9,6 +9,13 @@ license.workspace = true
 name = "flux-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forward the Linux-only real capture/encode backends so the pipeline can probe
+# live portal + VA-API capabilities (otherwise it runs on the base probe).
+capture-pipewire = ["flux-capture/capture-pipewire"]
+encoder-vaapi = ["flux-encode/encoder-vaapi"]
+
 [dependencies]
 flux-core = { workspace = true }
 flux-capture = { workspace = true }

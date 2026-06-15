@@ -42,3 +42,65 @@ fn default_backend() -> EncoderBackend {
     // Specific vendor backends (NVENC, AMF) can be selected explicitly.
     EncoderBackend::VulkanVideo
 }
+
+/// Probe the VA-API driver and report its *drivable* encode capabilities as a
+/// [`flux_core::capability::EncodeCapabilities`], for capability negotiation.
+///
+/// Opens a DRM render node, queries the driver's encode entrypoints, and maps
+/// the result onto the core capability type. Only codecs the backend can
+/// actually drive are reported (the VA-API backend encodes H.264 today, even
+/// where the driver advertises HEVC/AV1), so negotiation never selects a codec
+/// that `create_session` would then reject. Returns `None` when no VA-API
+/// encoder can be opened (no render node, no encode entrypoint, etc.).
+#[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
+pub fn probe_encode_capabilities() -> Option<flux_core::capability::EncodeCapabilities> {
+    let encoder = backend::vaapi::VaapiEncoder::new().ok()?;
+    let caps = encoder.capabilities().ok()?;
+    Some(to_core_encode_caps(
+        encoder.driver(),
+        &caps.supported_codecs,
+        caps.supports_hdr,
+    ))
+}
+
+/// Map a VA-API backend's drivable codec set onto the core capability type.
+#[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
+fn to_core_encode_caps(
+    driver: &str,
+    supported: &[flux_core::types::VideoCodec],
+    supports_hdr: bool,
+) -> flux_core::capability::EncodeCapabilities {
+    use flux_core::types::VideoCodec;
+    flux_core::capability::EncodeCapabilities {
+        backend: Some(EncoderBackend::Vaapi),
+        driver: (!driver.is_empty()).then(|| driver.to_string()),
+        h264: supported.contains(&VideoCodec::H264),
+        h265: supported.contains(&VideoCodec::H265),
+        av1: supported.contains(&VideoCodec::Av1),
+        hdr10: supports_hdr,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "encoder-vaapi", test))]
+mod probe_tests {
+    use super::*;
+    use flux_core::types::VideoCodec;
+
+    #[test]
+    fn maps_drivable_codecs_onto_core_caps() {
+        let caps = to_core_encode_caps("Mesa Gallium", &[VideoCodec::H264], false);
+        assert_eq!(caps.backend, Some(EncoderBackend::Vaapi));
+        assert_eq!(caps.driver.as_deref(), Some("Mesa Gallium"));
+        assert!(caps.h264);
+        assert!(!caps.h265);
+        assert!(!caps.av1);
+        assert!(!caps.hdr10);
+    }
+
+    #[test]
+    fn empty_driver_string_maps_to_none() {
+        let caps = to_core_encode_caps("", &[], false);
+        assert!(caps.driver.is_none());
+        assert!(!caps.h264);
+    }
+}

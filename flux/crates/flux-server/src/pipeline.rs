@@ -54,7 +54,26 @@ impl StreamingPipeline {
             params.video_bitrate_kbps,
         );
 
-        let capabilities = BaseCapabilityProbe::from_platform_info(platform);
+        #[cfg_attr(
+            not(all(target_os = "linux", any(feature = "capture-pipewire", feature = "encoder-vaapi"))),
+            allow(unused_mut)
+        )]
+        let mut capabilities = BaseCapabilityProbe::from_platform_info(platform);
+
+        // ── Enrich with live subsystem probes (feature-gated) ────────
+        // The base probe leaves portal/encode fields at conservative defaults;
+        // when the real backends are compiled in, query them so negotiation is
+        // driven by what the host can actually do.
+        #[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
+        {
+            capabilities.portal = flux_capture::probe_portal_capabilities();
+        }
+        #[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
+        {
+            if let Some(encode) = flux_encode::probe_encode_capabilities() {
+                capabilities.encode = encode;
+            }
+        }
 
         // ── Negotiate backends from probed capabilities ──────────────
         let plan = capabilities.negotiate(params.codec, params.enable_input)?;
