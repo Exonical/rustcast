@@ -783,9 +783,8 @@ impl EncoderState {
 
         let mut octx = ff::codec::context::Context::new_with_codec(codec);
 
-        // Dimensions/rate-control must be set before the hardware frame pool is
-        // built: the Vulkan path derives the pool from these via
-        // `avcodec_get_hw_frames_parameters`.
+        // Dimensions/rate-control are set before the hardware frame pool is
+        // built so the encoder sees a fully-configured context at open time.
         // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
         unsafe {
             let ctx = octx.as_mut_ptr();
@@ -820,20 +819,20 @@ impl EncoderState {
                 let device_ref = device.as_ref().ok_or_else(|| {
                     FluxError::EncoderInit("hardware encode requires a hardware device".into())
                 })?;
+                // The encoder ingests hardware surfaces (`pix_fmt`) holding
+                // `sw_format` pixels; the Vulkan encoder reads `sw_pix_fmt` at
+                // init to pick its picture format, and it is harmless for VA-API.
                 // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
                 unsafe {
                     (*octx.as_mut_ptr()).pix_fmt = api.hw_pix_fmt();
+                    (*octx.as_mut_ptr()).sw_pix_fmt = pixel_to_ffi(sw_format);
                 }
-                // VA-API: build the surface pool directly. Vulkan: let
-                // libavcodec fill in the encode-specific image usage/tiling
-                // flags (e.g. `VK_IMAGE_USAGE_VIDEO_ENCODE_SRC`) the video
-                // encode queue requires.
-                let frames = match api {
-                    HwApi::Vaapi => create_hw_frames_ctx(device_ref, sw_format, width, height)?,
-                    HwApi::Vulkan => {
-                        create_vulkan_frames_ctx(&mut octx, device_ref, sw_format, width, height)?
-                    }
-                };
+                // Both APIs build the pool the same way: leave the Vulkan image
+                // usage at its default so `hwcontext_vulkan` auto-derives the
+                // `VIDEO_ENCODE_SRC` usage the encode queue requires (see
+                // `create_hw_frames_ctx`).
+                let frames =
+                    create_hw_frames_ctx(device_ref, api.hw_pix_fmt(), sw_format, width, height)?;
                 // SAFETY: `octx` owns a valid context; bind the pool so the
                 // encoder ingests hardware surfaces.
                 unsafe {
@@ -1050,10 +1049,20 @@ impl Drop for EncoderState {
 
 // ─────────────────────────── ffi helpers ───────────────────────────
 
-/// Allocate and initialize a VA-API hardware frame pool for `sw_format`,
+/// Allocate and initialize a hardware frame pool for `sw_format` on the given
+/// hardware API's surface format (`AV_PIX_FMT_VAAPI` / `AV_PIX_FMT_VULKAN`),
 /// returned in an RAII guard that frees it on drop.
+///
+/// `usage` is deliberately left at its default of `0`. For Vulkan this matters:
+/// `hwcontext_vulkan`'s pool init only auto-derives the image usage flags — in
+/// particular `VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR` (and profile-independent
+/// image creation via `VK_KHR_video_maintenance1`) — when the caller has not
+/// pinned a custom usage. Setting it manually would suppress that derivation and
+/// the encoder would reject the surfaces. This mirrors what the `hwupload`
+/// filter does on the FFmpeg CLI.
 fn create_hw_frames_ctx(
     device: &HwDevice,
+    hw_format: ff::ffi::AVPixelFormat,
     sw_format: Pixel,
     width: u32,
     height: u32,
@@ -1066,7 +1075,7 @@ fn create_hw_frames_ctx(
             return Err(FluxError::EncoderInit("av_hwframe_ctx_alloc failed".into()));
         }
         let frames_ctx = (*frames_ref).data as *mut ff::ffi::AVHWFramesContext;
-        (*frames_ctx).format = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*frames_ctx).format = hw_format;
         (*frames_ctx).sw_format = pixel_to_ffi(sw_format);
         (*frames_ctx).width = width as c_int;
         (*frames_ctx).height = height as c_int;
@@ -1076,56 +1085,6 @@ fn create_hw_frames_ctx(
             let mut r = frames_ref;
             ff::ffi::av_buffer_unref(&mut r);
             return Err(FluxError::EncoderInit(format!("av_hwframe_ctx_init failed ({ret})")));
-        }
-        Ok(HwFramesCtx(frames_ref))
-    }
-}
-
-/// Allocate a Vulkan hardware frame pool for the encoder.
-///
-/// Unlike the VA-API path, the pool is built via
-/// `avcodec_get_hw_frames_parameters`, which fills in the image usage/tiling
-/// flags the Vulkan video-encode queue requires (manual field-setting as in
-/// [`create_hw_frames_ctx`] would omit `VK_IMAGE_USAGE_VIDEO_ENCODE_SRC` and the
-/// encoder would reject the surfaces). `octx` must already have its
-/// width/height set. Returned in an RAII guard that frees it on drop.
-fn create_vulkan_frames_ctx(
-    octx: &mut ff::codec::context::Context,
-    device: &HwDevice,
-    sw_format: Pixel,
-    width: u32,
-    height: u32,
-) -> Result<HwFramesCtx> {
-    // SAFETY: `octx` owns a valid `AVCodecContext` with dimensions set; `device.0`
-    // is a valid Vulkan device context. The out-pointer is configured before init.
-    unsafe {
-        let avctx = octx.as_mut_ptr();
-        (*avctx).sw_pix_fmt = pixel_to_ffi(sw_format);
-        let mut frames_ref: *mut ff::ffi::AVBufferRef = ptr::null_mut();
-        let ret = ff::ffi::avcodec_get_hw_frames_parameters(
-            avctx,
-            device.0,
-            ff::ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
-            &mut frames_ref,
-        );
-        if ret < 0 || frames_ref.is_null() {
-            return Err(FluxError::EncoderInit(format!(
-                "avcodec_get_hw_frames_parameters (vulkan) failed ({ret})"
-            )));
-        }
-        let frames_ctx = (*frames_ref).data as *mut ff::ffi::AVHWFramesContext;
-        (*frames_ctx).width = width as c_int;
-        (*frames_ctx).height = height as c_int;
-        if (*frames_ctx).initial_pool_size == 0 {
-            (*frames_ctx).initial_pool_size = HW_POOL_SIZE;
-        }
-        let ret = ff::ffi::av_hwframe_ctx_init(frames_ref);
-        if ret < 0 {
-            let mut r = frames_ref;
-            ff::ffi::av_buffer_unref(&mut r);
-            return Err(FluxError::EncoderInit(format!(
-                "av_hwframe_ctx_init (vulkan) failed ({ret})"
-            )));
         }
         Ok(HwFramesCtx(frames_ref))
     }
