@@ -329,22 +329,29 @@ async fn frame_server(
     }
 }
 
-/// The hardware H.264 encoder backend to prefer for this build/platform:
-/// AMF on Windows, FFmpeg-VA-API or cros-codecs VA-API on Linux (depending on
-/// which encoder feature is compiled in), falling back to the software encoder.
-fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
+/// Ordered list of encoder backends to try for this build/platform, from most
+/// to least preferred, always ending in the software fallback.
+///
+/// On Linux with FFmpeg compiled in we prefer Vulkan video (`h264_vulkan`) —
+/// real GPU offload on the system Vulkan driver, which works on hosts with no
+/// VA-API driver (e.g. RHEL/Rocky) — then FFmpeg VA-API, then software.
+fn encoder_fallback_chain() -> Vec<flux_core::types::EncoderBackend> {
     use flux_core::types::EncoderBackend;
     #[cfg(target_os = "windows")]
     {
-        EncoderBackend::Amf
+        vec![EncoderBackend::Amf, EncoderBackend::Software]
     }
     #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
     {
-        EncoderBackend::FfmpegVaapi
+        vec![
+            EncoderBackend::VulkanVideo,
+            EncoderBackend::FfmpegVaapi,
+            EncoderBackend::Software,
+        ]
     }
     #[cfg(all(target_os = "linux", feature = "encoder-vaapi", not(feature = "encoder-ffmpeg")))]
     {
-        EncoderBackend::Vaapi
+        vec![EncoderBackend::Vaapi, EncoderBackend::Software]
     }
     #[cfg(not(any(
         target_os = "windows",
@@ -352,7 +359,7 @@ fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
         all(target_os = "linux", feature = "encoder-vaapi"),
     )))]
     {
-        EncoderBackend::Software
+        vec![EncoderBackend::Software]
     }
 }
 
@@ -409,16 +416,21 @@ fn build_encode_session_for(
         max_ref_frames: 1,
     };
 
-    let preferred = preferred_encoder_backend();
-    let mut backend = preferred;
-    let mut session = create_encode_session(preferred, encoder_config.clone());
-    if session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
-        tracing::warn!(
-            "{:?} encoder unavailable; falling back to software H.264 encoding",
-            preferred
-        );
-        backend = flux_core::types::EncoderBackend::Software;
-        session = create_encode_session(backend, encoder_config);
+    // Try each backend in preference order (GPU offload first), falling back
+    // to the next when one can't be opened (e.g. no Vulkan encode support, no
+    // VA-API driver), ending at the software encoder.
+    let chain = encoder_fallback_chain();
+    let mut backend = flux_core::types::EncoderBackend::Software;
+    let mut session = None;
+    for (idx, candidate) in chain.iter().copied().enumerate() {
+        backend = candidate;
+        session = create_encode_session(candidate, encoder_config.clone());
+        if session.is_some() {
+            break;
+        }
+        if let Some(next) = chain.get(idx + 1) {
+            tracing::warn!("{:?} encoder unavailable; falling back to {:?}", candidate, next);
+        }
     }
     (session, backend)
 }
