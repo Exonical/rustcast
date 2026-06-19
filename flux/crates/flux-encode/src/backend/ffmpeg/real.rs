@@ -223,18 +223,58 @@ impl HwDevice {
         )
     }
 
-    /// Open a Vulkan device for video encode. libavutil's default picks the
-    /// first Vulkan device; `$FLUX_VULKAN_DEVICE` (a device index, e.g. "0")
-    /// overrides on multi-GPU hosts. Used when no VA-API driver is available
-    /// but the system Vulkan driver exposes the video-encode extensions.
+    /// Open a Vulkan device that can actually drive the video encoder.
+    ///
+    /// A host may expose several Vulkan devices (a second GPU, or a software
+    /// rasterizer) and libavutil's default — or even a given index — may land
+    /// on one without the `VK_KHR_video_encode_queue` extension. The extension
+    /// and encode-queue checks only happen at `avcodec_open2`, not at device
+    /// creation, so the only reliable test is to open a throwaway encoder. So
+    /// probe each candidate device in turn and keep the first whose
+    /// `h264_vulkan` encoder opens. The candidate order is: `$FLUX_VULKAN_DEVICE`
+    /// if set, then explicit indices `0..=3`, then the libavutil default.
     fn open_vulkan() -> Result<Self> {
-        Self::open_any(
-            ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
-            vulkan_device_candidates(),
-            "Vulkan",
-            "is a Vulkan driver with video-encode support installed? \
-             (vulkaninfo | grep VK_KHR_video_encode)",
-        )
+        let hint = "is a Vulkan driver with video-encode support installed? \
+                    (vulkaninfo | grep VK_KHR_video_encode)";
+        let mut last_ret = None;
+        for device in vulkan_device_candidates() {
+            match Self::open_device(
+                ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                device.as_deref(),
+            ) {
+                Ok(dev) => {
+                    if vulkan_device_can_encode(&dev) {
+                        match device.as_deref() {
+                            Some(idx) => tracing::info!(
+                                device = %idx,
+                                "opened Vulkan device (video-encode capable)"
+                            ),
+                            None => tracing::info!(
+                                "opened Vulkan device (default, video-encode capable)"
+                            ),
+                        }
+                        return Ok(dev);
+                    }
+                    tracing::debug!(
+                        device = device.as_deref().unwrap_or("<default>"),
+                        "Vulkan device opened but cannot drive the video encoder; \
+                         trying next candidate"
+                    );
+                }
+                Err(ret) => {
+                    tracing::debug!(
+                        device = device.as_deref().unwrap_or("<default>"),
+                        ret,
+                        "Vulkan device open failed, trying next candidate"
+                    );
+                    last_ret = Some(ret);
+                }
+            }
+        }
+        Err(FluxError::EncoderInit(format!(
+            "no Vulkan device with video-encode support found \
+             (last av_hwdevice_ctx_create ret {last_ret:?}); {hint}"
+        )))
     }
 
     /// Try each candidate device for `device_type` in turn, falling back to the
@@ -337,9 +377,12 @@ fn vaapi_device_candidates() -> Vec<Option<String>> {
     candidates
 }
 
-/// Vulkan device strings to try, in priority order. `None` is the libavutil
-/// default (first Vulkan device), tried last. `$FLUX_VULKAN_DEVICE` (a Vulkan
-/// device index such as "0") overrides when set, for multi-GPU hosts.
+/// Vulkan device strings to try, in priority order. `$FLUX_VULKAN_DEVICE` (a
+/// Vulkan device index such as "0") is tried first when set, then explicit
+/// indices `0..=3` so a multi-GPU host where the default device lacks the
+/// video-encode queue still finds the encode-capable GPU, then `None` (the
+/// libavutil default) as a final fallback. Each is validated for encode
+/// support by [`HwDevice::open_vulkan`].
 fn vulkan_device_candidates() -> Vec<Option<String>> {
     let mut candidates = Vec::new();
     if let Ok(dev) = std::env::var("FLUX_VULKAN_DEVICE") {
@@ -347,8 +390,27 @@ fn vulkan_device_candidates() -> Vec<Option<String>> {
             candidates.push(Some(dev));
         }
     }
+    for idx in 0..=3 {
+        candidates.push(Some(idx.to_string()));
+    }
     candidates.push(None);
     candidates
+}
+
+/// Probe whether a Vulkan device can actually open the `h264_vulkan` encoder.
+///
+/// The `VK_KHR_video_encode_queue` / encode-queue-family checks happen inside
+/// `avcodec_open2`, so opening a tiny throwaway encoder is the only reliable
+/// signal short of poking version-specific `AVVulkanDeviceContext` fields. A
+/// non-encode device fails here (FFmpeg logs `Device does not support the
+/// VK_KHR_video_encode_queue extension`) and the caller moves to the next one.
+fn vulkan_device_can_encode(device: &HwDevice) -> bool {
+    let probe = EncodeConfig {
+        codec: VideoCodec::H264,
+        resolution: Resolution::new(320, 240),
+        ..EncodeConfig::default()
+    };
+    EncoderState::new(&probe, Accel::Hardware(HwApi::Vulkan), Some(device.new_ref())).is_ok()
 }
 
 /// RAII owner of a VA-API hardware frame pool (`AVBufferRef*`).
