@@ -40,6 +40,37 @@ impl VideoEncoder for FfmpegVaapiEncoder {
     }
 }
 
+/// FFmpeg Vulkan-video encoder (Linux) — disabled build.
+pub struct FfmpegVulkanEncoder {
+    _private: (),
+}
+
+impl FfmpegVulkanEncoder {
+    pub fn new() -> Result<Self> {
+        Err(FluxError::EncoderInit(
+            "FFmpeg Vulkan backend not compiled in (enable the `encoder-ffmpeg` feature)".into(),
+        ))
+    }
+}
+
+impl VideoEncoder for FfmpegVulkanEncoder {
+    fn name(&self) -> &'static str {
+        "ffmpeg-vulkan"
+    }
+
+    fn capabilities(&self) -> Result<EncoderCapabilities> {
+        Err(FluxError::EncoderInit("FFmpeg Vulkan backend not compiled in".into()))
+    }
+
+    fn validate_config(&self, _config: &EncodeConfig) -> Result<()> {
+        Err(FluxError::EncoderInit("FFmpeg Vulkan backend not compiled in".into()))
+    }
+
+    fn create_session(&self, _config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        Err(FluxError::EncoderInit("FFmpeg Vulkan backend not compiled in".into()))
+    }
+}
+
 /// FFmpeg software encoder (Linux) — disabled build.
 pub struct FfmpegSoftwareEncoder {
     _private: (),

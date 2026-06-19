@@ -48,11 +48,7 @@ const HW_POOL_SIZE: i32 = 20;
 /// this backend does not drive the codec (AV1 has no broadly-available
 /// `av1_vaapi` encoder yet, so it is left to other backends).
 fn encoder_name(codec: VideoCodec) -> Option<&'static str> {
-    match codec {
-        VideoCodec::H264 => Some("h264_vaapi"),
-        VideoCodec::H265 => Some("hevc_vaapi"),
-        VideoCodec::Av1 => None,
-    }
+    HwApi::Vaapi.encoder_name(codec)
 }
 
 /// The libavutil pixel format a [`CapturedFrame`] is presented as to swscale.
@@ -101,11 +97,43 @@ fn low_latency_options(config: &EncodeConfig) -> Vec<(&'static str, String)> {
     vec![("rc_mode", rc_mode.to_string()), ("async_depth", "1".to_string())]
 }
 
-/// Whether this session encodes on the GPU (VA-API surfaces) or the CPU
+/// Which FFmpeg hardware encode API a hardware session drives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HwApi {
+    /// VA-API (`h264_vaapi`/`hevc_vaapi`) — Linux AMD/Intel via Mesa/iHD.
+    Vaapi,
+    /// Vulkan video (`h264_vulkan`/`hevc_vulkan`) — cross-vendor, driven on
+    /// the system Vulkan driver (no VA-API driver required).
+    Vulkan,
+}
+
+impl HwApi {
+    /// The libavutil hardware surface pixel format for this API.
+    fn hw_pix_fmt(self) -> ff::ffi::AVPixelFormat {
+        match self {
+            HwApi::Vaapi => ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+            HwApi::Vulkan => ff::ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+        }
+    }
+
+    /// libavcodec encoder name for a codec on this API, or `None` when the API
+    /// does not drive the codec (no AV1 hardware encoder is wired here).
+    fn encoder_name(self, codec: VideoCodec) -> Option<&'static str> {
+        match (self, codec) {
+            (HwApi::Vaapi, VideoCodec::H264) => Some("h264_vaapi"),
+            (HwApi::Vaapi, VideoCodec::H265) => Some("hevc_vaapi"),
+            (HwApi::Vulkan, VideoCodec::H264) => Some("h264_vulkan"),
+            (HwApi::Vulkan, VideoCodec::H265) => Some("hevc_vulkan"),
+            (_, VideoCodec::Av1) => None,
+        }
+    }
+}
+
+/// Whether this session encodes on the GPU (hardware surfaces) or the CPU
 /// (libx264/libx265 software fallback).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Accel {
-    Hardware,
+    Hardware(HwApi),
     Software,
 }
 
@@ -136,17 +164,25 @@ fn sw_low_latency_options(encoder_name: &str) -> Vec<(&'static str, String)> {
     }
 }
 
+/// Low-latency private options for the Vulkan video encoder. Kept minimal:
+/// `async_depth=1` avoids extra in-flight frames. Unknown private options are
+/// ignored by `avcodec_open2`, so this stays safe across FFmpeg builds; the
+/// rate-control target rides on the codec context's `bit_rate` fields.
+fn vk_low_latency_options(_config: &EncodeConfig) -> Vec<(&'static str, String)> {
+    vec![("async_depth", "1".to_string())]
+}
+
 /// Reject configurations this backend cannot drive before touching hardware.
 fn validate(config: &EncodeConfig) -> Result<()> {
     if encoder_name(config.codec).is_none() {
         return Err(FluxError::EncoderInit(format!(
-            "FFmpeg VA-API backend does not encode {:?} (no VA-API encoder)",
+            "FFmpeg backend does not encode {:?} (only H.264/H.265)",
             config.codec
         )));
     }
     if config.dynamic_range == DynamicRange::Hdr10 && config.codec != VideoCodec::H265 {
         return Err(FluxError::EncoderInit(
-            "HDR10 encode requires HEVC (Main10) on the FFmpeg VA-API backend".into(),
+            "HDR10 encode requires HEVC (Main10)".into(),
         ));
     }
     Ok(())
@@ -178,14 +214,85 @@ impl HwDevice {
     /// candidate node in turn and finally fall back to the libva default. The
     /// candidate list is, in order: `$FLUX_VAAPI_DEVICE` if set, then
     /// `/dev/dri/renderD128..renderD135`, then null (libva default).
-    fn open() -> Result<Self> {
-        let mut last_ret = 0;
-        for device in vaapi_device_candidates() {
-            match Self::open_device(device.as_deref()) {
+    fn open_vaapi() -> Result<Self> {
+        Self::open_any(
+            ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            vaapi_device_candidates(),
+            "VA-API",
+            "is a VA-API driver installed? (mesa-va-drivers / vainfo)",
+        )
+    }
+
+    /// Open a Vulkan device that can actually drive the video encoder.
+    ///
+    /// A host may expose several Vulkan devices (a second GPU, or a software
+    /// rasterizer) and libavutil's default — or even a given index — may land
+    /// on one without the `VK_KHR_video_encode_queue` extension. The extension
+    /// and encode-queue checks only happen at `avcodec_open2`, not at device
+    /// creation, so the only reliable test is to open a throwaway encoder. So
+    /// probe each candidate device in turn and keep the first whose
+    /// `h264_vulkan` encoder opens. The candidate order is: `$FLUX_VULKAN_DEVICE`
+    /// if set, then explicit indices `0..=3`, then the libavutil default.
+    fn open_vulkan() -> Result<Self> {
+        let hint = "is a Vulkan driver with video-encode support installed? \
+                    (vulkaninfo | grep VK_KHR_video_encode)";
+        let mut last_ret = None;
+        for device in vulkan_device_candidates() {
+            match Self::open_device(
+                ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                device.as_deref(),
+            ) {
                 Ok(dev) => {
-                    match device {
-                        Some(path) => tracing::info!(device = %path, "opened VA-API device"),
-                        None => tracing::info!("opened VA-API device (libva default)"),
+                    if vulkan_device_can_encode(&dev) {
+                        match device.as_deref() {
+                            Some(idx) => tracing::info!(
+                                device = %idx,
+                                "opened Vulkan device (video-encode capable)"
+                            ),
+                            None => tracing::info!(
+                                "opened Vulkan device (default, video-encode capable)"
+                            ),
+                        }
+                        return Ok(dev);
+                    }
+                    tracing::debug!(
+                        device = device.as_deref().unwrap_or("<default>"),
+                        "Vulkan device opened but cannot drive the video encoder; \
+                         trying next candidate"
+                    );
+                }
+                Err(ret) => {
+                    tracing::debug!(
+                        device = device.as_deref().unwrap_or("<default>"),
+                        ret,
+                        "Vulkan device open failed, trying next candidate"
+                    );
+                    last_ret = Some(ret);
+                }
+            }
+        }
+        Err(FluxError::EncoderInit(format!(
+            "no Vulkan device with video-encode support found \
+             (last av_hwdevice_ctx_create ret {last_ret:?}); {hint}"
+        )))
+    }
+
+    /// Try each candidate device for `device_type` in turn, falling back to the
+    /// libavutil default (a `None` candidate). Returns a clear init error with
+    /// `hint` when every candidate fails.
+    fn open_any(
+        device_type: ff::ffi::AVHWDeviceType,
+        candidates: Vec<Option<String>>,
+        label: &str,
+        hint: &str,
+    ) -> Result<Self> {
+        let mut last_ret = 0;
+        for device in candidates {
+            match Self::open_device(device_type, device.as_deref()) {
+                Ok(dev) => {
+                    match device.as_deref() {
+                        Some(path) => tracing::info!(device = %path, "opened {} device", label),
+                        None => tracing::info!("opened {} device (default)", label),
                     }
                     return Ok(dev);
                 }
@@ -193,22 +300,25 @@ impl HwDevice {
                     tracing::debug!(
                         device = device.as_deref().unwrap_or("<default>"),
                         ret,
-                        "VA-API device open failed, trying next candidate"
+                        "{} device open failed, trying next candidate",
+                        label
                     );
                     last_ret = ret;
                 }
             }
         }
         Err(FluxError::EncoderInit(format!(
-            "failed to create VA-API device context for any DRM render node \
-             (av_hwdevice_ctx_create returned {last_ret}); is a VA-API driver \
-             installed? (mesa-va-drivers / vainfo)"
+            "failed to create {label} device context \
+             (av_hwdevice_ctx_create returned {last_ret}); {hint}"
         )))
     }
 
-    /// Try to open one VA-API device by path (or the libva default when
-    /// `device` is `None`). Returns the libav error code on failure.
-    fn open_device(device: Option<&str>) -> std::result::Result<Self, c_int> {
+    /// Try to open one device by path/index (or the default when `device` is
+    /// `None`). Returns the libav error code on failure.
+    fn open_device(
+        device_type: ff::ffi::AVHWDeviceType,
+        device: Option<&str>,
+    ) -> std::result::Result<Self, c_int> {
         let c_device = device.and_then(|d| std::ffi::CString::new(d).ok());
         let device_ptr = c_device
             .as_ref()
@@ -219,7 +329,7 @@ impl HwDevice {
         let ret = unsafe {
             ff::ffi::av_hwdevice_ctx_create(
                 &mut ptr,
-                ff::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                device_type,
                 device_ptr,
                 ptr::null_mut(),
                 0,
@@ -267,6 +377,42 @@ fn vaapi_device_candidates() -> Vec<Option<String>> {
     candidates
 }
 
+/// Vulkan device strings to try, in priority order. `$FLUX_VULKAN_DEVICE` (a
+/// Vulkan device index such as "0") is tried first when set, then explicit
+/// indices `0..=3` so a multi-GPU host where the default device lacks the
+/// video-encode queue still finds the encode-capable GPU, then `None` (the
+/// libavutil default) as a final fallback. Each is validated for encode
+/// support by [`HwDevice::open_vulkan`].
+fn vulkan_device_candidates() -> Vec<Option<String>> {
+    let mut candidates = Vec::new();
+    if let Ok(dev) = std::env::var("FLUX_VULKAN_DEVICE") {
+        if !dev.is_empty() {
+            candidates.push(Some(dev));
+        }
+    }
+    for idx in 0..=3 {
+        candidates.push(Some(idx.to_string()));
+    }
+    candidates.push(None);
+    candidates
+}
+
+/// Probe whether a Vulkan device can actually open the `h264_vulkan` encoder.
+///
+/// The `VK_KHR_video_encode_queue` / encode-queue-family checks happen inside
+/// `avcodec_open2`, so opening a tiny throwaway encoder is the only reliable
+/// signal short of poking version-specific `AVVulkanDeviceContext` fields. A
+/// non-encode device fails here (FFmpeg logs `Device does not support the
+/// VK_KHR_video_encode_queue extension`) and the caller moves to the next one.
+fn vulkan_device_can_encode(device: &HwDevice) -> bool {
+    let probe = EncodeConfig {
+        codec: VideoCodec::H264,
+        resolution: Resolution::new(320, 240),
+        ..EncodeConfig::default()
+    };
+    EncoderState::new(&probe, Accel::Hardware(HwApi::Vulkan), Some(device.new_ref())).is_ok()
+}
+
 /// RAII owner of a VA-API hardware frame pool (`AVBufferRef*`).
 ///
 /// Owning the pool in a guard frees it via `Drop` if encoder setup fails before
@@ -306,7 +452,7 @@ impl FfmpegVaapiEncoder {
         ff::init().map_err(|e| FluxError::EncoderInit(format!("ffmpeg init failed: {e}")))?;
         tracing::info!("Initializing FFmpeg VA-API encoder");
 
-        let device = HwDevice::open()?;
+        let device = HwDevice::open_vaapi()?;
 
         let mut supported = Vec::new();
         if ff::encoder::find_by_name("h264_vaapi").is_some() {
@@ -367,7 +513,94 @@ impl VideoEncoder for FfmpegVaapiEncoder {
         self.validate_config(&config)?;
         Ok(Box::new(FfmpegSession::spawn(
             config,
-            Accel::Hardware,
+            Accel::Hardware(HwApi::Vaapi),
+            Some(self.device.new_ref()),
+        )?))
+    }
+}
+
+/// FFmpeg Vulkan-video hardware encoder (cross-vendor; AMD/Intel/NVIDIA via the
+/// `VK_KHR_video_encode_*` extensions). Drives the system Vulkan driver, so it
+/// needs no VA-API driver — the offload path on hosts where Mesa's VA driver is
+/// unavailable (e.g. RHEL/Rocky). Requires FFmpeg >= 7.0 (which first shipped
+/// the `h264_vulkan`/`hevc_vulkan` encoders).
+pub struct FfmpegVulkanEncoder {
+    capabilities: EncoderCapabilities,
+    device: HwDevice,
+}
+
+impl FfmpegVulkanEncoder {
+    pub fn new() -> Result<Self> {
+        ff::init().map_err(|e| FluxError::EncoderInit(format!("ffmpeg init failed: {e}")))?;
+        tracing::info!("Initializing FFmpeg Vulkan video encoder");
+
+        // Probe encoder availability before opening a device so an old FFmpeg
+        // (< 7.0, no Vulkan encoder) fails fast with a clear message rather
+        // than a confusing device error.
+        let mut supported = Vec::new();
+        if ff::encoder::find_by_name("h264_vulkan").is_some() {
+            supported.push(VideoCodec::H264);
+        }
+        let h265 = ff::encoder::find_by_name("hevc_vulkan").is_some();
+        if h265 {
+            supported.push(VideoCodec::H265);
+        }
+        if supported.is_empty() {
+            return Err(FluxError::EncoderInit(
+                "FFmpeg build exposes no Vulkan video encoder (need h264_vulkan/hevc_vulkan; \
+                 requires FFmpeg >= 7.0)"
+                    .into(),
+            ));
+        }
+
+        let device = HwDevice::open_vulkan()?;
+
+        let capabilities = EncoderCapabilities {
+            name: "ffmpeg-vulkan",
+            supported_codecs: supported.clone(),
+            // HDR10 (HEVC Main10) rides on the HEVC Vulkan encoder.
+            supports_hdr: h265,
+            supports_yuv444: false,
+            max_resolution: Resolution::new(7680, 4320),
+            max_framerate: 240,
+        };
+        tracing::info!(codecs = ?capabilities.supported_codecs, "FFmpeg Vulkan video encoder ready");
+        Ok(Self { capabilities, device })
+    }
+}
+
+impl VideoEncoder for FfmpegVulkanEncoder {
+    fn name(&self) -> &'static str {
+        "ffmpeg-vulkan"
+    }
+
+    fn capabilities(&self) -> Result<EncoderCapabilities> {
+        Ok(self.capabilities.clone())
+    }
+
+    fn validate_config(&self, config: &EncodeConfig) -> Result<()> {
+        validate(config)?;
+        if !self.capabilities.supported_codecs.contains(&config.codec) {
+            return Err(FluxError::EncoderInit(format!(
+                "FFmpeg build has no Vulkan encoder for {:?}",
+                config.codec
+            )));
+        }
+        let max = self.capabilities.max_resolution;
+        if config.resolution.width > max.width || config.resolution.height > max.height {
+            return Err(FluxError::EncoderInit(format!(
+                "resolution {} exceeds FFmpeg Vulkan maximum {}",
+                config.resolution, max
+            )));
+        }
+        Ok(())
+    }
+
+    fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        self.validate_config(&config)?;
+        Ok(Box::new(FfmpegSession::spawn(
+            config,
+            Accel::Hardware(HwApi::Vulkan),
             Some(self.device.new_ref()),
         )?))
     }
@@ -589,7 +822,7 @@ struct EncoderState {
 impl EncoderState {
     fn new(config: &EncodeConfig, accel: Accel, device: Option<HwDevice>) -> Result<Self> {
         let name = match accel {
-            Accel::Hardware => encoder_name(config.codec)
+            Accel::Hardware(api) => api.encoder_name(config.codec)
                 .ok_or_else(|| FluxError::EncoderInit("unsupported codec".into()))?,
             Accel::Software => sw_encoder_name(config.codec).ok_or_else(|| {
                 FluxError::EncoderInit(format!(
@@ -603,45 +836,17 @@ impl EncoderState {
 
         let width = config.resolution.width;
         let height = config.resolution.height;
-        // Hardware VA-API surfaces take NV12 (SDR) / P010 (HDR); the software
-        // encoders (libx264/libopenh264) take planar YUV420P.
+        // Hardware surfaces take NV12 (SDR) / P010 (HDR); the software encoders
+        // (libx264/libopenh264) take planar YUV420P.
         let sw_format = match accel {
-            Accel::Hardware => surface_sw_format(config.dynamic_range),
+            Accel::Hardware(_) => surface_sw_format(config.dynamic_range),
             Accel::Software => Pixel::YUV420P,
         };
 
         let mut octx = ff::codec::context::Context::new_with_codec(codec);
 
-        // Hardware: build a VA-API surface pool and feed the encoder VAAPI
-        // surfaces. Software: the encoder ingests the CPU frame directly in its
-        // `sw_format`. The pool is held in an RAII guard so it is freed if any
-        // `?` below bails out before `EncoderState` (whose `Drop` then owns it)
-        // is constructed.
-        let frames_ctx = match accel {
-            Accel::Hardware => {
-                let device_ref = device.as_ref().ok_or_else(|| {
-                    FluxError::EncoderInit("hardware encode requires a VA-API device".into())
-                })?;
-                let frames = create_hw_frames_ctx(device_ref, sw_format, width, height)?;
-                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
-                unsafe {
-                    let ctx = octx.as_mut_ptr();
-                    (*ctx).pix_fmt = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                    // Bind the hardware frame pool; the encoder ingests VA-API surfaces.
-                    (*ctx).hw_frames_ctx = ff::ffi::av_buffer_ref(frames.raw());
-                }
-                // Init succeeded so far; transfer ownership to `EncoderState::drop`.
-                Some(frames.into_raw())
-            }
-            Accel::Software => {
-                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
-                unsafe {
-                    (*octx.as_mut_ptr()).pix_fmt = pixel_to_ffi(sw_format);
-                }
-                None
-            }
-        };
-
+        // Dimensions/rate-control are set before the hardware frame pool is
+        // built so the encoder sees a fully-configured context at open time.
         // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
         unsafe {
             let ctx = octx.as_mut_ptr();
@@ -666,9 +871,51 @@ impl EncoderState {
             (*ctx).rc_buffer_size = bits.min(i32::MAX as i64) as c_int;
         }
 
+        // Hardware: build a surface pool and feed the encoder hardware surfaces.
+        // Software: the encoder ingests the CPU frame directly in its
+        // `sw_format`. The pool is held in an RAII guard so it is freed if any
+        // `?` below bails out before `EncoderState` (whose `Drop` then owns it)
+        // is constructed.
+        let frames_ctx = match accel {
+            Accel::Hardware(api) => {
+                let device_ref = device.as_ref().ok_or_else(|| {
+                    FluxError::EncoderInit("hardware encode requires a hardware device".into())
+                })?;
+                // The encoder ingests hardware surfaces (`pix_fmt`) holding
+                // `sw_format` pixels; the Vulkan encoder reads `sw_pix_fmt` at
+                // init to pick its picture format, and it is harmless for VA-API.
+                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
+                unsafe {
+                    (*octx.as_mut_ptr()).pix_fmt = api.hw_pix_fmt();
+                    (*octx.as_mut_ptr()).sw_pix_fmt = pixel_to_ffi(sw_format);
+                }
+                // Both APIs build the pool the same way: leave the Vulkan image
+                // usage at its default so `hwcontext_vulkan` auto-derives the
+                // `VIDEO_ENCODE_SRC` usage the encode queue requires (see
+                // `create_hw_frames_ctx`).
+                let frames =
+                    create_hw_frames_ctx(device_ref, api.hw_pix_fmt(), sw_format, width, height)?;
+                // SAFETY: `octx` owns a valid context; bind the pool so the
+                // encoder ingests hardware surfaces.
+                unsafe {
+                    (*octx.as_mut_ptr()).hw_frames_ctx = ff::ffi::av_buffer_ref(frames.raw());
+                }
+                // Init succeeded so far; transfer ownership to `EncoderState::drop`.
+                Some(frames.into_raw())
+            }
+            Accel::Software => {
+                // SAFETY: `octx` owns a freshly-allocated `AVCodecContext`.
+                unsafe {
+                    (*octx.as_mut_ptr()).pix_fmt = pixel_to_ffi(sw_format);
+                }
+                None
+            }
+        };
+
         let mut opts = ff::Dictionary::new();
         let option_list = match accel {
-            Accel::Hardware => low_latency_options(config),
+            Accel::Hardware(HwApi::Vaapi) => low_latency_options(config),
+            Accel::Hardware(HwApi::Vulkan) => vk_low_latency_options(config),
             Accel::Software => sw_low_latency_options(name),
         };
         for (k, v) in option_list {
@@ -864,10 +1111,20 @@ impl Drop for EncoderState {
 
 // ─────────────────────────── ffi helpers ───────────────────────────
 
-/// Allocate and initialize a VA-API hardware frame pool for `sw_format`,
+/// Allocate and initialize a hardware frame pool for `sw_format` on the given
+/// hardware API's surface format (`AV_PIX_FMT_VAAPI` / `AV_PIX_FMT_VULKAN`),
 /// returned in an RAII guard that frees it on drop.
+///
+/// `usage` is deliberately left at its default of `0`. For Vulkan this matters:
+/// `hwcontext_vulkan`'s pool init only auto-derives the image usage flags — in
+/// particular `VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR` (and profile-independent
+/// image creation via `VK_KHR_video_maintenance1`) — when the caller has not
+/// pinned a custom usage. Setting it manually would suppress that derivation and
+/// the encoder would reject the surfaces. This mirrors what the `hwupload`
+/// filter does on the FFmpeg CLI.
 fn create_hw_frames_ctx(
     device: &HwDevice,
+    hw_format: ff::ffi::AVPixelFormat,
     sw_format: Pixel,
     width: u32,
     height: u32,
@@ -880,7 +1137,7 @@ fn create_hw_frames_ctx(
             return Err(FluxError::EncoderInit("av_hwframe_ctx_alloc failed".into()));
         }
         let frames_ctx = (*frames_ref).data as *mut ff::ffi::AVHWFramesContext;
-        (*frames_ctx).format = ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*frames_ctx).format = hw_format;
         (*frames_ctx).sw_format = pixel_to_ffi(sw_format);
         (*frames_ctx).width = width as c_int;
         (*frames_ctx).height = height as c_int;
@@ -945,6 +1202,34 @@ mod tests {
         assert_eq!(encoder_name(VideoCodec::H264), Some("h264_vaapi"));
         assert_eq!(encoder_name(VideoCodec::H265), Some("hevc_vaapi"));
         assert_eq!(encoder_name(VideoCodec::Av1), None);
+    }
+
+    #[test]
+    fn hw_api_maps_encoder_names_per_codec() {
+        assert_eq!(HwApi::Vaapi.encoder_name(VideoCodec::H264), Some("h264_vaapi"));
+        assert_eq!(HwApi::Vaapi.encoder_name(VideoCodec::H265), Some("hevc_vaapi"));
+        assert_eq!(HwApi::Vulkan.encoder_name(VideoCodec::H264), Some("h264_vulkan"));
+        assert_eq!(HwApi::Vulkan.encoder_name(VideoCodec::H265), Some("hevc_vulkan"));
+        assert_eq!(HwApi::Vaapi.encoder_name(VideoCodec::Av1), None);
+        assert_eq!(HwApi::Vulkan.encoder_name(VideoCodec::Av1), None);
+    }
+
+    #[test]
+    fn hw_api_maps_surface_pixel_format() {
+        assert_eq!(
+            HwApi::Vaapi.hw_pix_fmt(),
+            ff::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI
+        );
+        assert_eq!(
+            HwApi::Vulkan.hw_pix_fmt(),
+            ff::ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
+        );
+    }
+
+    #[test]
+    fn vulkan_low_latency_options_set_async_depth() {
+        let opts = vk_low_latency_options(&cfg(VideoCodec::H264));
+        assert!(opts.contains(&("async_depth", "1".to_string())));
     }
 
     #[test]

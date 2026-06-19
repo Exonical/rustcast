@@ -31,7 +31,20 @@ pub fn create_encoder(backend: Option<EncoderBackend>) -> Result<Box<dyn VideoEn
         #[cfg(target_os = "windows")]
         EncoderBackend::Amf => Ok(Box::new(backend::amf::AmfEncoder::new()?)),
 
-        EncoderBackend::VulkanVideo => Ok(Box::new(backend::vulkan::VulkanVideoEncoder::new()?)),
+        EncoderBackend::VulkanVideo => {
+            // On Linux with FFmpeg compiled in, Vulkan Video is driven through
+            // libavcodec's `h264_vulkan`/`hevc_vulkan` encoders (real GPU
+            // offload on the system Vulkan driver, no VA-API driver needed).
+            // Elsewhere it resolves to the cross-platform raw-Vulkan backend.
+            #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
+            {
+                Ok(Box::new(backend::ffmpeg::FfmpegVulkanEncoder::new()?))
+            }
+            #[cfg(not(all(target_os = "linux", feature = "encoder-ffmpeg")))]
+            {
+                Ok(Box::new(backend::vulkan::VulkanVideoEncoder::new()?))
+            }
+        }
 
         EncoderBackend::Software => {
             // On Linux with the FFmpeg backend compiled in, the software path is
