@@ -352,10 +352,13 @@ fn encoder_backend_candidates() -> Vec<flux_core::types::EncoderBackend> {
 
 /// Create an encoder of the given backend and open a session, returning `None`
 /// (with a warning logged) if either the encoder or the session can't be built.
+/// If the requested resolution exceeds the encoder's maximum, the session is
+/// opened at an aspect-preserving downscaled resolution instead; the actually
+/// used resolution is returned alongside the session.
 fn create_encode_session(
     backend: flux_core::types::EncoderBackend,
-    config: flux_encode::traits::EncodeConfig,
-) -> Option<Box<dyn flux_encode::traits::EncodeSession>> {
+    mut config: flux_encode::traits::EncodeConfig,
+) -> Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)> {
     let encoder = match flux_encode::create_encoder(Some(backend)) {
         Ok(enc) => {
             tracing::info!("Encoder created: {} ({:?})", enc.name(), backend);
@@ -366,10 +369,24 @@ fn create_encode_session(
             return None;
         }
     };
+    if let Ok(caps) = encoder.capabilities() {
+        let fitted = flux_encode::scale::fit_within(config.resolution, caps.max_resolution);
+        if fitted != config.resolution {
+            tracing::info!(
+                "{:?}: downscaling {} → {} to fit encoder maximum {}",
+                backend,
+                config.resolution,
+                fitted,
+                caps.max_resolution
+            );
+            config.resolution = fitted;
+        }
+    }
+    let resolution = config.resolution;
     match encoder.create_session(config) {
         Ok(s) => {
-            tracing::info!("{:?} H.264 encode session started", backend);
-            Some(s)
+            tracing::info!("{:?} H.264 encode session started at {}", backend, resolution);
+            Some((s, resolution))
         }
         Err(e) => {
             tracing::warn!("Failed to create {:?} encode session: {}", backend, e);
@@ -381,11 +398,12 @@ fn create_encode_session(
 /// Build an H.264 encode session for a concrete capture resolution, preferring
 /// the platform hardware encoder and falling back to software when it can't be
 /// opened (e.g. no VA-API driver). Returns the session and the backend used.
+#[allow(clippy::type_complexity)]
 fn build_encode_session_for(
     target_fps: u32,
     resolution: flux_core::types::Resolution,
 ) -> (
-    Option<Box<dyn flux_encode::traits::EncodeSession>>,
+    Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)>,
     flux_core::types::EncoderBackend,
 ) {
     let encoder_config = flux_encode::traits::EncodeConfig {
@@ -486,6 +504,7 @@ fn capture_loop(
     // monitors). Build the encoder from the frame the capture path actually
     // delivers, and rebuild it if the resolution changes mid-stream.
     let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
+    let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
     let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
     // Verification file (first ~5 seconds)
@@ -529,18 +548,42 @@ fn capture_loop(
         // (Re)build the encoder once the negotiated capture resolution is
         // known or whenever it changes (e.g. display rotation / mode switch),
         // so the encoder dimensions always match the frames it receives.
-        if encode_resolution != frame.resolution {
+        if capture_resolution != frame.resolution {
             let (sess, backend) = build_encode_session_for(target_fps, frame.resolution);
-            encode_session = sess;
-            encode_resolution = frame.resolution;
+            capture_resolution = frame.resolution;
+            match sess {
+                Some((s, res)) => {
+                    encode_session = Some(s);
+                    encode_resolution = res;
+                }
+                None => {
+                    encode_session = None;
+                    encode_resolution = frame.resolution;
+                }
+            }
             tracing::info!(
-                "Capture+encode loop: {}x{}@{}fps → {:?} H.264",
+                "Capture+encode loop: {}x{} captured → {}x{}@{}fps {:?} H.264",
+                capture_resolution.width, capture_resolution.height,
                 encode_resolution.width, encode_resolution.height, target_fps, backend
             );
             if let Some(ref mut enc) = encode_session {
                 enc.request_idr();
             }
         }
+
+        // Downscale when the encoder couldn't be opened at the full capture
+        // size (e.g. 5120x2160 exceeds AMD's 4096x4096 H.264 limit).
+        let frame = if frame.resolution != encode_resolution {
+            match flux_encode::scale::downscale_frame(&frame, encode_resolution) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("Frame downscale failed: {}", e);
+                    continue;
+                }
+            }
+        } else {
+            frame
+        };
 
         // ── Hardware H.264 encode ───────────────────────────────────
         let t1 = std::time::Instant::now();
