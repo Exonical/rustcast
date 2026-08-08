@@ -1,0 +1,21 @@
+# Extends wdk-build's driver packaging flow: build, stampinf, infverif,
+# inf2cat, test-certificate generation, and signing. Output lands in
+# target/<profile>/flux_idd_package/.
+extend = "target/rust-driver-makefile.toml"
+
+[env]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+
+[config]
+load_script = '''
+#!@rust
+//! ```cargo
+//! [dependencies]
+//! wdk-build = "0.5.1"
+//! ```
+#![allow(unused_doc_comments)]
+
+fn main() -> Result<(), wdk_build::ConfigError> {
+    wdk_build::cargo_make::load_rust_driver_makefile()
+}
+'''
