@@ -1,0 +1,67 @@
+; FluxIdd.inf — Flux virtual display (Indirect Display Driver, UMDF 2 / IddCx)
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderString%
+CatalogFile=FluxIdd.cat
+DriverVer=01/01/2026,1.0.0.0
+PnpLockDown=1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$.10.0...17763
+
+[Standard.NT$ARCH$.10.0...17763]
+%DeviceName%=FluxIdd_Install, Root\FluxIdd
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+flux_idd.dll = 1
+
+[FluxIdd_Install.NT]
+CopyFiles=UMDriverCopy
+
+[FluxIdd_Install.NT.hw]
+AddReg = FluxIdd_HardwareDeviceSettings
+
+[FluxIdd_HardwareDeviceSettings.AddReg]
+; Restrict device access to SYSTEM and Administrators: the plug-in/out IOCTLs
+; change display topology and must not be reachable from normal user code.
+HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[FluxIdd_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName = %WudfRdDisplayName%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[FluxIdd_Install.NT.Wdf]
+UmdfService=FluxIdd,FluxIdd_Umdf_Install
+UmdfServiceOrder=FluxIdd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+UmdfHostProcessSharing=ProcessSharingDisabled
+
+[FluxIdd_Umdf_Install]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\flux_idd.dll
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+flux_idd.dll
+
+[Strings]
+ProviderString="Rustcast"
+ManufacturerName="Rustcast"
+DeviceName="Flux Virtual Display"
+DiskName="FluxIdd Installation Disk"
+WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"

@@ -12,6 +12,8 @@ mod http;
 mod pipeline;
 mod quic_frames;
 mod session;
+#[cfg(target_os = "windows")]
+mod virtual_display;
 #[cfg(feature = "tray")]
 mod tray;
 
@@ -145,6 +147,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         tray_quit_rx
     };
+
+    // Plug in a virtual monitor for headless hosts before capture starts.
+    // Kept alive for the whole server lifetime; dropped (plugged out) on exit.
+    #[cfg(target_os = "windows")]
+    let _virtual_display = config.video.virtual_display.and_then(|vd| {
+        match virtual_display::VirtualDisplay::plug_in(vd.width, vd.height, vd.refresh_hz) {
+            Ok(display) => {
+                // Give the OS a moment to enumerate the new display before
+                // capture probes for outputs.
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Some(display)
+            }
+            Err(e) => {
+                tracing::warn!("Virtual display unavailable: {e}");
+                None
+            }
+        }
+    });
 
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.

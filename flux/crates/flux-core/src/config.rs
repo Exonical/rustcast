@@ -129,6 +129,23 @@ pub struct VideoConfig {
     /// the forced backend can't be opened.
     #[serde(default)]
     pub encoder: Option<crate::types::EncoderBackend>,
+
+    /// Virtual display for headless hosts (Windows, requires the FluxIdd
+    /// driver): plug in a virtual monitor at this mode before capturing.
+    #[serde(default)]
+    pub virtual_display: Option<VirtualDisplayConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VirtualDisplayConfig {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_refresh_hz")]
+    pub refresh_hz: u32,
+}
+
+fn default_refresh_hz() -> u32 {
+    60
 }
 
 impl Default for VideoConfig {
@@ -146,6 +163,7 @@ impl Default for VideoConfig {
             fec_percentage: 20,
             max_packet_size: 1400,
             encoder: None,
+            virtual_display: None,
         }
     }
 }
