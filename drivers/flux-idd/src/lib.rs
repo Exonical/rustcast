@@ -71,7 +71,6 @@ struct DriverState {
     monitor_operation_in_progress: bool,
     preferred: (u32, u32, u32),
     processor: Option<swapchain::SwapChainProcessor>,
-    last_swapchain_error: NTSTATUS,
 }
 
 // IDDCX handles are only touched from IddCx callbacks and the IOCTL queue,
@@ -87,7 +86,6 @@ static STATE: Mutex<DriverState> = Mutex::new(DriverState {
     monitor_operation_in_progress: false,
     preferred: (1920, 1080, 60),
     processor: None,
-    last_swapchain_error: STATUS_SUCCESS,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +272,7 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
     monitor_info.MonitorDescription.Size = size_of::<idd::IDDCX_MONITOR_DESCRIPTION>() as u32;
     monitor_info.MonitorDescription.Type =
         idd::IDDCX_MONITOR_DESCRIPTION_TYPE_IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+    // EDID-less monitor: the OS calls EvtIddCxMonitorGetDefaultDescriptionModes.
     monitor_info.MonitorDescription.DataSize = 0;
     monitor_info.MonitorDescription.pData = ptr::null_mut();
 
@@ -533,10 +532,7 @@ extern "C" fn evt_monitor_assign_swapchain(
             state.processor = Some(processor);
             STATUS_SUCCESS
         }
-        Err(status) => {
-            STATE.lock().unwrap().last_swapchain_error = status;
-            STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN
-        }
+        Err(_) => STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN,
     }
 }
 
