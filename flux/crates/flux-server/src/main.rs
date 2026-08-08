@@ -157,6 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // IDR request channel: Frame server (TCP) -> Capture thread
     let (idr_tx, idr_rx) = std::sync::mpsc::channel::<()>();
 
+    // Bitrate update channel: relay congestion feedback -> capture thread
+    let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
+
     // Input event channel: Frame server (TCP) -> Capture thread (Input Sink)
     let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
 
@@ -164,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
-            capture_loop(h264_tx2, idr_rx, input_rx, capture_fps);
+            capture_loop(h264_tx2, idr_rx, bitrate_rx, input_rx, capture_fps);
         })?;
 
     // ── Start TCP frame server (for Go WebRTC relay) ─────────────
@@ -181,9 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
                 let h264_tx = h264_tx.clone();
                 let idr_tx = idr_tx.clone();
+                let bitrate_tx = bitrate_tx.clone();
                 let input_tx = input_tx.clone();
                 Some(tokio::spawn(async move {
-                    quic_frames::serve(endpoint, h264_tx, idr_tx, input_tx).await;
+                    quic_frames::serve(endpoint, h264_tx, idr_tx, bitrate_tx, input_tx).await;
                 }))
             }
             Err(e) => {
@@ -198,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let frame_handle = tokio::spawn(async move {
-        frame_server(frame_listener, h264_tx, idr_tx, input_tx).await;
+        frame_server(frame_listener, h264_tx, idr_tx, bitrate_tx, input_tx).await;
     });
 
     // Build the server.
@@ -237,6 +241,7 @@ async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
+    bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
     loop {
@@ -262,6 +267,7 @@ async fn frame_server(
         }
         let mut rx = h264_tx.subscribe();
         let idr_tx = idr_tx.clone();
+        let bitrate_tx = bitrate_tx.clone();
         let input_tx = input_tx.clone();
 
         tokio::spawn(async move {
@@ -323,6 +329,16 @@ async fn frame_server(
                                     tracing::warn!("Failed to deserialize input event: {}", e);
                                 }
                             }
+                        }
+                        0x03 => {
+                            // Bitrate update (congestion feedback from relay)
+                            let mut kbps_buf = [0u8; 4];
+                            if reader.read_exact(&mut kbps_buf).await.is_err() {
+                                break;
+                            }
+                            let kbps = u32::from_be_bytes(kbps_buf);
+                            tracing::info!("Client {} requested bitrate {} kbps", addr, kbps);
+                            let _ = bitrate_tx.send(kbps);
                         }
                         _ => {
                             tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);
@@ -488,6 +504,7 @@ fn build_encode_session_for(
 fn capture_loop(
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
+    bitrate_rx: std::sync::mpsc::Receiver<u32>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
 ) {
@@ -577,6 +594,18 @@ fn capture_loop(
             tracing::info!("Handling IDR request from client");
             if let Some(ref mut enc) = encode_session {
                 enc.request_idr();
+            }
+        }
+
+        // Apply bitrate updates from relay congestion feedback (latest wins)
+        let mut new_bitrate: Option<u32> = None;
+        while let Ok(kbps) = bitrate_rx.try_recv() {
+            new_bitrate = Some(kbps);
+        }
+        if let (Some(kbps), Some(ref mut enc)) = (new_bitrate, encode_session.as_mut()) {
+            match enc.set_bitrate(kbps) {
+                Ok(()) => tracing::info!("Encoder bitrate set to {} kbps", kbps),
+                Err(e) => tracing::warn!("set_bitrate({} kbps) failed: {}", kbps, e),
             }
         }
 

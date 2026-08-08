@@ -8,6 +8,7 @@
 //! Stream formats:
 //!   frame (server→client uni): [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
+//!                                | [0x03][4-byte BE target bitrate kbps]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,7 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
+    bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
@@ -55,7 +57,13 @@ pub async fn serve(
         tracing::info!("QUIC frame client connected: {}", connection.remote_address());
 
         let rx = h264_tx.subscribe();
-        tokio::spawn(handle_connection(connection, rx, idr_tx.clone(), input_tx.clone()));
+        tokio::spawn(handle_connection(
+            connection,
+            rx,
+            idr_tx.clone(),
+            bitrate_tx.clone(),
+            input_tx.clone(),
+        ));
     }
 }
 
@@ -63,6 +71,7 @@ async fn handle_connection(
     connection: quinn::Connection,
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
+    bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
     let control_conn = connection.clone();
@@ -73,8 +82,9 @@ async fn handle_connection(
                 Err(_) => return,
             };
             let idr_tx = idr_tx.clone();
+            let bitrate_tx = bitrate_tx.clone();
             let input_tx = input_tx.clone();
-            tokio::spawn(read_commands(recv, idr_tx, input_tx));
+            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx));
         }
     });
 
@@ -115,6 +125,7 @@ async fn handle_connection(
 async fn read_commands(
     mut recv: quinn::RecvStream,
     idr_tx: std::sync::mpsc::Sender<()>,
+    bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
 ) {
     loop {
@@ -147,6 +158,15 @@ async fn read_commands(
                     }
                     Err(e) => tracing::warn!("QUIC input event parse error: {}", e),
                 }
+            }
+            0x03 => {
+                let mut kbps_buf = [0u8; 4];
+                if recv.read_exact(&mut kbps_buf).await.is_err() {
+                    return;
+                }
+                let kbps = u32::from_be_bytes(kbps_buf);
+                tracing::info!("QUIC client requested bitrate {} kbps", kbps);
+                let _ = bitrate_tx.send(kbps);
             }
             other => {
                 tracing::warn!("QUIC unknown command byte: 0x{:02x}", other);
