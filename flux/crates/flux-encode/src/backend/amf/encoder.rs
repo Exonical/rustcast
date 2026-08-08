@@ -460,7 +460,9 @@ impl VideoEncoder for AmfEncoder {
             supported_codecs: codecs,
             supports_hdr: self.supports_hdr(),
             supports_yuv444: false, // VCN < 4.0
-            max_resolution: Resolution::new(7680, 4320),
+            // AMD VCN caps H.264 (AVC) encoding at 4096x4096; larger frames
+            // fail session creation with AMF_INVALID_ARG on FrameSize.
+            max_resolution: Resolution::new(4096, 4096),
             max_framerate: 240,
         })
     }

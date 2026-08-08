@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod color;
+pub mod scale;
 #[cfg(any(feature = "encoder-vaapi", feature = "encoder-vulkan"))]
 pub(crate) mod nv12;
 // DMA-BUF GPU import is a unix/Linux concept (VA-API/Vulkan); Windows imports
