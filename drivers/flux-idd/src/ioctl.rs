@@ -9,7 +9,9 @@ use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr;
 
-use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, ULONG, WDFDEVICE, WDFREQUEST};
+use wdk_sys::{call_unsafe_wdf_function_binding, NTSTATUS, ULONG, WDFREQUEST};
+
+use crate::bindings as idd;
 
 // CTL_CODE(FILE_DEVICE_UNKNOWN=0x22, function, METHOD_BUFFERED=0, FILE_WRITE_DATA=2)
 // = (0x22 << 16) | (2 << 14) | (function << 2) | 0
@@ -28,13 +30,14 @@ pub struct FluxIddMonitorMode {
     pub refresh_hz: u32,
 }
 
-pub extern "C" fn evt_io_device_control(
-    _device: WDFDEVICE,
-    request: WDFREQUEST,
+pub unsafe extern "C" fn evt_io_device_control(
+    _device: idd::WDFDEVICE,
+    request: idd::WDFREQUEST,
     _output_buffer_length: usize,
     input_buffer_length: usize,
     io_control_code: ULONG,
 ) {
+    let request = request as WDFREQUEST;
     let status: NTSTATUS = match io_control_code {
         IOCTL_FLUXIDD_PLUG_IN => handle_plug_in(request, input_buffer_length),
         IOCTL_FLUXIDD_PLUG_OUT => crate::plug_out_monitor(),
