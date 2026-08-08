@@ -622,6 +622,10 @@ impl AmfSession {
                 encoder.set_property_size(H264_FRAMESIZE, w, h)?;
                 encoder.set_property_rate(H264_FRAMERATE, config.framerate, 1)?;
                 encoder.set_property_int64(H264_PROFILE, H264_PROFILE_HIGH)?;
+                encoder.set_property_int64(H264_QUALITY_PRESET, H264_QUALITY_BALANCED)?;
+                if let Err(e) = encoder.set_property_bool(H264_LOWLATENCY_MODE, true) {
+                    tracing::debug!("AMF: LowLatencyInternal not supported: {}", e);
+                }
 
                 // Rate control
                 let rc = match config.rate_control {
@@ -644,6 +648,15 @@ impl AmfSession {
                 encoder.set_property_int64(H264_B_PIC_PATTERN, 0)?; 
                 encoder.set_property_int64(H264_HEADER_INSERTION_MODE, HEADER_INSERTION_IDR)?;
                 encoder.set_property_bool(H264_ENFORCE_HRD, true)?;
+                // Adaptive quantization: spend bits where the eye notices
+                // (text, edges) for better perceived quality per bit. Not
+                // supported on all drivers, so failures are non-fatal.
+                if let Err(e) = encoder.set_property_bool(H264_VBAQ, true) {
+                    tracing::debug!("AMF: EnableVBAQ not supported: {}", e);
+                }
+                if let Err(e) = encoder.set_property_bool(H264_PREENCODE, true) {
+                    tracing::debug!("AMF: RateControlPreanalysisEnable not supported: {}", e);
+                }
             }
             VideoCodec::H265 => {
                 encoder.set_property_int64(HEVC_USAGE, HEVC_USAGE_ULTRA_LOW_LATENCY)?;
@@ -659,6 +672,7 @@ impl AmfSession {
 
                 // Tier (High for quality, Main for speed)
                 encoder.set_property_int64(HEVC_TIER, HEVC_TIER_HIGH)?;
+                encoder.set_property_int64(HEVC_QUALITY_PRESET, HEVC_QUALITY_BALANCED)?;
 
                 // Rate control
                 let rc = match config.rate_control {
@@ -679,12 +693,16 @@ impl AmfSession {
                 encoder.set_property_int64(HEVC_GOP_SIZE, config.framerate as i64)?;
                 encoder.set_property_int64(HEVC_MAX_NUM_REFRAMES, config.max_ref_frames as i64)?;
                 encoder.set_property_bool(HEVC_ENFORCE_HRD, true)?;
+                if let Err(e) = encoder.set_property_bool(HEVC_VBAQ, true) {
+                    tracing::debug!("AMF: HevcEnableVBAQ not supported: {}", e);
+                }
             }
             VideoCodec::Av1 => {
                 encoder.set_property_int64(AV1_USAGE, AV1_USAGE_ULTRA_LOW_LATENCY)?;
                 encoder.set_property_size(AV1_FRAMESIZE, w, h)?;
                 encoder.set_property_rate(AV1_FRAMERATE, config.framerate, 1)?;
                 encoder.set_property_int64(AV1_PROFILE, AV1_PROFILE_MAIN)?;
+                encoder.set_property_int64(AV1_QUALITY_PRESET, AV1_QUALITY_BALANCED)?;
                 
                 // Rate control
                 let rc = match config.rate_control {

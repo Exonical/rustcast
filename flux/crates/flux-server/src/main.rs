@@ -350,6 +350,13 @@ fn encoder_backend_candidates() -> Vec<flux_core::types::EncoderBackend> {
     candidates
 }
 
+/// Content-scaled CBR bitrate: ~0.05 bits per pixel per frame suits H.264
+/// desktop streaming (sharp text at moderate motion), clamped to sane bounds.
+fn bitrate_kbps_for(resolution: flux_core::types::Resolution, fps: u32) -> u32 {
+    let bps = resolution.width as u64 * resolution.height as u64 * fps as u64 * 5 / 100;
+    (bps / 1000).clamp(4_000, 40_000) as u32
+}
+
 /// Create an encoder of the given backend and open a session, returning `None`
 /// (with a warning logged) if either the encoder or the session can't be built.
 /// If the requested resolution exceeds the encoder's maximum, the session is
@@ -383,6 +390,7 @@ fn create_encode_session(
         }
     }
     let resolution = config.resolution;
+    config.bitrate_kbps = bitrate_kbps_for(resolution, config.framerate);
     match encoder.create_session(config) {
         Ok(s) => {
             tracing::info!("{:?} H.264 encode session started at {}", backend, resolution);
@@ -410,6 +418,7 @@ fn build_encode_session_for(
         codec: flux_core::types::VideoCodec::H264,
         resolution,
         framerate: target_fps,
+        // Placeholder; recomputed per-backend from the fitted resolution.
         bitrate_kbps: 10_000,
         rate_control: flux_core::types::RateControlMode::Cbr,
         dynamic_range: flux_core::types::DynamicRange::Sdr,
