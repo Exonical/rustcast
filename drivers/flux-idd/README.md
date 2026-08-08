@@ -26,7 +26,11 @@ Prerequisites:
 
 1. Visual Studio 2022 Build Tools with C++ workload
 2. [WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk) (or eWDK) — 22H2 or newer
-3. LLVM/Clang (for bindgen): `winget install LLVM.LLVM`
+3. LLVM/Clang 17 (for bindgen — newer LLVM (22+) miscompiles bindgen layouts,
+   producing `E0080` size-assertion errors in wdk-sys):
+   `winget install -i LLVM.LLVM --version 17.0.6`
+   If a newer LLVM is also installed, point bindgen at 17 explicitly:
+   `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"` (the 17.0.6 install path)
 4. `cargo install cargo-make --no-default-features --features tls-native`
 
 Build & package:
