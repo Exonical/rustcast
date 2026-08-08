@@ -569,10 +569,32 @@ fn capture_loop(
             if let Some(ref mut enc) = encode_session {
                 enc.request_idr();
             }
+
+            // If the encoder had to be opened below the capture size (e.g.
+            // 5120x2160 exceeds AMD's 4096x4096 H.264 limit), restart the
+            // capture session at the encode resolution so the backend scales
+            // on the GPU (DXGI video-processor blit) and frames arrive
+            // already sized for the encoder.
+            if encode_session.is_some() && encode_resolution != capture_resolution {
+                match capture.start_capture(Some(primary.id), encode_resolution, target_fps) {
+                    Ok(s) => {
+                        session = s;
+                        capture_resolution = encode_resolution;
+                        tracing::info!("Capture restarted with GPU downscale to {}", encode_resolution);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to restart capture at {}: {} — falling back to CPU downscale",
+                            encode_resolution, e
+                        );
+                    }
+                }
+            }
         }
 
-        // Downscale when the encoder couldn't be opened at the full capture
-        // size (e.g. 5120x2160 exceeds AMD's 4096x4096 H.264 limit).
+        // CPU fallback when GPU-side scaling isn't available: downscale the
+        // frame before encoding when the encoder session is smaller.
         let frame = if frame.resolution != encode_resolution {
             match flux_encode::scale::downscale_frame(&frame, encode_resolution) {
                 Ok(f) => f,

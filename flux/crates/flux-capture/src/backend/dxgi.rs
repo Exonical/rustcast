@@ -148,6 +148,129 @@ impl ScreenCapture for DxgiCapture {
     }
 }
 
+/// GPU downscaler: a D3D11 video processor that blits the desktop-sized
+/// capture into a smaller shared texture, so hardware encoders with a lower
+/// maximum coded size (e.g. 4096x4096 for H.264 on AMD VCN) can consume the
+/// frame without any CPU copy.
+struct GpuScaler {
+    video_context: ID3D11VideoContext,
+    processor: ID3D11VideoProcessor,
+    /// Desktop-sized intermediate the acquired frame is copied into (input
+    /// views can't be created on the transient duplication texture).
+    input_texture: ID3D11Texture2D,
+    input_view: ID3D11VideoProcessorInputView,
+    output_view: ID3D11VideoProcessorOutputView,
+}
+
+impl GpuScaler {
+    fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        shared_texture: &ID3D11Texture2D,
+        input: Resolution,
+        output: Resolution,
+    ) -> Result<Self> {
+        unsafe {
+            let video_device: ID3D11VideoDevice = device.cast()
+                .map_err(|e| FluxError::Capture(format!("Cast to ID3D11VideoDevice: {}", e)))?;
+            let video_context: ID3D11VideoContext = context.cast()
+                .map_err(|e| FluxError::Capture(format!("Cast to ID3D11VideoContext: {}", e)))?;
+
+            let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+                InputWidth: input.width,
+                InputHeight: input.height,
+                OutputFrameRate: DXGI_RATIONAL { Numerator: 60, Denominator: 1 },
+                OutputWidth: output.width,
+                OutputHeight: output.height,
+                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            };
+            let enumerator = video_device.CreateVideoProcessorEnumerator(&content_desc)
+                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorEnumerator: {}", e)))?;
+            let processor = video_device.CreateVideoProcessor(&enumerator, 0)
+                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessor: {}", e)))?;
+
+            // Desktop-sized intermediate input texture.
+            let input_desc = D3D11_TEXTURE2D_DESC {
+                Width: input.width,
+                Height: input.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut input_texture = None;
+            device.CreateTexture2D(&input_desc, None, Some(&mut input_texture))
+                .map_err(|e| FluxError::Capture(format!("CreateTexture2D scaler input: {}", e)))?;
+            let input_texture = input_texture
+                .ok_or_else(|| FluxError::Capture("Scaler input texture is null".into()))?;
+
+            let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+                },
+            };
+            let mut input_view = None;
+            video_device.CreateVideoProcessorInputView(&input_texture, &enumerator, &input_view_desc, Some(&mut input_view))
+                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorInputView: {}", e)))?;
+            let input_view = input_view
+                .ok_or_else(|| FluxError::Capture("Scaler input view is null".into()))?;
+
+            let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut output_view = None;
+            video_device.CreateVideoProcessorOutputView(shared_texture, &enumerator, &output_view_desc, Some(&mut output_view))
+                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorOutputView: {}", e)))?;
+            let output_view = output_view
+                .ok_or_else(|| FluxError::Capture("Scaler output view is null".into()))?;
+
+            tracing::info!("GPU scaler created: {} → {} (D3D11 video processor)", input, output);
+
+            Ok(Self {
+                video_context,
+                processor,
+                input_texture,
+                input_view,
+                output_view,
+            })
+        }
+    }
+
+    /// Copy the acquired desktop texture into the intermediate input and blit
+    /// it, scaled, into the shared output texture.
+    fn scale(&self, context: &ID3D11DeviceContext, desktop_texture: &ID3D11Texture2D) -> Result<()> {
+        unsafe {
+            context.CopyResource(&self.input_texture, desktop_texture);
+            let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: true.into(),
+                OutputIndex: 0,
+                InputFrameOrField: 0,
+                PastFrames: 0,
+                FutureFrames: 0,
+                ppPastSurfaces: std::ptr::null_mut(),
+                pInputSurface: std::mem::ManuallyDrop::new(Some(self.input_view.clone())),
+                ppFutureSurfaces: std::ptr::null_mut(),
+                ppPastSurfacesRight: std::ptr::null_mut(),
+                pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+                ppFutureSurfacesRight: std::ptr::null_mut(),
+            };
+            self.video_context.VideoProcessorBlt(&self.processor, &self.output_view, 0, &[stream])
+                .map_err(|e| FluxError::Capture(format!("VideoProcessorBlt: {}", e)))
+        }
+    }
+}
+
 /// An active DXGI duplication session.
 struct DxgiCaptureSession {
     _device: ID3D11Device,
@@ -157,6 +280,7 @@ struct DxgiCaptureSession {
     shared_handle: u64,
     display_id: u32,
     resolution: Resolution,
+    scaler: Option<GpuScaler>,
     frame_interval: std::time::Duration,
     frame_sequence: u64,
     running: bool,
@@ -169,7 +293,7 @@ impl DxgiCaptureSession {
         context: &ID3D11DeviceContext,
         adapter: &IDXGIAdapter1,
         display_id: u32,
-        _resolution: Resolution,
+        requested_resolution: Resolution,
         framerate: u32,
     ) -> Result<Self> {
         unsafe {
@@ -195,10 +319,23 @@ impl DxgiCaptureSession {
                 dup_desc.ModeDesc.Format
             );
 
+            // Output at the requested resolution when it's smaller than the
+            // desktop (GPU downscale for encoders with a lower maximum coded
+            // size); otherwise pass the desktop through at native size.
+            let desktop = Resolution::new(dup_desc.ModeDesc.Width, dup_desc.ModeDesc.Height);
+            let output = if requested_resolution.width > 0
+                && requested_resolution.height > 0
+                && (requested_resolution.width < desktop.width || requested_resolution.height < desktop.height)
+            {
+                requested_resolution
+            } else {
+                desktop
+            };
+
             // Create a shared texture for GPU zero-copy access
             let tex_desc = D3D11_TEXTURE2D_DESC {
-                Width: dup_desc.ModeDesc.Width,
-                Height: dup_desc.ModeDesc.Height,
+                Width: output.width,
+                Height: output.height,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -223,6 +360,12 @@ impl DxgiCaptureSession {
             let shared_handle_val = shared_handle.0 as u64;
             tracing::info!("Shared texture handle: 0x{:x}", shared_handle_val);
 
+            let scaler = if output != desktop {
+                Some(GpuScaler::new(device, context, &shared_texture, desktop, output)?)
+            } else {
+                None
+            };
+
             let frame_interval = std::time::Duration::from_micros(1_000_000 / framerate as u64);
 
             Ok(Self {
@@ -232,7 +375,8 @@ impl DxgiCaptureSession {
                 shared_texture,
                 shared_handle: shared_handle_val,
                 display_id,
-                resolution: Resolution::new(dup_desc.ModeDesc.Width, dup_desc.ModeDesc.Height),
+                resolution: output,
+                scaler,
                 frame_interval,
                 frame_sequence: 0,
                 running: true,
@@ -274,8 +418,17 @@ impl DxgiCaptureSession {
             let desktop_texture: ID3D11Texture2D = resource.cast()
                 .map_err(|e| FluxError::Capture(format!("Cast to ID3D11Texture2D: {}", e)))?;
 
-            // Copy to shared texture (GPU copy)
-            self.context.CopyResource(&self.shared_texture, &desktop_texture);
+            // Copy to shared texture: direct GPU copy at native size, or a
+            // video-processor blit when downscaling.
+            match &self.scaler {
+                Some(scaler) => {
+                    if let Err(e) = scaler.scale(&self.context, &desktop_texture) {
+                        let _ = self.duplication.ReleaseFrame();
+                        return Err(e);
+                    }
+                }
+                None => self.context.CopyResource(&self.shared_texture, &desktop_texture),
+            }
 
             // Flush to ensure the GPU copy is submitted before the encoder
             // reads from this texture on a different D3D11 device.
