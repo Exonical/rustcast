@@ -10,6 +10,7 @@ require (
 	github.com/pion/interceptor v0.1.47
 	github.com/pion/rtcp v1.2.17
 	github.com/pion/webrtc/v4 v4.2.18
+	github.com/quic-go/quic-go v0.61.0
 	golang.org/x/net v0.57.0
 )
 
@@ -46,7 +47,6 @@ require (
 	github.com/pion/transport/v4 v4.1.0 // indirect
 	github.com/pion/turn/v5 v5.0.12 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.61.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.2 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect

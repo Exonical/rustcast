@@ -41,5 +41,8 @@ parking_lot = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 serde_json = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+socket2 = "0.6"
 tray-icon = { workspace = true, optional = true }
 muda = { workspace = true, optional = true }
