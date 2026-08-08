@@ -46,3 +46,6 @@ rustls = { workspace = true }
 socket2 = "0.6"
 tray-icon = { workspace = true, optional = true }
 muda = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }

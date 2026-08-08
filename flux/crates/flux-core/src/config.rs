@@ -123,6 +123,23 @@ pub struct VideoConfig {
 
     /// Maximum RTP packet size in bytes.
     pub max_packet_size: u16,
+
+    /// Virtual display for headless hosts (Windows, requires the FluxIdd
+    /// driver): plug in a virtual monitor at this mode before capturing.
+    #[serde(default)]
+    pub virtual_display: Option<VirtualDisplayConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct VirtualDisplayConfig {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_refresh_hz")]
+    pub refresh_hz: u32,
+}
+
+fn default_refresh_hz() -> u32 {
+    60
 }
 
 impl Default for VideoConfig {
@@ -139,6 +156,7 @@ impl Default for VideoConfig {
             rtp_port: 47998,
             fec_percentage: 20,
             max_packet_size: 1400,
+            virtual_display: None,
         }
     }
 }
