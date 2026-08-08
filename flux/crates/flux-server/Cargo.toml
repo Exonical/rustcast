@@ -20,6 +20,7 @@ tray = ["dep:tray-icon", "dep:muda"]
 capture-pipewire = ["flux-capture/capture-pipewire"]
 encoder-vaapi = ["flux-encode/encoder-vaapi"]
 encoder-ffmpeg = ["flux-encode/encoder-ffmpeg"]
+encoder-vulkan = ["flux-encode/encoder-vulkan"]
 
 [dependencies]
 flux-core = { workspace = true }

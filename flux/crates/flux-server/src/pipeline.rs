@@ -57,15 +57,20 @@ impl StreamingPipeline {
         #[cfg_attr(
             not(all(
                 target_os = "linux",
-                any(
-                    feature = "capture-pipewire",
-                    feature = "encoder-vaapi",
-                    feature = "encoder-ffmpeg"
-                )
+                any(feature = "capture-pipewire", feature = "encoder-vaapi", feature = "encoder-ffmpeg")
             )),
             allow(unused_mut)
         )]
         let mut capabilities = BaseCapabilityProbe::from_platform_info(platform);
+
+        // Vulkan Video is probed first so the more mature VA-API/FFmpeg
+        // backends override it when they are also compiled in.
+        #[cfg(feature = "encoder-vulkan")]
+        {
+            if let Some(encode) = flux_encode::probe_vulkan_encode_capabilities() {
+                capabilities.encode = encode;
+            }
+        }
 
         // ── Enrich with live subsystem probes (feature-gated) ────────
         // The base probe leaves portal/encode fields at conservative defaults;

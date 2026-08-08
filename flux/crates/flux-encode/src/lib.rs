@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod color;
+#[cfg(any(feature = "encoder-vaapi", feature = "encoder-vulkan"))]
+pub(crate) mod nv12;
 // DMA-BUF GPU import is a unix/Linux concept (VA-API/Vulkan); Windows imports
 // DXGI shared textures directly inside the AMF backend.
 #[cfg(unix)]
@@ -111,6 +113,30 @@ pub fn probe_ffmpeg_encode_capabilities() -> Option<flux_core::capability::Encod
     Some(flux_core::capability::EncodeCapabilities {
         backend: Some(EncoderBackend::FfmpegVaapi),
         driver: None,
+        h264: caps.supported_codecs.contains(&VideoCodec::H264),
+        h265: caps.supported_codecs.contains(&VideoCodec::H265),
+        av1: caps.supported_codecs.contains(&VideoCodec::Av1),
+        hdr10: caps.supports_hdr,
+    })
+}
+
+/// Probe the Vulkan Video driver and report its drivable encode capabilities.
+///
+/// Creates a Vulkan instance and looks for a device exposing
+/// `VK_KHR_video_encode_queue` + `VK_KHR_video_encode_h264`. Only codecs the
+/// backend can actually drive are reported (H.264 today). Returns `None` when
+/// no Vulkan Video encode device is available.
+#[cfg(feature = "encoder-vulkan")]
+pub fn probe_vulkan_encode_capabilities() -> Option<flux_core::capability::EncodeCapabilities> {
+    use flux_core::types::VideoCodec;
+    let encoder = backend::vulkan::VulkanVideoEncoder::new().ok()?;
+    let caps = encoder.capabilities().ok()?;
+    Some(flux_core::capability::EncodeCapabilities {
+        backend: Some(EncoderBackend::VulkanVideo),
+        driver: {
+            let name = encoder.device_name().to_string();
+            (!name.is_empty()).then_some(name)
+        },
         h264: caps.supported_codecs.contains(&VideoCodec::H264),
         h265: caps.supported_codecs.contains(&VideoCodec::H265),
         av1: caps.supported_codecs.contains(&VideoCodec::Av1),

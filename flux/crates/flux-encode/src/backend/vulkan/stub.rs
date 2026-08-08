@@ -194,11 +194,7 @@ impl EncodeSession for VulkanVideoSession {
         //  10. Query encode feedback:
         //      VkQueryPool with VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR
 
-        tracing::trace!(
-            "Vulkan Video encode frame {} (IDR={})",
-            self.frame_index,
-            is_idr
-        );
+        tracing::trace!("Vulkan Video encode frame {} (IDR={})", self.frame_index, is_idr);
 
         Ok(vec![EncodedPacket {
             frame_index: self.frame_index,
