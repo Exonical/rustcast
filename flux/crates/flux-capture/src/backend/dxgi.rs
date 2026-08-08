@@ -15,6 +15,9 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::core::Interface;
 
 /// DXGI Desktop Duplication capture backend.
@@ -29,6 +32,16 @@ impl DxgiCapture {
         tracing::info!("Initializing DXGI Desktop Duplication capture");
 
         unsafe {
+            // Declare per-monitor DPI awareness so display enumeration reports
+            // native pixel resolutions. Without this, Windows virtualizes
+            // DesktopCoordinates by the scale factor (e.g. a 2560x1600 panel at
+            // 150% shows up as 1707x1067) and the stream is silently captured
+            // at reduced resolution. Fails harmlessly if awareness was already
+            // set (e.g. via manifest).
+            if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
+                tracing::debug!("SetProcessDpiAwarenessContext: {} (already set?)", e);
+            }
+
             // Create D3D11 device with BGRA support (needed for Desktop Duplication)
             let mut device = None;
             let mut context = None;
