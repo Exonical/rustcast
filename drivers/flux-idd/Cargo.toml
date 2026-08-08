@@ -20,13 +20,13 @@ target-umdf-version-minor = 33
 crate-type = ["cdylib"]
 
 [build-dependencies]
-wdk-build = "0.4"
+wdk-build = "0.5"
 bindgen = "0.71"
 cc = "1"
 
 [dependencies]
-wdk = "0.4"
-wdk-sys = "0.4"
+wdk = "0.5"
+wdk-sys = "0.5"
 windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
