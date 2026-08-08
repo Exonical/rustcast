@@ -25,7 +25,6 @@ crate-type = ["cdylib"]
 [build-dependencies]
 wdk-build = "0.5"
 bindgen = "0.71"
-cc = "1"
 
 [dependencies]
 wdk = "0.4.1"
