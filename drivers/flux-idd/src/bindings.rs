@@ -22,7 +22,7 @@ macro_rules! iddcx_call {
     ($name:ident: $pfn:ident @ $idx:ident ( $($arg:ident : $ty:ty),* $(,)? )) => {
         pub unsafe fn $name($($arg: $ty),*) -> NTSTATUS {
             unsafe {
-                let f = IddFunctions
+                let f = (*(&raw const IddFunctions))
                     .as_ptr()
                     .add($idx as usize)
                     .cast::<$pfn>()
