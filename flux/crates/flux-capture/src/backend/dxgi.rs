@@ -153,13 +153,15 @@ impl ScreenCapture for DxgiCapture {
 /// maximum coded size (e.g. 4096x4096 for H.264 on AMD VCN) can consume the
 /// frame without any CPU copy.
 struct GpuScaler {
+    video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
-    /// Desktop-sized intermediate the acquired frame is copied into (input
-    /// views can't be created on the transient duplication texture).
-    input_texture: ID3D11Texture2D,
-    input_view: ID3D11VideoProcessorInputView,
+    enumerator: ID3D11VideoProcessorEnumerator,
     output_view: ID3D11VideoProcessorOutputView,
+    /// Lazily-created desktop-sized intermediate, used only if an input view
+    /// can't be created directly on the acquired duplication texture.
+    fallback: std::cell::RefCell<Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>>,
+    input: Resolution,
 }
 
 impl GpuScaler {
@@ -191,38 +193,6 @@ impl GpuScaler {
             let processor = video_device.CreateVideoProcessor(&enumerator, 0)
                 .map_err(|e| FluxError::Capture(format!("CreateVideoProcessor: {}", e)))?;
 
-            // Desktop-sized intermediate input texture.
-            let input_desc = D3D11_TEXTURE2D_DESC {
-                Width: input.width,
-                Height: input.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-            };
-            let mut input_texture = None;
-            device.CreateTexture2D(&input_desc, None, Some(&mut input_texture))
-                .map_err(|e| FluxError::Capture(format!("CreateTexture2D scaler input: {}", e)))?;
-            let input_texture = input_texture
-                .ok_or_else(|| FluxError::Capture("Scaler input texture is null".into()))?;
-
-            let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                FourCC: 0,
-                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
-                },
-            };
-            let mut input_view = None;
-            video_device.CreateVideoProcessorInputView(&input_texture, &enumerator, &input_view_desc, Some(&mut input_view))
-                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorInputView: {}", e)))?;
-            let input_view = input_view
-                .ok_or_else(|| FluxError::Capture("Scaler input view is null".into()))?;
-
             let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
@@ -238,20 +208,78 @@ impl GpuScaler {
             tracing::info!("GPU scaler created: {} → {} (D3D11 video processor)", input, output);
 
             Ok(Self {
+                video_device,
                 video_context,
                 processor,
-                input_texture,
-                input_view,
+                enumerator,
                 output_view,
+                fallback: std::cell::RefCell::new(None),
+                input,
             })
         }
     }
 
-    /// Copy the acquired desktop texture into the intermediate input and blit
-    /// it, scaled, into the shared output texture.
-    fn scale(&self, context: &ID3D11DeviceContext, desktop_texture: &ID3D11Texture2D) -> Result<()> {
+    /// Blit the acquired desktop texture, scaled, into the shared output
+    /// texture. Prefers a zero-copy blit straight from the duplication
+    /// texture; falls back to copying through a desktop-sized intermediate
+    /// if the driver refuses an input view on it.
+    fn scale(&self, device: &ID3D11Device, context: &ID3D11DeviceContext, desktop_texture: &ID3D11Texture2D) -> Result<()> {
+        let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV { MipSlice: 0, ArraySlice: 0 },
+            },
+        };
+
         unsafe {
-            context.CopyResource(&self.input_texture, desktop_texture);
+            let mut direct_view = None;
+            let input_view = match self.video_device.CreateVideoProcessorInputView(
+                desktop_texture,
+                &self.enumerator,
+                &input_view_desc,
+                Some(&mut direct_view),
+            ) {
+                Ok(()) => direct_view
+                    .ok_or_else(|| FluxError::Capture("Scaler input view is null".into()))?,
+                Err(e) => {
+                    // Copy through the lazily-created intermediate instead.
+                    let mut fallback = self.fallback.borrow_mut();
+                    if fallback.is_none() {
+                        tracing::info!(
+                            "Direct input view on duplication texture unavailable ({}); using intermediate copy",
+                            e
+                        );
+                        let input_desc = D3D11_TEXTURE2D_DESC {
+                            Width: self.input.width,
+                            Height: self.input.height,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Usage: D3D11_USAGE_DEFAULT,
+                            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                            CPUAccessFlags: 0,
+                            MiscFlags: 0,
+                        };
+                        let mut input_texture = None;
+                        device.CreateTexture2D(&input_desc, None, Some(&mut input_texture))
+                            .map_err(|e| FluxError::Capture(format!("CreateTexture2D scaler input: {}", e)))?;
+                        let input_texture = input_texture
+                            .ok_or_else(|| FluxError::Capture("Scaler input texture is null".into()))?;
+                        let mut view = None;
+                        self.video_device.CreateVideoProcessorInputView(&input_texture, &self.enumerator, &input_view_desc, Some(&mut view))
+                            .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorInputView: {}", e)))?;
+                        let view = view
+                            .ok_or_else(|| FluxError::Capture("Scaler input view is null".into()))?;
+                        *fallback = Some((input_texture, view));
+                    }
+                    let (input_texture, view) = fallback.as_ref().unwrap().clone();
+                    context.CopyResource(&input_texture, desktop_texture);
+                    view
+                }
+            };
+
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
                 Enable: true.into(),
                 OutputIndex: 0,
@@ -259,7 +287,7 @@ impl GpuScaler {
                 PastFrames: 0,
                 FutureFrames: 0,
                 ppPastSurfaces: std::ptr::null_mut(),
-                pInputSurface: std::mem::ManuallyDrop::new(Some(self.input_view.clone())),
+                pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
                 ppFutureSurfaces: std::ptr::null_mut(),
                 ppPastSurfacesRight: std::ptr::null_mut(),
                 pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
@@ -273,7 +301,7 @@ impl GpuScaler {
 
 /// An active DXGI duplication session.
 struct DxgiCaptureSession {
-    _device: ID3D11Device,
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     shared_texture: ID3D11Texture2D,
@@ -285,6 +313,7 @@ struct DxgiCaptureSession {
     frame_sequence: u64,
     running: bool,
     last_frame_time: std::time::Instant,
+    last_delivery: std::time::Instant,
 }
 
 impl DxgiCaptureSession {
@@ -369,7 +398,7 @@ impl DxgiCaptureSession {
             let frame_interval = std::time::Duration::from_micros(1_000_000 / framerate as u64);
 
             Ok(Self {
-                _device: device.clone(),
+                device: device.clone(),
                 context: context.clone(),
                 duplication,
                 shared_texture,
@@ -381,6 +410,7 @@ impl DxgiCaptureSession {
                 frame_sequence: 0,
                 running: true,
                 last_frame_time: std::time::Instant::now(),
+                last_delivery: std::time::Instant::now(),
             })
         }
     }
@@ -414,6 +444,17 @@ impl DxgiCaptureSession {
 
             let resource = resource.ok_or_else(|| FluxError::Capture("Frame resource is null".into()))?;
 
+            // Skip unchanged desktop images (LastPresentTime == 0 means only
+            // the mouse moved) to keep GPU copy/scale/encode work near zero on
+            // a static screen. Still deliver a heartbeat frame periodically so
+            // late joiners and IDR requests aren't starved.
+            if frame_info.LastPresentTime == 0
+                && self.last_delivery.elapsed() < std::time::Duration::from_secs(1)
+            {
+                let _ = self.duplication.ReleaseFrame();
+                return Ok(None);
+            }
+
             // Get the desktop texture
             let desktop_texture: ID3D11Texture2D = resource.cast()
                 .map_err(|e| FluxError::Capture(format!("Cast to ID3D11Texture2D: {}", e)))?;
@@ -422,7 +463,7 @@ impl DxgiCaptureSession {
             // video-processor blit when downscaling.
             match &self.scaler {
                 Some(scaler) => {
-                    if let Err(e) = scaler.scale(&self.context, &desktop_texture) {
+                    if let Err(e) = scaler.scale(&self.device, &self.context, &desktop_texture) {
                         let _ = self.duplication.ReleaseFrame();
                         return Err(e);
                     }
@@ -437,6 +478,7 @@ impl DxgiCaptureSession {
             let _ = self.duplication.ReleaseFrame();
 
             self.frame_sequence += 1;
+            self.last_delivery = std::time::Instant::now();
 
             Ok(Some(CapturedFrame {
                 sequence: self.frame_sequence,
