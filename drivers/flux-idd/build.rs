@@ -2,11 +2,12 @@
 //! bindgen bindings for IddCx (not shipped by wdk-sys).
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // IddCx exposes its API as FORCEINLINE functions dispatching through the
-// IddCxFunctions table; `wrap_static_fns` makes bindgen emit callable extern
-// wrappers for them (compiled below with cc).
+// IddCxFunctions table. Defining IDD_STUB before including iddcx.h makes the
+// header declare the IddCx* entry points as plain imports instead, resolved
+// by IddCxStub.lib — so bindgen emits directly callable extern functions.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure UMDF compile/link flags from the [package.metadata.wdk] config.
@@ -35,6 +36,7 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
 #define IDDCX_VERSION_MAJOR 1
 #define IDDCX_VERSION_MINOR 4
 #define IDDCX_MINIMUM_VERSION_REQUIRED 4
+#define IDD_STUB
 #include <iddcx.h>
 "#,
         )
@@ -46,8 +48,6 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         .allowlist_item("DISPLAYCONFIG_.*")
         .derive_default(true)
         .layout_tests(false)
-        .wrap_static_fns(true)
-        .wrap_static_fns_path(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers"))
         // The IddCx headers are C++-only (forward struct references in
         // function signatures), so parse them as C++.
         .clang_arg("-x")
@@ -66,41 +66,38 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
 
     builder.generate()?.write_to_file(&out_path)?;
 
-    // Compile the generated static-fn wrappers. In C++ mode bindgen writes
-    // `iddcx_wrappers.cpp` but emits the wrapper functions without `extern
-    // "C"`, while the Rust bindings expect unmangled names — so wrap the
-    // wrapper-function section (everything after the "// Static wrappers"
-    // marker, keeping the header includes outside) in an extern "C" block.
-    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
-    let wrappers_generated = out_dir.join("iddcx_wrappers.cpp");
-    let wrappers_cpp = out_dir.join("iddcx_wrappers_externc.cpp");
-    let wrapper_src = std::fs::read_to_string(&wrappers_generated)?;
-    const MARKER: &str = "// Static wrappers";
-    let (headers, wrappers) = wrapper_src
-        .split_once(MARKER)
-        .ok_or("bindgen wrapper file missing '// Static wrappers' marker")?;
-    std::fs::write(
-        &wrappers_cpp,
-        format!("{headers}\nextern \"C\" {{\n{MARKER}{wrappers}\n}}\n"),
-    )?;
-
-    let mut cc_build = cc::Build::new();
-    cc_build.file(&wrappers_cpp);
-    cc_build.cpp(true);
-    cc_build.flag_if_supported("/std:c++17");
-    cc_build.include(&iddcx_dir);
-    cc_build.include(&out_dir);
-    for include_dir in config.include_paths()? {
-        cc_build.include(include_dir);
+    // IddCxStub.lib lives in the versioned lib directory mirroring the
+    // include layout: Lib\<sdk>\um\<arch>\iddcx\<version>\.
+    if let Some(lib_dir) = iddcx_stub_lib_dir(&iddcx_dir) {
+        println!("cargo:rustc-link-search={}", lib_dir.display());
     }
-    cc_build
-        .define("IDDCX_VERSION_MAJOR", "1")
-        .define("IDDCX_VERSION_MINOR", "4")
-        .define("IDDCX_MINIMUM_VERSION_REQUIRED", "4")
-        .compile("iddcx_wrappers");
 
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
+}
+
+/// Map an IddCx include dir like `...\Include\<sdk>\um\iddcx\<ver>` to the
+/// matching `...\Lib\<sdk>\um\<arch>\iddcx\<ver>` library directory.
+fn iddcx_stub_lib_dir(iddcx_include_dir: &Path) -> Option<PathBuf> {
+    let arch = match env::var("CARGO_CFG_TARGET_ARCH").ok()?.as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+
+    let version = iddcx_include_dir.file_name()?;
+    let um_dir = iddcx_include_dir.parent()?.parent()?; // ...\Include\<sdk>\um
+    let sdk_dir = um_dir.parent()?; // ...\Include\<sdk>
+    let kits_root = sdk_dir.parent()?.parent()?; // ...\Windows Kits\10
+
+    let lib_dir = kits_root
+        .join("Lib")
+        .join(sdk_dir.file_name()?)
+        .join("um")
+        .join(arch)
+        .join("iddcx")
+        .join(version);
+    lib_dir.is_dir().then_some(lib_dir)
 }
 
 /// IddCx.h is not on the standard WDK include paths: it lives in a versioned
