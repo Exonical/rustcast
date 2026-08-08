@@ -34,37 +34,37 @@ macro_rules! iddcx_call {
     };
 }
 
-iddcx_call!(IddCxDeviceInitConfig: PFN_IDDCXDEVICEINITCONFIG @ IDDFUNCENUM_IddCxDeviceInitConfigTableIndex(
+iddcx_call!(IddCxDeviceInitConfig: PFN_IDDCXDEVICEINITCONFIG @ _IDDFUNCENUM_IddCxDeviceInitConfigTableIndex(
     device_init: *mut WDFDEVICE_INIT,
     config: *const IDD_CX_CLIENT_CONFIG,
 ));
-iddcx_call!(IddCxDeviceInitialize: PFN_IDDCXDEVICEINITIALIZE @ IDDFUNCENUM_IddCxDeviceInitializeTableIndex(
+iddcx_call!(IddCxDeviceInitialize: PFN_IDDCXDEVICEINITIALIZE @ _IDDFUNCENUM_IddCxDeviceInitializeTableIndex(
     device: WDFDEVICE,
 ));
-iddcx_call!(IddCxAdapterInitAsync: PFN_IDDCXADAPTERINITASYNC @ IDDFUNCENUM_IddCxAdapterInitAsyncTableIndex(
+iddcx_call!(IddCxAdapterInitAsync: PFN_IDDCXADAPTERINITASYNC @ _IDDFUNCENUM_IddCxAdapterInitAsyncTableIndex(
     in_args: *const IDARG_IN_ADAPTER_INIT,
     out_args: *mut IDARG_OUT_ADAPTER_INIT,
 ));
-iddcx_call!(IddCxMonitorCreate: PFN_IDDCXMONITORCREATE @ IDDFUNCENUM_IddCxMonitorCreateTableIndex(
+iddcx_call!(IddCxMonitorCreate: PFN_IDDCXMONITORCREATE @ _IDDFUNCENUM_IddCxMonitorCreateTableIndex(
     adapter: IDDCX_ADAPTER,
     in_args: *const IDARG_IN_MONITORCREATE,
     out_args: *mut IDARG_OUT_MONITORCREATE,
 ));
-iddcx_call!(IddCxMonitorArrival: PFN_IDDCXMONITORARRIVAL @ IDDFUNCENUM_IddCxMonitorArrivalTableIndex(
+iddcx_call!(IddCxMonitorArrival: PFN_IDDCXMONITORARRIVAL @ _IDDFUNCENUM_IddCxMonitorArrivalTableIndex(
     monitor: IDDCX_MONITOR,
     out_args: *mut IDARG_OUT_MONITORARRIVAL,
 ));
-iddcx_call!(IddCxMonitorDeparture: PFN_IDDCXMONITORDEPARTURE @ IDDFUNCENUM_IddCxMonitorDepartureTableIndex(
+iddcx_call!(IddCxMonitorDeparture: PFN_IDDCXMONITORDEPARTURE @ _IDDFUNCENUM_IddCxMonitorDepartureTableIndex(
     monitor: IDDCX_MONITOR,
 ));
-iddcx_call!(IddCxSwapChainSetDevice: PFN_IDDCXSWAPCHAINSETDEVICE @ IDDFUNCENUM_IddCxSwapChainSetDeviceTableIndex(
+iddcx_call!(IddCxSwapChainSetDevice: PFN_IDDCXSWAPCHAINSETDEVICE @ _IDDFUNCENUM_IddCxSwapChainSetDeviceTableIndex(
     swapchain: IDDCX_SWAPCHAIN,
     in_args: *const IDARG_IN_SWAPCHAINSETDEVICE,
 ));
-iddcx_call!(IddCxSwapChainReleaseAndAcquireBuffer: PFN_IDDCXSWAPCHAINRELEASEANDACQUIREBUFFER @ IDDFUNCENUM_IddCxSwapChainReleaseAndAcquireBufferTableIndex(
+iddcx_call!(IddCxSwapChainReleaseAndAcquireBuffer: PFN_IDDCXSWAPCHAINRELEASEANDACQUIREBUFFER @ _IDDFUNCENUM_IddCxSwapChainReleaseAndAcquireBufferTableIndex(
     swapchain: IDDCX_SWAPCHAIN,
     out_args: *mut IDARG_OUT_RELEASEANDACQUIREBUFFER,
 ));
-iddcx_call!(IddCxSwapChainFinishedProcessingFrame: PFN_IDDCXSWAPCHAINFINISHEDPROCESSINGFRAME @ IDDFUNCENUM_IddCxSwapChainFinishedProcessingFrameTableIndex(
+iddcx_call!(IddCxSwapChainFinishedProcessingFrame: PFN_IDDCXSWAPCHAINFINISHEDPROCESSINGFRAME @ _IDDFUNCENUM_IddCxSwapChainFinishedProcessingFrameTableIndex(
     swapchain: IDDCX_SWAPCHAIN,
 ));
