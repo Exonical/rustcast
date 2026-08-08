@@ -160,10 +160,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
 
     let capture_fps = config.video.max_fps.min(60);
+    let forced_encoder = config.video.encoder;
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
-            capture_loop(h264_tx2, idr_rx, input_rx, capture_fps);
+            capture_loop(h264_tx2, idr_rx, input_rx, capture_fps, forced_encoder);
         })?;
 
     // ── Start TCP frame server (for Go WebRTC relay) ─────────────
@@ -335,8 +336,18 @@ async fn frame_server(
 /// vendor-neutral Vulkan Video encoder, then the software fallback.
 // Vec::new + cfg-gated pushes: `vec![]` can't hold conditional elements.
 #[allow(clippy::vec_init_then_push)]
-fn encoder_backend_candidates() -> Vec<flux_core::types::EncoderBackend> {
+fn encoder_backend_candidates(
+    forced: Option<flux_core::types::EncoderBackend>,
+) -> Vec<flux_core::types::EncoderBackend> {
     use flux_core::types::EncoderBackend;
+    if let Some(backend) = forced {
+        tracing::info!("Encoder backend forced by config: {:?}", backend);
+        // Keep the software fallback so a failed forced backend still streams.
+        if backend == EncoderBackend::Software {
+            return vec![backend];
+        }
+        return vec![backend, EncoderBackend::Software];
+    }
     let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]
     candidates.push(EncoderBackend::Amf);
@@ -410,6 +421,7 @@ fn create_encode_session(
 fn build_encode_session_for(
     target_fps: u32,
     resolution: flux_core::types::Resolution,
+    forced_backend: Option<flux_core::types::EncoderBackend>,
 ) -> (
     Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)>,
     flux_core::types::EncoderBackend,
@@ -432,7 +444,7 @@ fn build_encode_session_for(
 
     let mut backend = flux_core::types::EncoderBackend::Software;
     let mut session = None;
-    for candidate in encoder_backend_candidates() {
+    for candidate in encoder_backend_candidates(forced_backend) {
         session = create_encode_session(candidate, encoder_config.clone());
         backend = candidate;
         if session.is_some() {
@@ -450,6 +462,7 @@ fn capture_loop(
     idr_rx: std::sync::mpsc::Receiver<()>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
+    forced_backend: Option<flux_core::types::EncoderBackend>,
 ) {
     // ── Initialize capture ──────────────────────────────────────────
     let capture = match flux_capture::create_capture(None) {
@@ -558,7 +571,7 @@ fn capture_loop(
         // known or whenever it changes (e.g. display rotation / mode switch),
         // so the encoder dimensions always match the frames it receives.
         if capture_resolution != frame.resolution {
-            let (sess, backend) = build_encode_session_for(target_fps, frame.resolution);
+            let (sess, backend) = build_encode_session_for(target_fps, frame.resolution, forced_backend);
             capture_resolution = frame.resolution;
             match sess {
                 Some((s, res)) => {
