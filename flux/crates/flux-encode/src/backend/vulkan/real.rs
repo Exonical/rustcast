@@ -223,8 +223,21 @@ impl VulkanVideoEncoder {
         entry: &ash::Entry,
         instance: &ash::Instance,
     ) -> Result<(vk::PhysicalDevice, ash::Device, u32, u32, H264Caps, String)> {
-        let devices =
+        let mut devices =
             unsafe { instance.enumerate_physical_devices() }.map_err(|e| init_err("vkEnumeratePhysicalDevices", e))?;
+
+        // Prefer discrete GPUs over integrated/virtual ones so a machine with
+        // both (e.g. an APU alongside a dedicated card) encodes on the
+        // dedicated card rather than whichever the loader enumerates first.
+        devices.sort_by_key(|&pd| {
+            let props = unsafe { instance.get_physical_device_properties(pd) };
+            match props.device_type {
+                vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+                vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+                vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                _ => 3,
+            }
+        });
 
         let required_exts = [
             vk::KHR_VIDEO_QUEUE_NAME,
