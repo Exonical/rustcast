@@ -10,9 +10,13 @@ use std::path::{Path, PathBuf};
 // by IddCxStub.lib — so bindgen emits directly callable extern functions.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure UMDF compile/link flags from the [package.metadata.wdk] config.
+    // Configure UMDF compile/link flags from the [package.metadata.wdk]
+    // config. This is the leaf driver crate producing the driver DLL, so use
+    // the binary configuration: it also emits the WDK library search paths
+    // and UMDF link libraries (WdfDriverStubUm, which provides WdfFunctions/
+    // WdfDriverGlobals) that a plain library build does not.
     let config = wdk_build::Config::from_env_auto()?;
-    config.configure_library_build()?;
+    config.configure_binary_build()?;
 
     generate_iddcx_bindings(&config)?;
 

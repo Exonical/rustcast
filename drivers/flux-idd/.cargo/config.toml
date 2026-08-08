@@ -1,0 +1,4 @@
+# Statically link the CRT: required by wdk-build's driver binary
+# configuration (matches the windows-drivers-rs driver templates).
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]
