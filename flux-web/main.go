@@ -14,6 +14,8 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
@@ -293,7 +295,16 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("register default codecs: %w", err)
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// Default interceptors provide the NACK responder (RTP retransmission of
+	// lost packets — essential on lossy links like WiFi), RTCP sender reports
+	// for A/V sync, and TWCC feedback. Without them every lost packet
+	// corrupts the stream until the next keyframe.
+	i := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, fmt.Errorf("register default interceptors: %w", err)
+	}
+
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -319,10 +330,17 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	sender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("add track: %w", err)
 	}
+
+	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
+	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
+	// fresh IDR from the capture server so the picture recovers immediately
+	// instead of staying corrupted until the next scheduled keyframe.
+	go forwardKeyframeRequests(sender)
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[webrtc] ICE connection state: %s", state.String())
@@ -344,6 +362,32 @@ func newSession() (*Session, error) {
 		PeerConnection: pc,
 		VideoTrack:     videoTrack,
 	}, nil
+}
+
+// forwardKeyframeRequests reads incoming RTCP on the video sender and turns
+// PLI/FIR feedback into upstream IDR requests, rate-limited to one per 250ms.
+func forwardKeyframeRequests(sender *webrtc.RTPSender) {
+	var lastIDR time.Time
+	for {
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		for _, pkt := range packets {
+			switch pkt.(type) {
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				if time.Since(lastIDR) < 250*time.Millisecond {
+					continue
+				}
+				lastIDR = time.Now()
+				select {
+				case upstreamCommandChan <- []byte{0x01}:
+					log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
+				default:
+				}
+			}
+		}
+	}
 }
 
 func exchangeOffer(session *Session, offerSDP string) (string, error) {
