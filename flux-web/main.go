@@ -8,14 +8,20 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
+	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +38,38 @@ var (
 
 	// Command channel to send requests to the Rust server
 	upstreamCommandChan = make(chan []byte, 100)
+
+	// Shared UDP mux for all WebRTC traffic: a single socket lets us mark
+	// packets with a DSCP class and gives a fixed port to open in firewalls.
+	iceUDPMux ice.UDPMux
 )
+
+// webrtcUDPPort is the single UDP port used for all WebRTC media traffic.
+const webrtcUDPPort = 8443
+
+// dscpAF41 is the AF41 (DSCP 34) per-hop behavior for interactive video,
+// expressed as the value of the IP TOS byte / IPv6 traffic class (34 << 2).
+const dscpAF41 = 34 << 2
+
+// initUDPMux binds the WebRTC media socket and marks its packets AF41 so
+// WMM-capable WiFi gear and QoS-enabled routers prioritize the video stream.
+// DSCP marking is best-effort: Windows ignores socket-level TOS (use a
+// New-NetQosPolicy instead), and some home routers wash the field.
+func initUDPMux() error {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: webrtcUDPPort})
+	if err != nil {
+		return fmt.Errorf("listen udp :%d: %w", webrtcUDPPort, err)
+	}
+	if err := ipv4.NewConn(conn).SetTOS(dscpAF41); err != nil {
+		log.Printf("[webrtc] DSCP(IPv4) not set: %v", err)
+	}
+	if err := ipv6.NewConn(conn).SetTrafficClass(dscpAF41); err != nil {
+		log.Printf("[webrtc] DSCP(IPv6) not set: %v", err)
+	}
+	iceUDPMux = webrtc.NewICEUDPMux(nil, conn)
+	log.Printf("[webrtc] media UDP mux on :%d (DSCP AF41)", webrtcUDPPort)
+	return nil
+}
 
 // Session wraps a single WebRTC peer connection + video track.
 type Session struct {
@@ -56,7 +93,16 @@ type frameMsg struct {
 
 func connectFrameServer(addr string) {
 	for {
-		log.Printf("[frame] connecting to %s ...", addr)
+		// Prefer QUIC (UDP, no head-of-line blocking on lossy links);
+		// fall back to the TCP frame protocol if the server is older.
+		if err := connectQUIC(addr); err != nil {
+			log.Printf("[frame] QUIC unavailable (%v), trying TCP", err)
+		} else {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		log.Printf("[frame] connecting to tcp %s ...", addr)
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
 			log.Printf("[frame] connection failed: %v, retrying in 2s", err)
@@ -112,6 +158,7 @@ func readFrames(conn net.Conn) error {
 		}
 
 		frameCount++
+		abr.countFrameBytes(len(data))
 		if frameCount%300 == 0 {
 			log.Printf("[frame] received %d frames (last=%d bytes)", frameCount, frameLen)
 		}
@@ -293,7 +340,25 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("register default codecs: %w", err)
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// Default interceptors provide the NACK responder (RTP retransmission of
+	// lost packets — essential on lossy links like WiFi), RTCP sender reports
+	// for A/V sync, and TWCC feedback. Without them every lost packet
+	// corrupts the stream until the next keyframe.
+	i := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, fmt.Errorf("register default interceptors: %w", err)
+	}
+
+	se := webrtc.SettingEngine{}
+	if iceUDPMux != nil {
+		se.SetICEUDPMux(iceUDPMux)
+	}
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
+	)
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -319,10 +384,17 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	sender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("add track: %w", err)
 	}
+
+	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
+	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
+	// fresh IDR from the capture server so the picture recovers immediately
+	// instead of staying corrupted until the next scheduled keyframe.
+	go forwardKeyframeRequests(sender)
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[webrtc] ICE connection state: %s", state.String())
@@ -344,6 +416,37 @@ func newSession() (*Session, error) {
 		PeerConnection: pc,
 		VideoTrack:     videoTrack,
 	}, nil
+}
+
+// forwardKeyframeRequests reads incoming RTCP on the video sender and turns
+// PLI/FIR feedback into upstream IDR requests, rate-limited to one per 250ms.
+func forwardKeyframeRequests(sender *webrtc.RTPSender) {
+	var lastIDR time.Time
+	for {
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		for _, pkt := range packets {
+			if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
+				for _, report := range rr.Reports {
+					abr.onReceiverReport(float64(report.FractionLost) / 256.0)
+				}
+			}
+			switch pkt.(type) {
+			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+				if time.Since(lastIDR) < 250*time.Millisecond {
+					continue
+				}
+				lastIDR = time.Now()
+				select {
+				case upstreamCommandChan <- []byte{0x01}:
+					log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
+				default:
+				}
+			}
+		}
+	}
 }
 
 func exchangeOffer(session *Session, offerSDP string) (string, error) {
@@ -541,8 +644,15 @@ func sendWSError(ws *websocket.Conn, msg string) {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
-	frameServerAddr := "127.0.0.1:8556"
+	frameServerAddr := os.Getenv("FLUX_SERVER_ADDR")
+	if frameServerAddr == "" {
+		frameServerAddr = "127.0.0.1:8556"
+	}
 	webAddr := ":8080"
+
+	if err := initUDPMux(); err != nil {
+		log.Printf("[webrtc] UDP mux unavailable, falling back to ephemeral ports: %v", err)
+	}
 
 	// Start TCP frame reader (connects to Rust flux-server)
 	go connectFrameServer(frameServerAddr)
