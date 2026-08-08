@@ -151,20 +151,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Plug in a virtual monitor for headless hosts before capture starts.
     // Kept alive for the whole server lifetime; dropped (plugged out) on exit.
     #[cfg(target_os = "windows")]
-    let _virtual_display = config.video.virtual_display.and_then(|vd| {
-        match virtual_display::VirtualDisplay::plug_in(vd.width, vd.height, vd.refresh_hz) {
-            Ok(display) => {
-                // Give the OS a moment to enumerate the new display before
-                // capture probes for outputs.
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                Some(display)
-            }
+    let (_virtual_display, virtual_display_target) = if let Some(vd) = config.video.virtual_display {
+        let capture_probe = flux_capture::create_capture(None)
+            .map_err(|e| format!("initialize capture while probing virtual display: {e}"))?;
+        let before = match capture_probe.enumerate_displays() {
+            Ok(displays) => displays,
             Err(e) => {
-                tracing::warn!("Virtual display unavailable: {e}");
-                None
+                tracing::info!("No displays before virtual plug-in: {e}");
+                Vec::new()
             }
-        }
-    });
+        };
+        let before_names: std::collections::HashSet<String> =
+            before.into_iter().map(|display| display.name).collect();
+        let display = virtual_display::VirtualDisplay::plug_in(vd.width, vd.height, vd.refresh_hz)
+            .map_err(|e| format!("plug in virtual display: {e}"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let target = loop {
+            if std::time::Instant::now() >= deadline {
+                drop(display);
+                return Err(
+                    "virtual display plugged in but no new DXGI output appeared within 10 seconds"
+                        .into(),
+                );
+            }
+            match capture_probe.enumerate_displays() {
+                Ok(displays) => {
+                    if let Some(display) = displays
+                        .into_iter()
+                        .find(|display| !before_names.contains(&display.name))
+                    {
+                        break display.name;
+                    }
+                }
+                Err(e) => tracing::debug!("waiting for virtual DXGI output: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        tracing::info!("Virtual display is available as DXGI output {target}");
+        (Some(display), Some(target))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let virtual_display_target = None;
 
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
@@ -188,7 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
-            capture_loop(h264_tx2, idr_rx, bitrate_rx, input_rx, capture_fps, forced_encoder);
+            capture_loop(
+                h264_tx2,
+                idr_rx,
+                bitrate_rx,
+                input_rx,
+                capture_fps,
+                forced_encoder,
+                virtual_display_target,
+            );
         })?;
 
     // ── Start TCP frame server (for Go WebRTC relay) ─────────────
@@ -540,6 +577,7 @@ fn capture_loop(
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
+    target_display_name: Option<String>,
 ) {
     // ── Initialize capture ──────────────────────────────────────────
     let capture = match flux_capture::create_capture(None) {
@@ -559,7 +597,20 @@ fn capture_loop(
     };
     tracing::info!("Capture: found {} display(s)", displays.len());
 
-    let primary = displays.iter().find(|d| d.primary).unwrap_or(&displays[0]);
+    let primary = if let Some(target_name) = target_display_name.as_deref() {
+        match displays.iter().find(|display| display.name == target_name) {
+            Some(display) => display,
+            None => {
+                tracing::error!(
+                    "Virtual display output {} is no longer present; refusing to capture another display",
+                    target_name
+                );
+                return;
+            }
+        }
+    } else {
+        displays.iter().find(|d| d.primary).unwrap_or(&displays[0])
+    };
     
     // Initialize Input Sink (needs primary display resolution for absolute mouse positioning)
     let input_sink = match flux_input::InputSink::new(

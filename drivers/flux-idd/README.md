@@ -26,35 +26,54 @@ Prerequisites:
 
 1. Visual Studio 2022 Build Tools with C++ workload
 2. [WDK](https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk) (or eWDK) — 22H2 or newer
-3. LLVM/Clang (for bindgen): `winget install LLVM.LLVM`
+3. LLVM/Clang 17 (for bindgen — newer LLVM (22+) miscompiles bindgen layouts,
+   producing `E0080` size-assertion errors in wdk-sys):
+   `winget install -i LLVM.LLVM --version 17.0.6`
+   If a newer LLVM is also installed, point bindgen at 17 explicitly:
+   `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"` (the 17.0.6 install path)
 4. `cargo install cargo-make --no-default-features --features tls-native`
 
 Build & package:
 
 ```powershell
 cd drivers\flux-idd
-cargo make            # builds flux_idd.dll, stampinf + inf2cat + signs with a test cert
+cargo make            # builds flux_idd.dll, stampinf + infverif + inf2cat + signs with a test cert
 ```
 
-Output package (driver DLL, INF, catalog) lands in
-`target\<profile>\flux-idd_package\`.
+Run from a *Developer PowerShell for VS 2022* (or an environment where the WDK
+tools `stampinf`/`infverif`/`inf2cat`/`signtool` are on PATH — they live in
+`C:\Program Files (x86)\Windows Kits\10\bin\<sdk-version>\x64`).
+
+Output package (driver DLL, stamped INF, signed catalog, test certificate)
+lands in `target\debug\flux_idd_package\`.
 
 ## Installing (test machine)
 
-The driver is test-signed, so enable test signing once and reboot:
+The package is signed with an auto-generated test certificate
+(`WDRLocalTestCert.cer`, included in the package folder), so a one-time setup
+is needed on the test machine (elevated PowerShell):
 
 ```powershell
+# Trust the test certificate
+certutil -addstore Root WDRLocalTestCert.cer
+certutil -addstore TrustedPublisher WDRLocalTestCert.cer
+
+# Allow test-signed drivers to load (dev machines only), then reboot
 bcdedit /set testsigning on
-# reboot
+Restart-Computer
 ```
 
-Create the root-enumerated software device and install the driver
-(using [devcon](https://learn.microsoft.com/windows-hardware/drivers/devtest/devcon) from the WDK, or `pnputil`):
+Then install the driver and create the root-enumerated software device
+(from the `flux_idd_package` folder, elevated):
 
 ```powershell
-pnputil /add-driver FluxIdd.inf /install
-devcon install FluxIdd.inf Root\FluxIdd
+pnputil /add-driver flux_idd.inf /install
+# Create the device instance (devcon is in the WDK: ...\Windows Kits\10\Tools\<ver>\x64)
+devcon install flux_idd.inf Root\FluxIdd
 ```
+
+Verify: `pnputil /enum-devices /class Display` should list “Flux Virtual
+Display” (started). No monitor appears yet — it plugs in on demand.
 
 flux-server then opens the device via its interface GUID
 `{5b1a4c37-6f5d-4a41-9c1d-8f2e4b6a7c01}` and sends plug-in/out IOCTLs.
@@ -71,6 +90,6 @@ For production distribution the package must be attestation-signed through the
 
 ## Status
 
-Untested scaffold: this crate has not yet been compiled against a real WDK (requires a
-Windows box with WDK + LLVM). Expect iteration on the generated IddCx bindings —
-especially bitfield accessors in `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` and enum naming.
+Compiles and links against WDK 10.0.26100 (UMDF 2.31, IddCx 1.4). Runtime
+behavior (monitor arrival, mode list, swap-chain processing) not yet verified
+on a test machine.

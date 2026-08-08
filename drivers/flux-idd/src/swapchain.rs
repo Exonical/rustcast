@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use windows::core::Interface;
-use windows::Win32::Foundation::{HANDLE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{HANDLE, HMODULE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -43,7 +43,7 @@ fn create_d3d_device(adapter_luid: LUID) -> windows::core::Result<D3DDevice> {
         D3D11CreateDevice(
             &adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
-            None,
+            HMODULE::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             None,
             D3D11_SDK_VERSION,
@@ -75,14 +75,15 @@ impl SwapChainProcessor {
         swapchain: idd::IDDCX_SWAPCHAIN,
         render_adapter_luid: idd::LUID,
         new_frame_event: *mut c_void,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, i32> {
         let luid = LUID {
             LowPart: render_adapter_luid.LowPart,
             HighPart: render_adapter_luid.HighPart,
         };
-        let device = create_d3d_device(luid).map_err(|_| ())?;
+        let device = create_d3d_device(luid).map_err(|error| error.code().0)?;
 
-        let terminate_event = unsafe { CreateEventW(None, false, false, None) }.map_err(|_| ())?;
+        let terminate_event =
+            unsafe { CreateEventW(None, false, false, None) }.map_err(|error| error.code().0)?;
 
         // Raw pointers can't cross the thread boundary as-is; wrap them.
         struct ThreadArgs {
@@ -123,7 +124,7 @@ impl SwapChainProcessor {
                     );
                 }
             })
-            .map_err(|_| ())?;
+            .map_err(|_| 0xC000009Au32 as i32)?;
         let _ = started_rx.recv();
 
         Ok(Self {

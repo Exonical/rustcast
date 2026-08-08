@@ -1,12 +1,12 @@
-; FluxIdd.inf — Flux virtual display (Indirect Display Driver, UMDF 2 / IddCx)
+; flux_idd.inx — Flux virtual display (Indirect Display Driver, UMDF 2 / IddCx)
+; Template INF: stampinf fills CatalogFile/DriverVer/$ARCH$/$UMDFVERSION$ at
+; package time (see Makefile.toml / wdk-build's rust-driver-makefile.toml).
 
 [Version]
 Signature="$WINDOWS NT$"
 Class=Display
 ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
 Provider=%ProviderString%
-CatalogFile=FluxIdd.cat
-DriverVer=01/01/2026,1.0.0.0
 PnpLockDown=1
 
 [Manufacturer]
@@ -22,25 +22,24 @@ PnpLockDown=1
 flux_idd.dll = 1
 
 [FluxIdd_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
 CopyFiles=UMDriverCopy
 
 [FluxIdd_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
 AddReg = FluxIdd_HardwareDeviceSettings
 
-[FluxIdd_HardwareDeviceSettings.AddReg]
+[FluxIdd_HardwareDeviceSettings]
 ; Restrict device access to SYSTEM and Administrators: the plug-in/out IOCTLs
 ; change display topology and must not be reachable from normal user code.
 HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "FluxIddGroup"
 
 [FluxIdd_Install.NT.Services]
-AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
-
-[WUDFRD_ServiceInstall]
-DisplayName = %WudfRdDisplayName%
-ServiceType = 1
-StartType = 3
-ErrorControl = 1
-ServiceBinary = %12%\WUDFRd.sys
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
 
 [FluxIdd_Install.NT.Wdf]
 UmdfService=FluxIdd,FluxIdd_Umdf_Install
@@ -64,4 +63,4 @@ ProviderString="Rustcast"
 ManufacturerName="Rustcast"
 DeviceName="Flux Virtual Display"
 DiskName="FluxIdd Installation Disk"
-WudfRdDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+REG_SZ=0x00000000
