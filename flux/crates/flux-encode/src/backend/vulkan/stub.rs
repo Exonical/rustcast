@@ -29,24 +29,11 @@ pub struct VulkanVideoEncoder {
 
 impl VulkanVideoEncoder {
     pub fn new() -> Result<Self> {
-        tracing::info!("Initializing Vulkan Video encoder");
-
-        // TODO: Initialization via ash:
-        //
-        //   1. Create VkInstance with VK_KHR_get_physical_device_properties2
-        //   2. Enumerate physical devices (vkEnumeratePhysicalDevices)
-        //   3. For each device, check queue families for VK_QUEUE_VIDEO_ENCODE_BIT_KHR
-        //   4. Query video encode capabilities:
-        //      - vkGetPhysicalDeviceVideoCapabilitiesKHR
-        //      - VkVideoEncodeH264CapabilitiesKHR / VkVideoEncodeH265CapabilitiesKHR
-        //   5. Create VkDevice with:
-        //      - Video encode queue
-        //      - Graphics/compute queue (for color conversion)
-        //      - VK_KHR_video_encode_queue extension
-        //      - VK_KHR_video_encode_h264 / h265 extensions
-        //   6. Allocate command pools for encode and compute queues
-
-        Ok(Self { _private: () })
+        // Without the feature, this stub must not be selected: it would
+        // silently produce empty packets. Fail so backend fallback moves on.
+        Err(FluxError::EncoderInit(
+            "Vulkan Video encoder not compiled in (enable the `encoder-vulkan` feature)".into(),
+        ))
     }
 
     fn probe_codec_support(&self) -> Vec<VideoCodec> {
