@@ -14,10 +14,13 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,7 +37,38 @@ var (
 
 	// Command channel to send requests to the Rust server
 	upstreamCommandChan = make(chan []byte, 100)
+
+	// Shared UDP mux for all WebRTC traffic: a single socket lets us mark
+	// packets with a DSCP class and gives a fixed port to open in firewalls.
+	iceUDPMux ice.UDPMux
 )
+
+// webrtcUDPPort is the single UDP port used for all WebRTC media traffic.
+const webrtcUDPPort = 8443
+
+// dscpAF41 is the AF41 (DSCP 34) per-hop behavior for interactive video,
+// expressed as the value of the IP TOS byte / IPv6 traffic class (34 << 2).
+const dscpAF41 = 34 << 2
+
+// initUDPMux binds the WebRTC media socket and marks its packets AF41 so
+// WMM-capable WiFi gear and QoS-enabled routers prioritize the video stream.
+// DSCP marking is best-effort: Windows ignores socket-level TOS (use a
+// New-NetQosPolicy instead), and some home routers wash the field.
+func initUDPMux() error {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: webrtcUDPPort})
+	if err != nil {
+		return fmt.Errorf("listen udp :%d: %w", webrtcUDPPort, err)
+	}
+	if err := ipv4.NewConn(conn).SetTOS(dscpAF41); err != nil {
+		log.Printf("[webrtc] DSCP(IPv4) not set: %v", err)
+	}
+	if err := ipv6.NewConn(conn).SetTrafficClass(dscpAF41); err != nil {
+		log.Printf("[webrtc] DSCP(IPv6) not set: %v", err)
+	}
+	iceUDPMux = webrtc.NewICEUDPMux(nil, conn)
+	log.Printf("[webrtc] media UDP mux on :%d (DSCP AF41)", webrtcUDPPort)
+	return nil
+}
 
 // Session wraps a single WebRTC peer connection + video track.
 type Session struct {
@@ -304,7 +338,16 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+	se := webrtc.SettingEngine{}
+	if iceUDPMux != nil {
+		se.SetICEUDPMux(iceUDPMux)
+	}
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
+	)
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -587,6 +630,10 @@ func main() {
 
 	frameServerAddr := "127.0.0.1:8556"
 	webAddr := ":8080"
+
+	if err := initUDPMux(); err != nil {
+		log.Printf("[webrtc] UDP mux unavailable, falling back to ephemeral ports: %v", err)
+	}
 
 	// Start TCP frame reader (connects to Rust flux-server)
 	go connectFrameServer(frameServerAddr)
