@@ -52,7 +52,11 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         // function signatures), so parse them as C++.
         .clang_arg("-x")
         .clang_arg("c++")
-        .clang_arg("-std=c++17");
+        .clang_arg("-std=c++17")
+        // The WDF/IddCx headers rely on MSVC-specific behavior (enum forward
+        // declarations with fixed underlying types, etc.).
+        .clang_arg("-fms-compatibility")
+        .clang_arg("-fms-extensions");
 
     let iddcx_dir = find_iddcx_include_dir(config)?;
     builder = builder.clang_arg(format!("-I{}", iddcx_dir.display()));
