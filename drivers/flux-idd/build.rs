@@ -33,8 +33,8 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
 #include <wudfwdm.h>
 #include <wdf.h>
 #define IDDCX_VERSION_MAJOR 1
-#define IDDCX_VERSION_MINOR 2
-#define IDDCX_MINIMUM_VERSION_REQUIRED 2
+#define IDDCX_VERSION_MINOR 4
+#define IDDCX_MINIMUM_VERSION_REQUIRED 4
 #include <iddcx.h>
 "#,
         )
@@ -47,7 +47,12 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         .derive_default(true)
         .layout_tests(false)
         .wrap_static_fns(true)
-        .wrap_static_fns_path(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers"));
+        .wrap_static_fns_path(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers"))
+        // The IddCx headers are C++-only (forward struct references in
+        // function signatures), so parse them as C++.
+        .clang_arg("-x")
+        .clang_arg("c++")
+        .clang_arg("-std=c++17");
 
     let iddcx_dir = find_iddcx_include_dir(config)?;
     builder = builder.clang_arg(format!("-I{}", iddcx_dir.display()));
@@ -57,17 +62,37 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
 
     builder.generate()?.write_to_file(&out_path)?;
 
-    // Compile the generated static-fn wrappers.
+    // Compile the generated static-fn wrappers. In C++ mode bindgen writes
+    // `iddcx_wrappers.cpp` but emits the wrapper functions without `extern
+    // "C"`, while the Rust bindings expect unmangled names — so wrap the
+    // wrapper-function section (everything after the "// Static wrappers"
+    // marker, keeping the header includes outside) in an extern "C" block.
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let wrappers_generated = out_dir.join("iddcx_wrappers.cpp");
+    let wrappers_cpp = out_dir.join("iddcx_wrappers_externc.cpp");
+    let wrapper_src = std::fs::read_to_string(&wrappers_generated)?;
+    const MARKER: &str = "// Static wrappers";
+    let (headers, wrappers) = wrapper_src
+        .split_once(MARKER)
+        .ok_or("bindgen wrapper file missing '// Static wrappers' marker")?;
+    std::fs::write(
+        &wrappers_cpp,
+        format!("{headers}\nextern \"C\" {{\n{MARKER}{wrappers}\n}}\n"),
+    )?;
+
     let mut cc_build = cc::Build::new();
-    cc_build.file(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers.c"));
+    cc_build.file(&wrappers_cpp);
+    cc_build.cpp(true);
+    cc_build.flag_if_supported("/std:c++17");
     cc_build.include(&iddcx_dir);
+    cc_build.include(&out_dir);
     for include_dir in config.include_paths()? {
         cc_build.include(include_dir);
     }
     cc_build
         .define("IDDCX_VERSION_MAJOR", "1")
-        .define("IDDCX_VERSION_MINOR", "2")
-        .define("IDDCX_MINIMUM_VERSION_REQUIRED", "2")
+        .define("IDDCX_VERSION_MINOR", "4")
+        .define("IDDCX_MINIMUM_VERSION_REQUIRED", "4")
         .compile("iddcx_wrappers");
 
     println!("cargo:rerun-if-changed=build.rs");
