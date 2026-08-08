@@ -124,6 +124,12 @@ pub struct VideoConfig {
     /// Maximum RTP packet size in bytes.
     pub max_packet_size: u16,
 
+    /// Force a specific encoder backend instead of automatic selection
+    /// (e.g. `encoder = "VulkanVideo"`). Software remains the fallback if
+    /// the forced backend can't be opened.
+    #[serde(default)]
+    pub encoder: Option<crate::types::EncoderBackend>,
+
     /// Virtual display for headless hosts (Windows, requires the FluxIdd
     /// driver): plug in a virtual monitor at this mode before capturing.
     #[serde(default)]
@@ -156,6 +162,7 @@ impl Default for VideoConfig {
             rtp_port: 47998,
             fec_percentage: 20,
             max_packet_size: 1400,
+            encoder: None,
             virtual_display: None,
         }
     }
