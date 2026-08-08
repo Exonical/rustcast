@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG,
     WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFOBJECT, WDFREQUEST, WDF_DRIVER_CONFIG, WDF_NO_HANDLE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
+    WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
     WDF_POWER_DEVICE_STATE,
 };
 
@@ -241,7 +241,7 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
     let mut monitor_info = idd::IDDCX_MONITOR_INFO {
         Size: size_of::<idd::IDDCX_MONITOR_INFO>() as u32,
         MonitorType:
-            idd::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+            idd::DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY_DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
         ConnectorIndex: 0,
         ..Default::default()
     };
@@ -308,10 +308,10 @@ fn fill_signal_info(
     vsync: u32,
     monitor_mode: bool,
 ) {
-    mode.totalSize.cx = width as i32;
-    mode.totalSize.cy = height as i32;
-    mode.activeSize.cx = width as i32;
-    mode.activeSize.cy = height as i32;
+    mode.totalSize.cx = width;
+    mode.totalSize.cy = height;
+    mode.activeSize.cx = width;
+    mode.activeSize.cy = height;
 
     // vSyncFreqDivider lives in the AdditionalSignalInfo bitfield union.
     unsafe {

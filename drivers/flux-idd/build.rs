@@ -45,6 +45,10 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         .allowlist_item("IDARG_.*")
         .allowlist_item("EVT_IDD_.*")
         .allowlist_item("PFN_IDD.*")
+        .allowlist_item("IDDFUNC.*")
+        // Declared extern in the headers but must be *defined* by the client
+        // driver (see src/bindings.rs), which IddCxStub.lib links against.
+        .blocklist_item("IddMinimumVersionRequired")
         .allowlist_item("DISPLAYCONFIG_.*")
         .derive_default(true)
         .layout_tests(false)
