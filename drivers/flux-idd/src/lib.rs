@@ -21,10 +21,9 @@ use core::ptr;
 use std::sync::Mutex;
 
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG,
-    WDFDEVICE, WDFDEVICE_INIT, WDFDRIVER, WDFOBJECT, WDF_DRIVER_CONFIG, WDF_NO_HANDLE,
-    WDF_NO_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
-    WDF_POWER_DEVICE_STATE,
+    call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDFDEVICE,
+    WDFDEVICE_INIT, WDFDRIVER, WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
+    WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
 };
 
 use bindings as idd;
@@ -35,6 +34,7 @@ const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000000Du32 as NTSTATUS;
 const STATUS_DEVICE_BUSY: NTSTATUS = 0x80000011u32 as NTSTATUS;
 const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC00000A3u32 as NTSTATUS;
 const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC0000010u32 as NTSTATUS;
+const STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN: NTSTATUS = 0xC01E0003u32 as NTSTATUS;
 
 /// Device interface used by flux-server to find and control the driver:
 /// {5b1a4c37-6f5d-4a41-9c1d-8f2e4b6a7c01}
@@ -68,8 +68,10 @@ struct DriverState {
     adapter_init_status: NTSTATUS,
     monitor: idd::IDDCX_MONITOR,
     monitor_plugged_in: bool,
+    monitor_operation_in_progress: bool,
     preferred: (u32, u32, u32),
     processor: Option<swapchain::SwapChainProcessor>,
+    last_swapchain_error: NTSTATUS,
 }
 
 // IDDCX handles are only touched from IddCx callbacks and the IOCTL queue,
@@ -82,8 +84,10 @@ static STATE: Mutex<DriverState> = Mutex::new(DriverState {
     adapter_init_status: STATUS_DEVICE_NOT_READY,
     monitor: ptr::null_mut(),
     monitor_plugged_in: false,
+    monitor_operation_in_progress: false,
     preferred: (1920, 1080, 60),
     processor: None,
+    last_swapchain_error: STATUS_SUCCESS,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -212,8 +216,10 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         ..Default::default()
     };
     caps.EndPointDiagnostics.Size = size_of::<idd::IDDCX_ENDPOINT_DIAGNOSTIC_INFO>() as u32;
-    caps.EndPointDiagnostics.GammaSupport = idd::IDDCX_FEATURE_IMPLEMENTATION_IDDCX_FEATURE_IMPLEMENTATION_NONE;
-    caps.EndPointDiagnostics.TransmissionType = idd::IDDCX_TRANSMISSION_TYPE_IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
+    caps.EndPointDiagnostics.GammaSupport =
+        idd::IDDCX_FEATURE_IMPLEMENTATION_IDDCX_FEATURE_IMPLEMENTATION_NONE;
+    caps.EndPointDiagnostics.TransmissionType =
+        idd::IDDCX_TRANSMISSION_TYPE_IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
     caps.EndPointDiagnostics.pEndPointFriendlyName = friendly_name.as_ptr();
     caps.EndPointDiagnostics.pEndPointManufacturerName = manufacturer.as_ptr();
     caps.EndPointDiagnostics.pEndPointModelName = model.as_ptr();
@@ -235,25 +241,28 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 }
 
 pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTATUS {
-    let mut state = STATE.lock().unwrap();
-    if !state.adapter_ready || state.adapter.is_null() {
-        // Surface the adapter init failure code if there was one, so a failed
-        // init is distinguishable from init still being in flight.
-        return if state.adapter_init_status < 0 {
-            state.adapter_init_status
-        } else {
-            STATUS_DEVICE_NOT_READY
-        };
-    }
-    if state.monitor_plugged_in {
-        return STATUS_DEVICE_BUSY;
-    }
+    let (adapter, old_preferred) = {
+        let mut state = STATE.lock().unwrap();
+        if !state.adapter_ready || state.adapter.is_null() {
+            return if state.adapter_init_status < 0 {
+                state.adapter_init_status
+            } else {
+                STATUS_DEVICE_NOT_READY
+            };
+        }
+        if state.monitor_plugged_in || state.monitor_operation_in_progress {
+            return STATUS_DEVICE_BUSY;
+        }
 
-    state.preferred = (
-        if width == 0 { 1920 } else { width },
-        if height == 0 { 1080 } else { height },
-        if refresh_hz == 0 { 60 } else { refresh_hz },
-    );
+        state.monitor_operation_in_progress = true;
+        let old_preferred = state.preferred;
+        state.preferred = (
+            if width == 0 { 1920 } else { width },
+            if height == 0 { 1080 } else { height },
+            if refresh_hz == 0 { 60 } else { refresh_hz },
+        );
+        (state.adapter, old_preferred)
+    };
 
     let mut monitor_info = idd::IDDCX_MONITOR_INFO {
         Size: size_of::<idd::IDDCX_MONITOR_INFO>() as u32,
@@ -265,7 +274,6 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
     monitor_info.MonitorDescription.Size = size_of::<idd::IDDCX_MONITOR_DESCRIPTION>() as u32;
     monitor_info.MonitorDescription.Type =
         idd::IDDCX_MONITOR_DESCRIPTION_TYPE_IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    // EDID-less monitor: the OS calls EvtIddCxMonitorGetDefaultDescriptionModes.
     monitor_info.MonitorDescription.DataSize = 0;
     monitor_info.MonitorDescription.pData = ptr::null_mut();
 
@@ -283,33 +291,58 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
         pMonitorInfo: &mut monitor_info,
     };
     let mut create_out = idd::IDARG_OUT_MONITORCREATE::default();
-    let status = unsafe { idd::IddCxMonitorCreate(state.adapter, &mut create, &mut create_out) };
+    let status = unsafe { idd::IddCxMonitorCreate(adapter, &mut create, &mut create_out) };
     if status < 0 {
+        let mut state = STATE.lock().unwrap();
+        state.preferred = old_preferred;
+        state.monitor_operation_in_progress = false;
         return status;
     }
 
     let mut arrival_out = idd::IDARG_OUT_MONITORARRIVAL::default();
     let status = unsafe { idd::IddCxMonitorArrival(create_out.MonitorObject, &mut arrival_out) };
     if status < 0 {
+        let processor = {
+            let mut state = STATE.lock().unwrap();
+            state.preferred = old_preferred;
+            state.monitor_operation_in_progress = false;
+            state.processor.take()
+        };
+        drop(processor);
         return status;
     }
 
+    let mut state = STATE.lock().unwrap();
     state.monitor = create_out.MonitorObject;
     state.monitor_plugged_in = true;
+    state.monitor_operation_in_progress = false;
     STATUS_SUCCESS
 }
 
 pub(crate) fn plug_out_monitor() -> NTSTATUS {
-    let mut state = STATE.lock().unwrap();
-    if !state.monitor_plugged_in || state.monitor.is_null() {
-        return STATUS_DEVICE_NOT_READY;
-    }
+    let (monitor, processor) = {
+        let mut state = STATE.lock().unwrap();
+        if !state.monitor_plugged_in || state.monitor.is_null() {
+            return STATUS_DEVICE_NOT_READY;
+        }
+        if state.monitor_operation_in_progress {
+            return STATUS_DEVICE_BUSY;
+        }
+        state.monitor_operation_in_progress = true;
+        (state.monitor, state.processor.take())
+    };
 
-    let status = unsafe { idd::IddCxMonitorDeparture(state.monitor) };
+    drop(processor);
+    let status = unsafe { idd::IddCxMonitorDeparture(monitor) };
+
+    let mut state = STATE.lock().unwrap();
+    state.monitor_operation_in_progress = false;
     if status >= 0 {
         state.monitor = ptr::null_mut();
         state.monitor_plugged_in = false;
-        state.processor = None;
+    } else {
+        state.monitor = monitor;
+        state.monitor_plugged_in = true;
     }
     status
 }
@@ -347,7 +380,12 @@ fn fill_signal_info(
     mode.pixelRate = u64::from(vsync) * u64::from(width) * u64::from(height);
 }
 
-fn monitor_mode(width: u32, height: u32, vsync: u32, origin: idd::IDDCX_MONITOR_MODE_ORIGIN) -> idd::IDDCX_MONITOR_MODE {
+fn monitor_mode(
+    width: u32,
+    height: u32,
+    vsync: u32,
+    origin: idd::IDDCX_MONITOR_MODE_ORIGIN,
+) -> idd::IDDCX_MONITOR_MODE {
     let mut mode = idd::IDDCX_MONITOR_MODE {
         Size: size_of::<idd::IDDCX_MONITOR_MODE>() as u32,
         Origin: origin,
@@ -434,7 +472,9 @@ extern "C" fn evt_monitor_get_default_modes(
         if in_args.DefaultMonitorModeBufferInputCount == 0 {
             out_args.DefaultMonitorModeBufferOutputCount = modes.len() as u32;
         } else {
-            let count = modes.len().min(in_args.DefaultMonitorModeBufferInputCount as usize);
+            let count = modes
+                .len()
+                .min(in_args.DefaultMonitorModeBufferInputCount as usize);
             for (i, &(w, h, hz)) in modes.iter().take(count).enumerate() {
                 let origin = if i == 0 {
                     idd::IDDCX_MONITOR_MODE_ORIGIN_IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
@@ -477,8 +517,11 @@ extern "C" fn evt_monitor_assign_swapchain(
     in_args: *const idd::IDARG_IN_SETSWAPCHAIN,
 ) -> NTSTATUS {
     let in_args = unsafe { &*in_args };
-    let mut state = STATE.lock().unwrap();
-    state.processor = None; // stop any previous processor first
+    let previous_processor = {
+        let mut state = STATE.lock().unwrap();
+        state.processor.take()
+    };
+    drop(previous_processor);
 
     match swapchain::SwapChainProcessor::start(
         in_args.hSwapChain,
@@ -486,27 +529,28 @@ extern "C" fn evt_monitor_assign_swapchain(
         in_args.hNextSurfaceAvailable as *mut c_void,
     ) {
         Ok(processor) => {
+            let mut state = STATE.lock().unwrap();
             state.processor = Some(processor);
             STATUS_SUCCESS
         }
-        Err(_) => {
-            // Give the swap-chain back to the OS to retry (possibly with a
-            // different render adapter).
-            unsafe {
-                call_unsafe_wdf_function_binding!(
-                    WdfObjectDelete,
-                    in_args.hSwapChain as WDFOBJECT,
-                );
-            }
-            STATUS_SUCCESS
+        Err(status) => {
+            STATE.lock().unwrap().last_swapchain_error = status;
+            STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN
         }
     }
 }
 
 extern "C" fn evt_monitor_unassign_swapchain(_monitor: idd::IDDCX_MONITOR) -> NTSTATUS {
-    STATE.lock().unwrap().processor = None;
+    let processor = {
+        let mut state = STATE.lock().unwrap();
+        state.processor.take()
+    };
+    drop(processor);
     STATUS_SUCCESS
 }
 
 // Re-exported for ioctl.rs
-pub(crate) use {STATUS_INVALID_DEVICE_REQUEST as ERR_INVALID_REQUEST, STATUS_INVALID_PARAMETER as ERR_INVALID_PARAM};
+pub(crate) use {
+    STATUS_INVALID_DEVICE_REQUEST as ERR_INVALID_REQUEST,
+    STATUS_INVALID_PARAMETER as ERR_INVALID_PARAM,
+};

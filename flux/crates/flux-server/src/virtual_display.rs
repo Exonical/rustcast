@@ -90,7 +90,9 @@ impl VirtualDisplay {
             unsafe {
                 let _ = CloseHandle(device);
             }
-            return Err(format!("IOCTL_FLUXIDD_PLUG_IN failed: {e}"));
+            return Err(format!(
+                "IOCTL_FLUXIDD_PLUG_IN failed: {e} (device={path}, mode={width}x{height}@{refresh_hz}Hz, code=0x{IOCTL_FLUXIDD_PLUG_IN:08x})"
+            ));
         }
 
         tracing::info!(

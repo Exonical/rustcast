@@ -65,7 +65,11 @@ fn handle_plug_in(request: WDFREQUEST, input_buffer_length: usize) -> NTSTATUS {
         )
     };
     if status < 0 || buffer.is_null() {
-        return crate::ERR_INVALID_PARAM;
+        return if status < 0 {
+            status
+        } else {
+            crate::ERR_INVALID_PARAM
+        };
     }
 
     let mode = unsafe { *(buffer as *const FluxIddMonitorMode) };
