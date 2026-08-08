@@ -27,7 +27,7 @@ CopyFiles=UMDriverCopy
 [FluxIdd_Install.NT.hw]
 AddReg = FluxIdd_HardwareDeviceSettings
 
-[FluxIdd_HardwareDeviceSettings.AddReg]
+[FluxIdd_HardwareDeviceSettings]
 ; Restrict device access to SYSTEM and Administrators: the plug-in/out IOCTLs
 ; change display topology and must not be reachable from normal user code.
 HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
