@@ -114,19 +114,6 @@ pub unsafe extern "system" fn driver_entry(
 extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INIT) -> NTSTATUS {
     let mut device_init = device_init;
 
-    let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
-        Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
-        EvtDeviceD0Entry: Some(evt_device_d0_entry),
-        ..Default::default()
-    };
-    unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceInitSetPnpPowerEventCallbacks,
-            device_init,
-            &mut pnp_callbacks,
-        );
-    }
-
     let mut idd_config = idd::IDD_CX_CLIENT_CONFIG {
         Size: size_of::<idd::IDD_CX_CLIENT_CONFIG>() as u32,
         EvtIddCxDeviceIoControl: Some(ioctl::evt_io_device_control),
@@ -143,6 +130,22 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
     let status = unsafe { idd::IddCxDeviceInitConfig(device_init as *mut _, &mut idd_config) };
     if status < 0 {
         return status;
+    }
+
+    // Must come after IddCxDeviceInitConfig: IddCx chains these callbacks, so
+    // registering first would let IddCx overwrite them (adapter init in
+    // EvtDeviceD0Entry would then never run).
+    let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDeviceD0Entry: Some(evt_device_d0_entry),
+        ..Default::default()
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetPnpPowerEventCallbacks,
+            device_init,
+            &mut pnp_callbacks,
+        );
     }
 
     let mut device: WDFDEVICE = ptr::null_mut();
