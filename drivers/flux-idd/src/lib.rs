@@ -64,6 +64,8 @@ const DEFAULT_MODES: &[(u32, u32, u32)] = &[
 /// a process-global keeps the Rust side simple and safe.
 struct DriverState {
     adapter: idd::IDDCX_ADAPTER,
+    adapter_ready: bool,
+    adapter_init_status: NTSTATUS,
     monitor: idd::IDDCX_MONITOR,
     monitor_plugged_in: bool,
     preferred: (u32, u32, u32),
@@ -76,6 +78,8 @@ unsafe impl Send for DriverState {}
 
 static STATE: Mutex<DriverState> = Mutex::new(DriverState {
     adapter: ptr::null_mut(),
+    adapter_ready: false,
+    adapter_init_status: STATUS_DEVICE_NOT_READY,
     monitor: ptr::null_mut(),
     monitor_plugged_in: false,
     preferred: (1920, 1080, 60),
@@ -188,15 +192,19 @@ extern "C" fn evt_device_d0_entry(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
-    let mut firmware_version = idd::IDDCX_ENDPOINT_VERSION {
-        Size: size_of::<idd::IDDCX_ENDPOINT_VERSION>() as u32,
-        MajorVer: 1,
-        ..Default::default()
-    };
+    // Leaked: adapter init is asynchronous, so IddCx may read the diagnostic
+    // strings/version after this function returns. One-time allocation.
+    let firmware_version: &'static mut idd::IDDCX_ENDPOINT_VERSION =
+        Box::leak(Box::new(idd::IDDCX_ENDPOINT_VERSION {
+            Size: size_of::<idd::IDDCX_ENDPOINT_VERSION>() as u32,
+            MajorVer: 1,
+            ..Default::default()
+        }));
 
-    let friendly_name: Vec<u16> = "Flux Virtual Display Adapter\0".encode_utf16().collect();
-    let manufacturer: Vec<u16> = "Rustcast\0".encode_utf16().collect();
-    let model: Vec<u16> = "FluxIdd\0".encode_utf16().collect();
+    let friendly_name: &'static [u16] =
+        Vec::leak("Flux Virtual Display Adapter\0".encode_utf16().collect());
+    let manufacturer: &'static [u16] = Vec::leak("Rustcast\0".encode_utf16().collect());
+    let model: &'static [u16] = Vec::leak("FluxIdd\0".encode_utf16().collect());
 
     let mut caps = idd::IDDCX_ADAPTER_CAPS {
         Size: size_of::<idd::IDDCX_ADAPTER_CAPS>() as u32,
@@ -209,8 +217,8 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pEndPointFriendlyName = friendly_name.as_ptr();
     caps.EndPointDiagnostics.pEndPointManufacturerName = manufacturer.as_ptr();
     caps.EndPointDiagnostics.pEndPointModelName = model.as_ptr();
-    caps.EndPointDiagnostics.pFirmwareVersion = &mut firmware_version;
-    caps.EndPointDiagnostics.pHardwareVersion = &mut firmware_version;
+    caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
+    caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
 
     let mut init = idd::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device as idd::WDFDEVICE,
@@ -228,8 +236,14 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 
 pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTATUS {
     let mut state = STATE.lock().unwrap();
-    if state.adapter.is_null() {
-        return STATUS_DEVICE_NOT_READY;
+    if !state.adapter_ready || state.adapter.is_null() {
+        // Surface the adapter init failure code if there was one, so a failed
+        // init is distinguishable from init still being in flight.
+        return if state.adapter_init_status < 0 {
+            state.adapter_init_status
+        } else {
+            STATUS_DEVICE_NOT_READY
+        };
     }
     if state.monitor_plugged_in {
         return STATUS_DEVICE_BUSY;
@@ -376,9 +390,16 @@ fn mode_list() -> Vec<(u32, u32, u32)> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 extern "C" fn evt_adapter_init_finished(
-    _adapter: idd::IDDCX_ADAPTER,
-    _in_args: *const idd::IDARG_IN_ADAPTER_INIT_FINISHED,
+    adapter: idd::IDDCX_ADAPTER,
+    in_args: *const idd::IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
+    let init_status = unsafe { (*in_args).AdapterInitStatus };
+    let mut state = STATE.lock().unwrap();
+    state.adapter_init_status = init_status;
+    if init_status >= 0 {
+        state.adapter = adapter;
+        state.adapter_ready = true;
+    }
     // Monitor is plugged in on IOCTL request, not at adapter init.
     STATUS_SUCCESS
 }
