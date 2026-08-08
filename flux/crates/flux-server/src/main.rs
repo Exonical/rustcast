@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 mod http;
 mod pipeline;
+mod quic_frames;
 mod session;
 #[cfg(feature = "tray")]
 mod tray;
@@ -172,6 +173,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_listener = tokio::net::TcpListener::bind(&frame_addr).await?;
     tracing::info!("H.264 frame server listening on tcp://{}", frame_addr);
 
+    // QUIC frame server on the same port number over UDP. Preferred by the
+    // relay on lossy links (no head-of-line blocking); TCP remains as fallback.
+    let quic_handle = match frame_addr.parse::<std::net::SocketAddr>() {
+        Ok(bind_addr) => match quic_frames::make_endpoint(bind_addr, &cert_manager) {
+            Ok(endpoint) => {
+                tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
+                let h264_tx = h264_tx.clone();
+                let idr_tx = idr_tx.clone();
+                let input_tx = input_tx.clone();
+                Some(tokio::spawn(async move {
+                    quic_frames::serve(endpoint, h264_tx, idr_tx, input_tx).await;
+                }))
+            }
+            Err(e) => {
+                tracing::warn!("QUIC frame server unavailable: {} (TCP only)", e);
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("QUIC frame server bind address invalid: {} (TCP only)", e);
+            None
+        }
+    };
+
     let frame_handle = tokio::spawn(async move {
         frame_server(frame_listener, h264_tx, idr_tx, input_tx).await;
     });
@@ -198,6 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     frame_handle.abort();
+    if let Some(h) = quic_handle {
+        h.abort();
+    }
     server.shutdown().await;
     tracing::info!("Flux Server stopped.");
     Ok(())
@@ -220,6 +248,18 @@ async fn frame_server(
             }
         };
         tracing::info!("Frame client connected: {}", addr);
+
+        // Low-latency socket setup: disable Nagle so each frame is sent
+        // immediately, and mark packets DSCP AF41 (interactive video) so
+        // QoS-aware networks prioritize them when the relay runs on
+        // another machine. Both are best-effort.
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!("set_nodelay failed: {}", e);
+        }
+        let sock = socket2::SockRef::from(&stream);
+        if let Err(e) = sock.set_tos_v4(34 << 2) {
+            tracing::debug!("DSCP not set (normal on Windows): {}", e);
+        }
         let mut rx = h264_tx.subscribe();
         let idr_tx = idr_tx.clone();
         let input_tx = input_tx.clone();

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -92,7 +93,16 @@ type frameMsg struct {
 
 func connectFrameServer(addr string) {
 	for {
-		log.Printf("[frame] connecting to %s ...", addr)
+		// Prefer QUIC (UDP, no head-of-line blocking on lossy links);
+		// fall back to the TCP frame protocol if the server is older.
+		if err := connectQUIC(addr); err != nil {
+			log.Printf("[frame] QUIC unavailable (%v), trying TCP", err)
+		} else {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		log.Printf("[frame] connecting to tcp %s ...", addr)
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
 			log.Printf("[frame] connection failed: %v, retrying in 2s", err)
@@ -628,7 +638,10 @@ func sendWSError(ws *websocket.Conn, msg string) {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
 
-	frameServerAddr := "127.0.0.1:8556"
+	frameServerAddr := os.Getenv("FLUX_SERVER_ADDR")
+	if frameServerAddr == "" {
+		frameServerAddr = "127.0.0.1:8556"
+	}
 	webAddr := ":8080"
 
 	if err := initUDPMux(); err != nil {
