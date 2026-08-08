@@ -158,6 +158,7 @@ func readFrames(conn net.Conn) error {
 		}
 
 		frameCount++
+		abr.countFrameBytes(len(data))
 		if frameCount%300 == 0 {
 			log.Printf("[frame] received %d frames (last=%d bytes)", frameCount, frameLen)
 		}
@@ -427,6 +428,11 @@ func forwardKeyframeRequests(sender *webrtc.RTPSender) {
 			return
 		}
 		for _, pkt := range packets {
+			if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
+				for _, report := range rr.Reports {
+					abr.onReceiverReport(float64(report.FractionLost) / 256.0)
+				}
+			}
 			switch pkt.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 				if time.Since(lastIDR) < 250*time.Millisecond {

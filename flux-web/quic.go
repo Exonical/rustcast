@@ -86,6 +86,7 @@ func connectQUIC(addr string) error {
 		}
 
 		frameCount++
+		abr.countFrameBytes(len(data))
 		if frameCount%300 == 0 {
 			log.Printf("[frame] received %d frames via quic (last=%d bytes)", frameCount, frameLen)
 		}
