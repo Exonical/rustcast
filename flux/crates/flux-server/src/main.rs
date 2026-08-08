@@ -329,31 +329,25 @@ async fn frame_server(
     }
 }
 
-/// The hardware H.264 encoder backend to prefer for this build/platform:
-/// AMF on Windows, FFmpeg-VA-API or cros-codecs VA-API on Linux (depending on
-/// which encoder feature is compiled in), falling back to the software encoder.
-fn preferred_encoder_backend() -> flux_core::types::EncoderBackend {
+/// The ordered H.264 encoder backends to try for this build/platform: the
+/// vendor hardware encoder first (AMF on Windows, FFmpeg-VA-API or
+/// cros-codecs VA-API on Linux depending on the compiled features), then the
+/// vendor-neutral Vulkan Video encoder, then the software fallback.
+// Vec::new + cfg-gated pushes: `vec![]` can't hold conditional elements.
+#[allow(clippy::vec_init_then_push)]
+fn encoder_backend_candidates() -> Vec<flux_core::types::EncoderBackend> {
     use flux_core::types::EncoderBackend;
+    let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]
-    {
-        EncoderBackend::Amf
-    }
+    candidates.push(EncoderBackend::Amf);
     #[cfg(all(target_os = "linux", feature = "encoder-ffmpeg"))]
-    {
-        EncoderBackend::FfmpegVaapi
-    }
+    candidates.push(EncoderBackend::FfmpegVaapi);
     #[cfg(all(target_os = "linux", feature = "encoder-vaapi", not(feature = "encoder-ffmpeg")))]
-    {
-        EncoderBackend::Vaapi
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        all(target_os = "linux", feature = "encoder-ffmpeg"),
-        all(target_os = "linux", feature = "encoder-vaapi"),
-    )))]
-    {
-        EncoderBackend::Software
-    }
+    candidates.push(EncoderBackend::Vaapi);
+    #[cfg(feature = "encoder-vulkan")]
+    candidates.push(EncoderBackend::VulkanVideo);
+    candidates.push(EncoderBackend::Software);
+    candidates
 }
 
 /// Create an encoder of the given backend and open a session, returning `None`
@@ -409,16 +403,15 @@ fn build_encode_session_for(
         max_ref_frames: 1,
     };
 
-    let preferred = preferred_encoder_backend();
-    let mut backend = preferred;
-    let mut session = create_encode_session(preferred, encoder_config.clone());
-    if session.is_none() && preferred != flux_core::types::EncoderBackend::Software {
-        tracing::warn!(
-            "{:?} encoder unavailable; falling back to software H.264 encoding",
-            preferred
-        );
-        backend = flux_core::types::EncoderBackend::Software;
-        session = create_encode_session(backend, encoder_config);
+    let mut backend = flux_core::types::EncoderBackend::Software;
+    let mut session = None;
+    for candidate in encoder_backend_candidates() {
+        session = create_encode_session(candidate, encoder_config.clone());
+        backend = candidate;
+        if session.is_some() {
+            break;
+        }
+        tracing::warn!("{:?} encoder unavailable; trying next backend", candidate);
     }
     (session, backend)
 }
