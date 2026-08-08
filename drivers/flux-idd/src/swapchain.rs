@@ -75,14 +75,15 @@ impl SwapChainProcessor {
         swapchain: idd::IDDCX_SWAPCHAIN,
         render_adapter_luid: idd::LUID,
         new_frame_event: *mut c_void,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, i32> {
         let luid = LUID {
             LowPart: render_adapter_luid.LowPart,
             HighPart: render_adapter_luid.HighPart,
         };
-        let device = create_d3d_device(luid).map_err(|_| ())?;
+        let device = create_d3d_device(luid).map_err(|error| error.code().0)?;
 
-        let terminate_event = unsafe { CreateEventW(None, false, false, None) }.map_err(|_| ())?;
+        let terminate_event =
+            unsafe { CreateEventW(None, false, false, None) }.map_err(|error| error.code().0)?;
 
         // Raw pointers can't cross the thread boundary as-is; wrap them.
         struct ThreadArgs {
@@ -123,7 +124,7 @@ impl SwapChainProcessor {
                     );
                 }
             })
-            .map_err(|_| ())?;
+            .map_err(|_| 0xC000009Au32 as i32)?;
         let _ = started_rx.recv();
 
         Ok(Self {
