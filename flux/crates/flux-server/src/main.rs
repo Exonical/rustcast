@@ -576,6 +576,11 @@ fn capture_loop(
             // on the GPU (DXGI video-processor blit) and frames arrive
             // already sized for the encoder.
             if encode_session.is_some() && encode_resolution != capture_resolution {
+                // Release the current session first: DXGI allows only one
+                // active IDXGIOutputDuplication per output per process, so
+                // DuplicateOutput fails while the old one is alive.
+                let _ = session.stop();
+                drop(session);
                 match capture.start_capture(Some(primary.id), encode_resolution, target_fps) {
                     Ok(s) => {
                         session = s;
@@ -588,6 +593,17 @@ fn capture_loop(
                             "Failed to restart capture at {}: {} — falling back to CPU downscale",
                             encode_resolution, e
                         );
+                        session = match capture.start_capture(
+                            Some(primary.id),
+                            primary.native_resolution,
+                            target_fps,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to restore capture session: {}", e);
+                                return;
+                            }
+                        };
                     }
                 }
             }
