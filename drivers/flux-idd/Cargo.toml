@@ -25,7 +25,7 @@ bindgen = "0.71"
 cc = "1"
 
 [dependencies]
-wdk = "0.5"
+wdk = "0.4.1"
 wdk-sys = "0.5"
 windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
