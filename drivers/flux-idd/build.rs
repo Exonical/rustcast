@@ -49,6 +49,8 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         .wrap_static_fns(true)
         .wrap_static_fns_path(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers"));
 
+    let iddcx_dir = find_iddcx_include_dir(config)?;
+    builder = builder.clang_arg(format!("-I{}", iddcx_dir.display()));
     for include_dir in config.include_paths()? {
         builder = builder.clang_arg(format!("-I{}", include_dir.display()));
     }
@@ -58,6 +60,7 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
     // Compile the generated static-fn wrappers.
     let mut cc_build = cc::Build::new();
     cc_build.file(PathBuf::from(env::var("OUT_DIR")?).join("iddcx_wrappers.c"));
+    cc_build.include(&iddcx_dir);
     for include_dir in config.include_paths()? {
         cc_build.include(include_dir);
     }
@@ -69,4 +72,48 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
 
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
+}
+
+/// IddCx.h is not on the standard WDK include paths: it lives in a versioned
+/// subdirectory `Include\<sdk-version>\um\iddcx\<iddcx-version>\` (newer
+/// WDKs) or directly in `um\iddcx\`. Probe the WDK include paths for it and
+/// return the newest matching directory.
+fn find_iddcx_include_dir(
+    config: &wdk_build::Config,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    for include_dir in config.include_paths()? {
+        let iddcx_root = include_dir.join("iddcx");
+        if iddcx_root.join("IddCx.h").exists() {
+            candidates.push(iddcx_root.clone());
+        }
+        if let Ok(entries) = std::fs::read_dir(&iddcx_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.join("IddCx.h").exists() {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+
+    // Version directories sort lexicographically well enough (e.g. 1.10 > 1.9
+    // is the one wrinkle, so compare numerically when both parse).
+    candidates.sort_by(|a, b| {
+        let ver = |p: &PathBuf| -> Option<(u32, u32)> {
+            let name = p.file_name()?.to_str()?;
+            let (major, minor) = name.split_once('.')?;
+            Some((major.parse().ok()?, minor.parse().ok()?))
+        };
+        match (ver(a), ver(b)) {
+            (Some(va), Some(vb)) => va.cmp(&vb),
+            _ => a.cmp(b),
+        }
+    });
+
+    candidates.pop().ok_or_else(|| {
+        "IddCx.h not found under any WDK include path (looked for um\\iddcx[\\<version>]\\IddCx.h). Is the full WDK installed?"
+            .into()
+    })
 }
