@@ -29,6 +29,9 @@ pub struct DxgiCapture {
 }
 
 struct DxgiState {
+    /// Held to keep the factory that produced `targets` alive for as long as
+    /// those adapter-derived objects are cached.
+    #[allow(dead_code)]
     factory: IDXGIFactory1,
     inventory_key: Vec<String>,
     displays: Vec<DisplayInfo>,
