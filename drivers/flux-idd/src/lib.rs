@@ -70,6 +70,12 @@ struct DriverState {
     d0_entry_ran: bool,
     adapter_init_async_status: NTSTATUS,
     adapter_init_status: NTSTATUS,
+    adapter_init_finished_entry_count: u32,
+    device_init_config_status: NTSTATUS,
+    device_initialize_status: NTSTATUS,
+    adapter_handle_nonnull: u32,
+    adapter_config_size: u32,
+    adapter_caps_size: u32,
     monitor: idd::IDDCX_MONITOR,
     monitor_plugged_in: bool,
     monitor_operation_in_progress: bool,
@@ -87,6 +93,12 @@ static STATE: Mutex<DriverState> = Mutex::new(DriverState {
     d0_entry_ran: false,
     adapter_init_async_status: STATUS_INIT_NOT_ATTEMPTED,
     adapter_init_status: STATUS_INIT_NOT_ATTEMPTED,
+    adapter_init_finished_entry_count: 0,
+    device_init_config_status: STATUS_INIT_NOT_ATTEMPTED,
+    device_initialize_status: STATUS_INIT_NOT_ATTEMPTED,
+    adapter_handle_nonnull: 0,
+    adapter_config_size: 0,
+    adapter_caps_size: 0,
     monitor: ptr::null_mut(),
     monitor_plugged_in: false,
     monitor_operation_in_progress: false,
@@ -154,6 +166,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
     };
 
     let status = unsafe { idd::IddCxDeviceInitConfig(device_init as *mut _, &mut idd_config) };
+    STATE.lock().unwrap().device_init_config_status = status;
     if status < 0 {
         return status;
     }
@@ -183,7 +196,9 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
         return status;
     }
 
-    unsafe { idd::IddCxDeviceInitialize(device as idd::WDFDEVICE) }
+    let status = unsafe { idd::IddCxDeviceInitialize(device as idd::WDFDEVICE) };
+    STATE.lock().unwrap().device_initialize_status = status;
+    status
 }
 
 extern "C" fn evt_device_d0_entry(
@@ -191,8 +206,7 @@ extern "C" fn evt_device_d0_entry(
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     STATE.lock().unwrap().d0_entry_ran = true;
-    let _ = init_adapter(device);
-    STATUS_SUCCESS
+    init_adapter(device)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -229,6 +243,11 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pEndPointModelName = model.as_ptr();
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
+    {
+        let mut state = STATE.lock().unwrap();
+        state.adapter_config_size = size_of::<idd::IDD_CX_CLIENT_CONFIG>() as u32;
+        state.adapter_caps_size = caps.Size;
+    }
 
     // Mirrors WDF_OBJECT_ATTRIBUTES_INIT: a zeroed struct has invalid
     // ExecutionLevel/SynchronizationScope and IddCx rejects it with
@@ -250,6 +269,7 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     let status = unsafe { idd::IddCxAdapterInitAsync(&mut init, &mut out) };
     let mut state = STATE.lock().unwrap();
     state.adapter_init_async_status = status;
+    state.adapter_handle_nonnull = (!out.AdapterObject.is_null()) as u32;
     if status >= 0 {
         state.adapter = out.AdapterObject;
     }
@@ -454,7 +474,18 @@ extern "C" fn evt_adapter_init_finished(
     adapter: idd::IDDCX_ADAPTER,
     in_args: *const idd::IDARG_IN_ADAPTER_INIT_FINISHED,
 ) -> NTSTATUS {
-    let init_status = unsafe { (*in_args).AdapterInitStatus };
+    {
+        let mut state = STATE.lock().unwrap();
+        state.adapter_init_finished_entry_count =
+            state.adapter_init_finished_entry_count.saturating_add(1);
+    }
+    let init_status = unsafe {
+        if in_args.is_null() {
+            STATUS_INVALID_PARAMETER
+        } else {
+            (*in_args).AdapterInitStatus
+        }
+    };
     let mut state = STATE.lock().unwrap();
     state.adapter_init_status = init_status;
     state.adapter_ready = init_status >= 0;
@@ -474,6 +505,15 @@ pub(crate) fn query_status() -> ioctl::FluxIddStatus {
         adapter_ready: state.adapter_ready as u32,
         monitor_plugged_in: state.monitor_plugged_in as u32,
         monitor_operation_in_progress: state.monitor_operation_in_progress as u32,
+        adapter_init_finished_entry_count: state.adapter_init_finished_entry_count,
+        device_init_config_status: state.device_init_config_status,
+        device_initialize_status: state.device_initialize_status,
+        adapter_handle_nonnull: state.adapter_handle_nonnull,
+        adapter_config_size: state.adapter_config_size,
+        adapter_caps_size: state.adapter_caps_size,
+        iddcx_version_major: idd::FLUX_IDDCX_VERSION_MAJOR,
+        iddcx_version_minor: idd::FLUX_IDDCX_VERSION_MINOR,
+        iddcx_minimum_version_required: idd::FLUX_IDDCX_MINIMUM_VERSION_REQUIRED,
     }
 }
 

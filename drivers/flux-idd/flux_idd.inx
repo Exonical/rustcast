@@ -10,9 +10,9 @@ Provider=%ProviderString%
 PnpLockDown=1
 
 [Manufacturer]
-%ManufacturerName%=Standard,NT$ARCH$.10.0...17763
+%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
 
-[Standard.NT$ARCH$.10.0...17763]
+[Standard.NT$ARCH$.10.0...22000]
 %DeviceName%=FluxIdd_Install, Root\FluxIdd
 
 [SourceDisksNames]
@@ -50,6 +50,9 @@ UmdfHostProcessSharing=ProcessSharingDisabled
 [FluxIdd_Umdf_Install]
 UmdfLibraryVersion=$UMDFVERSION$
 ServiceBinary=%12%\UMDF\flux_idd.dll
+; The Rust bindings and IddCx version macros target IddCx 1.4. This
+; extension identifier matches Microsoft's IddCx sample and is not the
+; versioned header-directory selector used by build.rs.
 UmdfExtensions=IddCx0102
 
 [DestinationDirs]

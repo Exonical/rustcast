@@ -45,6 +45,15 @@ pub struct FluxIddStatus {
     pub adapter_ready: u32,
     pub monitor_plugged_in: u32,
     pub monitor_operation_in_progress: u32,
+    pub adapter_init_finished_entry_count: u32,
+    pub device_init_config_status: NTSTATUS,
+    pub device_initialize_status: NTSTATUS,
+    pub adapter_handle_nonnull: u32,
+    pub adapter_config_size: u32,
+    pub adapter_caps_size: u32,
+    pub iddcx_version_major: u32,
+    pub iddcx_version_minor: u32,
+    pub iddcx_minimum_version_required: u32,
 }
 
 pub unsafe extern "C" fn evt_io_device_control(

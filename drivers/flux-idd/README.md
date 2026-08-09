@@ -33,6 +33,14 @@ Prerequisites:
    `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"` (the 17.0.6 install path)
 4. `cargo install cargo-make --no-default-features --features tls-native`
 
+The driver is intentionally pinned to the **IddCx 1.4** header ABI. `build.rs`
+selects `um\iddcx\1.4\IddCx.h` explicitly and fails if that directory is absent;
+it must not silently switch to a newer WDK directory because bindgen structure
+layouts are part of the driver ABI. The generated bindings, `IddMinimumVersionRequired`,
+and the `IddCx0102` UMDF extension declaration in the INF are kept aligned with
+the Microsoft IddCx sample's 1.4 client configuration. The UMDF target remains
+2.31; WDK 10.0.26100 provides both pins.
+
 Build & package:
 
 ```powershell

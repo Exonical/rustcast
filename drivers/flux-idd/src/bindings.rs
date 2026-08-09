@@ -12,11 +12,12 @@
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/iddcx_bindings.rs"));
+include!(concat!(env!("OUT_DIR"), "/iddcx_version.rs"));
 
 /// IddCxStub.lib resolves this from the client driver; it declares the
 /// minimum IddCx version the driver requires (IDDCX_MINIMUM_VERSION_REQUIRED).
 #[unsafe(no_mangle)]
-pub static IddMinimumVersionRequired: u32 = 4;
+pub static IddMinimumVersionRequired: u32 = FLUX_IDDCX_MINIMUM_VERSION_REQUIRED;
 
 macro_rules! iddcx_call {
     ($name:ident: $pfn:ident @ $idx:ident ( $($arg:ident : $ty:ty),* $(,)? )) => {
