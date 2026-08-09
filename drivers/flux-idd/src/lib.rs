@@ -230,8 +230,8 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
 
-    let mut object_attributes = idd::WDF_OBJECT_ATTRIBUTES {
-        Size: size_of::<idd::WDF_OBJECT_ATTRIBUTES>() as ULONG,
+    let mut object_attributes = idd::_WDF_OBJECT_ATTRIBUTES {
+        Size: size_of::<idd::_WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ..Default::default()
     };
     let mut init = idd::IDARG_IN_ADAPTER_INIT {
