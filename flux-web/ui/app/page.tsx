@@ -13,6 +13,12 @@ function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
 function mapMouseButton(button: number): "Left" | "Right" | "Middle" | "Back" | "Forward" | undefined {
   switch (button) {
     case 0: return "Left";
@@ -68,6 +74,16 @@ const PointerLockIcon = () => (
     <circle cx="12" cy="12" r="3" /><path d="M12 2v4M12 18v4M2 12h4M18 12h4" />
   </svg>
 );
+const HelpIcon = () => (
+  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="9" /><path d="M9.5 9a2.5 2.5 0 1 1 4.1 1.9c-.9.7-1.6 1.1-1.6 2.4" /><path d="M12 17h.01" />
+  </svg>
+);
+const AlertIcon = () => (
+  <svg className="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M10.3 3.4 2.2 17.5A2 2 0 0 0 3.9 20.5h16.2a2 2 0 0 0 1.7-3L13.7 3.4a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" />
+  </svg>
+);
 const WifiIcon = () => (
   <svg className="w-10 h-10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>
@@ -113,6 +129,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showStats, setShowStats] = useState(true);
   const [showControls, setShowControls] = useState(true);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const [pointerLockEnabled, setPointerLockEnabled] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -452,12 +469,35 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     : connectionState === "connecting" ? "bg-amber-400" : "bg-red-400";
   const textColor = connectionState === "connected" ? "text-emerald-400"
     : connectionState === "connecting" ? "text-amber-400" : "text-red-400";
+  const connectionCopy: Record<ConnectionState, { label: string; title: string; detail: string }> = {
+    connecting: {
+      label: "Connecting",
+      title: "Connecting to stream",
+      detail: `Reaching ${machine.name}. This can take a moment.`,
+    },
+    connected: {
+      label: "Connected",
+      title: "Live stream",
+      detail: "Your remote desktop is ready.",
+    },
+    disconnected: {
+      label: "Disconnected",
+      title: "Stream disconnected",
+      detail: "The connection was interrupted. Flux will try again automatically.",
+    },
+    failed: {
+      label: "Failed",
+      title: "Couldn’t connect to stream",
+      detail: "Check that the sender is online, then try again.",
+    },
+  };
+  const currentConnection = connectionCopy[connectionState];
 
   return (
     <Tooltip.Provider delayDuration={300}>
       <div
         ref={containerRef}
-        className="relative w-screen h-screen bg-black overflow-hidden select-none"
+        className="relative min-h-screen w-full bg-[var(--color-background)] overflow-hidden select-none"
         onMouseMove={handleMouseMove}
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
@@ -465,32 +505,37 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         onContextMenu={(e) => e.preventDefault()}
         style={{ cursor: isPointerLocked || !showControls ? "none" : "default" }}
       >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          className="absolute inset-0 w-full h-full object-contain bg-black pointer-events-none"
-        />
+        <div className="absolute inset-0 bg-black">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="absolute inset-0 h-full w-full object-contain bg-black pointer-events-none"
+          />
+        </div>
 
         {/* Top bar */}
-        <div className={`absolute top-0 left-0 right-0 p-4 flex items-center justify-between transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
+        <div className={`absolute top-0 left-0 right-0 z-10 p-3 sm:p-5 flex flex-wrap items-start justify-between gap-3 transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
           {/* Logo + status */}
-          <div className="glass rounded-xl px-4 py-2.5 flex items-center gap-3 animate-fade-in">
+          <div className="glass rounded-2xl px-3 py-2.5 sm:px-4 flex min-w-0 items-center gap-2.5 sm:gap-3 animate-fade-in">
             <span className="text-[var(--color-accent)]"><MonitorIcon /></span>
-            <span className="text-sm font-semibold tracking-tight">Flux Stream</span>
-            <Separator.Root className="w-px h-4 bg-zinc-700" orientation="vertical" />
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full pulse-dot ${dotColor}`} />
-              <span className={`text-xs font-medium capitalize ${textColor}`}>{connectionState}</span>
+            <div className="min-w-0">
+              <div className="text-sm font-semibold tracking-tight">Flux Stream</div>
+              <div className="max-w-36 truncate text-[11px] text-zinc-500 sm:max-w-52">{machine.name}</div>
             </div>
-            <button onClick={onBack} className="ml-2 text-xs text-zinc-400 hover:text-white">
+            <Separator.Root className="hidden sm:block w-px h-7 bg-zinc-700" orientation="vertical" />
+            <div className="flex items-center gap-2 whitespace-nowrap">
+              <div className={`w-2 h-2 rounded-full pulse-dot ${dotColor}`} />
+              <span className={`text-xs font-semibold ${textColor}`}>{currentConnection.label}</span>
+            </div>
+            <button onClick={onBack} className="ml-1 rounded-lg px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-white">
               Machines
             </button>
           </div>
 
           {/* Controls */}
-          <div className="glass rounded-xl px-2 py-1.5 flex items-center gap-1 animate-fade-in">
+          <div className="glass rounded-2xl px-2 py-1.5 flex items-center gap-1 animate-fade-in">
             <CtrlTooltip label="Reconnect (Ctrl+Alt+Shift+R)">
               <button onClick={reconnect} className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors">
                 <RefreshIcon />
@@ -524,43 +569,76 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
                 {isFullscreen ? <MinimizeIcon /> : <MaximizeIcon />}
               </button>
             </CtrlTooltip>
+            <CtrlTooltip label="Keyboard shortcuts">
+              <button
+                aria-label="Show keyboard shortcuts"
+                aria-expanded={showShortcuts}
+                onClick={() => setShowShortcuts((visible) => !visible)}
+                className={`p-2 rounded-lg transition-colors ${showShortcuts ? "bg-zinc-700 text-white" : "text-zinc-400 hover:text-white hover:bg-zinc-800"}`}
+              >
+                <HelpIcon />
+              </button>
+            </CtrlTooltip>
           </div>
         </div>
 
+        {showShortcuts && (
+          <div className="absolute right-3 top-20 z-20 w-[min(19rem,calc(100vw-1.5rem))] glass rounded-2xl p-4 shadow-2xl animate-fade-in sm:right-5 sm:top-24">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-zinc-100">Shortcuts</h2>
+              <button onClick={() => setShowShortcuts(false)} className="text-xs text-zinc-500 hover:text-white">Close</button>
+            </div>
+            <div className="space-y-2 text-xs text-zinc-400">
+              <ShortcutRow keys="Ctrl + Alt + Shift + R" label="Reconnect" />
+              <ShortcutRow keys="Ctrl + Alt + Shift + S" label="Toggle stats" />
+              <ShortcutRow keys="Ctrl + Alt + Shift + F" label="Toggle fullscreen" />
+              <ShortcutRow keys="Esc" label="Exit pointer lock" />
+              <p className="pt-1 text-[11px] text-zinc-600">Pointer lock also enables relative mouse movement.</p>
+            </div>
+          </div>
+        )}
+
         {/* Stats overlay */}
-        {showStats && stats && (
-          <div className="absolute bottom-4 left-4 glass rounded-xl px-4 py-3 animate-fade-in">
-            <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs font-mono">
-              <span className="text-zinc-500">Resolution</span><span className="text-zinc-200 text-right">{stats.width}x{stats.height}</span>
-              <span className="text-zinc-500">FPS</span><span className="text-zinc-200 text-right">{stats.fps}</span>
-              <span className="text-zinc-500">Bitrate</span><span className="text-zinc-200 text-right">{formatBitrate(stats.bitrate)}</span>
-              <span className="text-zinc-500">Packets Lost</span><span className="text-zinc-200 text-right">{stats.packetsLost}</span>
-              <span className="text-zinc-500">Jitter</span><span className="text-zinc-200 text-right">{(stats.jitter * 1000).toFixed(1)}ms</span>
+        {showStats && (
+          <div className="absolute bottom-3 left-3 z-10 w-[min(22rem,calc(100vw-1.5rem))] glass rounded-2xl p-3 sm:bottom-5 sm:left-5 sm:p-4 animate-fade-in">
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold text-zinc-200">Stream health</p>
+                <p className="text-[11px] text-zinc-500">Live WebRTC telemetry</p>
+              </div>
+              <span className={`rounded-full px-2 py-1 text-[10px] font-medium ${stats ? "bg-emerald-400/10 text-emerald-300" : "bg-amber-400/10 text-amber-300"}`}>
+                {stats ? "LIVE" : "WAITING"}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <StatCard label="Resolution" value={stats ? `${stats.width} × ${stats.height}` : "—"} />
+              <StatCard label="Frame rate" value={stats ? `${stats.fps.toFixed(1)} fps` : "—"} />
+              <StatCard label="Bitrate" value={stats ? formatBitrate(stats.bitrate) : "—"} accent />
+              <StatCard label="Packets lost" value={stats ? stats.packetsLost.toLocaleString() : "—"} accent={!!stats && stats.packetsLost > 0} />
+              <StatCard label="Jitter" value={stats ? `${(stats.jitter * 1000).toFixed(1)} ms` : "—"} />
+              <StatCard label="Received" value={stats ? formatBytes(stats.bytesReceived) : "—"} />
             </div>
           </div>
         )}
 
         {/* Connection overlay */}
         {connectionState !== "connected" && (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <div className="glass rounded-2xl px-8 py-6 flex flex-col items-center gap-4 animate-fade-in">
-              {connectionState === "connecting" ? (
-                <>
-                  <span className="text-amber-400 animate-pulse"><WifiIcon /></span>
-                  <p className="text-sm text-zinc-300">Connecting to stream...</p>
-                </>
-              ) : connectionState === "failed" ? (
-                <>
-                  <span className="text-red-400"><WifiOffIcon /></span>
-                  <p className="text-sm text-zinc-300">Connection failed</p>
-                  <button onClick={reconnect} className="px-4 py-2 rounded-lg bg-[var(--color-accent)] hover:brightness-110 text-white text-sm font-medium transition">Retry</button>
-                </>
-              ) : (
-                <>
-                  <span className="text-zinc-500"><WifiOffIcon /></span>
-                  <p className="text-sm text-zinc-300">Disconnected</p>
-                  <button onClick={reconnect} className="px-4 py-2 rounded-lg bg-[var(--color-accent)] hover:brightness-110 text-white text-sm font-medium transition">Connect</button>
-                </>
+          <div className="absolute inset-0 z-[1] flex items-center justify-center px-4">
+            <div className="glass w-full max-w-md rounded-3xl px-6 py-7 text-center shadow-2xl animate-fade-in sm:px-10">
+              <div className={`mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl ${connectionState === "connecting" ? "bg-amber-400/10 text-amber-300" : "bg-red-400/10 text-red-300"}`}>
+                {connectionState === "connecting" ? <span className="animate-pulse"><WifiIcon /></span> : connectionState === "failed" ? <AlertIcon /> : <WifiOffIcon />}
+              </div>
+              <p className="mb-2 text-lg font-semibold text-zinc-100">{currentConnection.title}</p>
+              <p className="mx-auto max-w-sm text-sm leading-6 text-zinc-400">{currentConnection.detail}</p>
+              {connectionState !== "connecting" && (
+                <div className="mt-6 flex flex-col justify-center gap-2 sm:flex-row">
+                  <button onClick={reconnect} className="rounded-xl bg-[var(--color-accent)] px-4 py-2.5 text-sm font-semibold text-white transition hover:brightness-110">
+                    {connectionState === "failed" ? "Retry connection" : "Reconnect"}
+                  </button>
+                  <button onClick={onBack} className="rounded-xl border border-zinc-700 px-4 py-2.5 text-sm font-semibold text-zinc-300 transition hover:border-zinc-500 hover:text-white">
+                    Back to machines
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -598,18 +676,18 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
   }, [refresh]);
 
   return (
-    <main className="min-h-screen bg-black text-zinc-100 px-6 py-12">
-      <div className="max-w-4xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
-          <div className="flex items-center gap-3">
+    <main className="h-screen overflow-y-auto bg-[var(--color-background)] px-4 py-6 text-zinc-100 sm:px-6 sm:py-12">
+      <div className="mx-auto max-w-5xl">
+        <div className="mb-8 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-3">
             <span className="text-[var(--color-accent)]"><MonitorIcon /></span>
             <div>
-              <h1 className="text-xl font-semibold">Flux Stream</h1>
+              <h1 className="text-xl font-semibold tracking-tight">Flux Stream</h1>
               <p className="text-sm text-zinc-500">Choose a machine to view</p>
             </div>
           </div>
-          <button onClick={() => void refresh()} className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800">
-            <RefreshIcon />
+          <button onClick={() => void refresh()} className="flex items-center gap-2 rounded-xl border border-zinc-800 px-3 py-2 text-xs font-medium text-zinc-400 transition hover:border-zinc-700 hover:bg-zinc-900 hover:text-white">
+            <RefreshIcon /><span className="hidden sm:inline">Refresh</span>
           </button>
         </div>
         {loading ? (
@@ -623,7 +701,7 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
         ) : machines.length === 0 ? (
           <div className="glass rounded-2xl p-8 text-center text-zinc-400">No machines have registered yet.</div>
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {machines.map((machine) => {
               const online = machine.status === "online";
               return (
@@ -631,16 +709,18 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
                   key={machine.id}
                   disabled={!online}
                   onClick={() => onSelect(machine)}
-                  className={`glass rounded-2xl p-5 text-left transition ${online ? "hover:bg-zinc-800/80" : "opacity-50 cursor-not-allowed"}`}
+                  className={`glass w-full rounded-2xl p-5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] ${online ? "hover:-translate-y-0.5 hover:border-zinc-700 hover:bg-zinc-800/80" : "cursor-not-allowed opacity-50"}`}
                 >
-                  <div className="flex items-center justify-between mb-4">
-                    <h2 className="font-semibold truncate">{machine.name}</h2>
-                    <span className={`text-xs ${online ? "text-emerald-400" : "text-zinc-500"}`}>
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h2 className="truncate font-semibold">{machine.name}</h2>
+                      {machine.display_name && <p className="mt-1 truncate text-xs text-zinc-500">{machine.display_name}</p>}
+                    </div>
+                    <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${online ? "bg-emerald-400/10 text-emerald-300" : "bg-zinc-800 text-zinc-500"}`}>
                       {online ? "Online" : "Offline"}
                     </span>
                   </div>
                   <div className="space-y-1 text-xs text-zinc-400">
-                    {machine.display_name && <p>Display: {machine.display_name}</p>}
                     {machine.os && <p>OS: {machine.os}</p>}
                     {machine.gpu_vendor && <p>GPU: {machine.gpu_vendor}</p>}
                     {machine.encoder_backend && <p>Encoder: {machine.encoder_backend}</p>}
@@ -654,6 +734,24 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
         )}
       </div>
     </main>
+  );
+}
+
+function StatCard({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div className="rounded-xl border border-white/5 bg-black/20 px-3 py-2">
+      <p className="text-[10px] uppercase tracking-wide text-zinc-600">{label}</p>
+      <p className={`mt-1 truncate font-mono text-sm font-semibold ${accent ? "text-[var(--color-accent)]" : "text-zinc-200"}`}>{value}</p>
+    </div>
+  );
+}
+
+function ShortcutRow({ keys, label }: { keys: string; label: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <span>{label}</span>
+      <kbd className="rounded-md border border-zinc-700 bg-black/30 px-2 py-1 font-mono text-[10px] text-zinc-300">{keys}</kbd>
+    </div>
   );
 }
 
