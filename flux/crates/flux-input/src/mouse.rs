@@ -84,7 +84,7 @@ impl MouseSink {
             SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-            MOUSEEVENTF_XUP, MOUSEINPUT,
+            MOUSEEVENTF_XUP, MOUSEEVENTF_HWHEEL, MOUSEINPUT,
         };
 
         // Standard Win32 XBUTTON values
@@ -113,7 +113,30 @@ impl MouseSink {
                 MouseButton::Back => (MOUSEEVENTF_XUP, 0, 0, XBUTTON1),
                 MouseButton::Forward => (MOUSEEVENTF_XUP, 0, 0, XBUTTON2),
             },
-            MouseEvent::Scroll { dx: _, dy } => (MOUSEEVENTF_WHEEL, 0, 0, *dy as u32),
+            MouseEvent::Scroll { dx, dy } => {
+                if *dx != 0 {
+                    let input = INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                dx: 0,
+                                dy: 0,
+                                mouseData: *dx as u32,
+                                dwFlags: MOUSEEVENTF_HWHEEL,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    };
+                    unsafe {
+                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+                    }
+                }
+                if *dy == 0 {
+                    return Ok(());
+                }
+                (MOUSEEVENTF_WHEEL, 0, 0, *dy as u32)
+            }
         };
 
         let input = INPUT {

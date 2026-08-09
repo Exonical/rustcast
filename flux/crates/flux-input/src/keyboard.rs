@@ -76,8 +76,8 @@ impl KeyboardSink {
     #[cfg(target_os = "windows")]
     fn inject_windows(&self, event: &KeyboardEvent) -> flux_core::Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            KEYEVENTF_SCANCODE, VIRTUAL_KEY,
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
         };
 
         let mut dw_flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
@@ -93,6 +93,10 @@ impl KeyboardSink {
                 if *sc > 0 {
                     dw_flags |= KEYEVENTF_SCANCODE;
                     scan_code = *sc;
+                    if scan_code & 0xFF00 == 0xE000 {
+                        dw_flags |= KEYEVENTF_EXTENDEDKEY;
+                        scan_code &= 0x00FF;
+                    }
                 } else if let Some(vk) = kc {
                     vk_code = *vk;
                 }
@@ -106,6 +110,10 @@ impl KeyboardSink {
                 if *sc > 0 {
                     dw_flags |= KEYEVENTF_SCANCODE;
                     scan_code = *sc;
+                    if scan_code & 0xFF00 == 0xE000 {
+                        dw_flags |= KEYEVENTF_EXTENDEDKEY;
+                        scan_code &= 0x00FF;
+                    }
                 } else if let Some(vk) = kc {
                     vk_code = *vk;
                 }
