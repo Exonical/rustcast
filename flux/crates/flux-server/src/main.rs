@@ -174,23 +174,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             display
                 .unplug()
                 .map_err(|e| format!("unplug existing virtual display: {e}"))?;
-            let old_names = before_names.clone();
+            let display_count_before_unplug = before_names.len();
             let unplug_deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                let current = capture_probe.enumerate_displays().unwrap_or_default();
-                let current_names: std::collections::HashSet<String> =
-                    current.iter().map(|display| display.name.clone()).collect();
-                before_names = current_names;
-                if old_names
-                    .iter()
-                    .any(|name| !before_names.contains(name))
-                    || std::time::Instant::now() >= unplug_deadline
-                {
-                    break;
+            let after_unplug = loop {
+                match capture_probe.enumerate_displays() {
+                    Ok(displays) if displays.len() < display_count_before_unplug => {
+                        break displays;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("waiting for existing virtual DXGI output removal: {e}")
+                    }
+                }
+                if std::time::Instant::now() >= unplug_deadline {
+                    drop(display);
+                    return Err(
+                        "existing virtual display could not be removed within 2 seconds"
+                            .into(),
+                    );
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            };
+            before_names = after_unplug
+                .into_iter()
+                .map(|display| display.name)
+                .collect();
             display
                 .plug_in_mode(vd.width, vd.height, vd.refresh_hz)
                 .map_err(|e| format!("re-plug virtual display: {e}"))?;

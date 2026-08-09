@@ -274,6 +274,7 @@ fn log_status(context: &str, status: FluxIddStatus) {
         status.device_initialize_status as u32,
         status.adapter_handle_nonnull,
         status.adapter_config_size,
+        status.adapter_caps_size,
         status.iddcx_version_major,
         status.iddcx_version_minor,
         status.iddcx_minimum_version_required,
