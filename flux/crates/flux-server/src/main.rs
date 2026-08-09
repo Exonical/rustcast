@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 mod http;
 mod pipeline;
 mod quic_frames;
+mod registration;
 mod session;
 #[cfg(target_os = "windows")]
 mod virtual_display;
@@ -214,6 +215,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let capture_fps = config.video.max_fps.min(60);
     let forced_encoder = config.video.encoder;
+    let runtime_status = Arc::new(std::sync::RwLock::new(registration::RuntimeStatus::default()));
+    let runtime_status_capture = runtime_status.clone();
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
@@ -225,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 capture_fps,
                 forced_encoder,
                 virtual_display_target,
+                runtime_status_capture,
             );
         })?;
 
@@ -232,6 +236,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_port = config.server.signaling_port + 2; // e.g. 8555
     let frame_addr = format!("{}:{}", config.bind_address, frame_port);
     let frame_listener = tokio::net::TcpListener::bind(&frame_addr).await?;
+    let frame_host = if config.bind_address == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        config.bind_address.as_str()
+    };
+    let advertised_frame_addr = format!("{frame_host}:{frame_port}");
+    let registration_stop = registration::start(
+        &config,
+        &platform,
+        advertised_frame_addr,
+        runtime_status,
+    );
     tracing::info!("H.264 frame server listening on tcp://{}", frame_addr);
 
     // QUIC frame server on the same port number over UDP. Preferred by the
@@ -289,6 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         h.abort();
     }
     server.shutdown().await;
+    if let Some(stop) = registration_stop {
+        let _ = stop.send(());
+    }
     tracing::info!("Flux Server stopped.");
     Ok(())
 }
@@ -578,6 +597,7 @@ fn capture_loop(
     target_fps: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     target_display_name: Option<String>,
+    runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
     // ── Initialize capture ──────────────────────────────────────────
     let capture = match flux_capture::create_capture(None) {
@@ -611,6 +631,9 @@ fn capture_loop(
     } else {
         displays.iter().find(|d| d.primary).unwrap_or(&displays[0])
     };
+    if let Ok(mut status) = runtime_status.write() {
+        status.display_name = Some(primary.name.clone());
+    }
     
     // Initialize Input Sink (needs primary display resolution for absolute mouse positioning)
     let input_sink = match flux_input::InputSink::new(
@@ -722,6 +745,13 @@ fn capture_loop(
                     encode_session = None;
                     encode_resolution = frame.resolution;
                 }
+            }
+            if let Ok(mut status) = runtime_status.write() {
+                status.capture_width = capture_resolution.width;
+                status.capture_height = capture_resolution.height;
+                status.encode_width = encode_resolution.width;
+                status.encode_height = encode_resolution.height;
+                status.encoder_backend = Some(format!("{backend:?}"));
             }
             tracing::info!(
                 "Capture+encode loop: {}x{} captured → {}x{}@{}fps {:?} H.264",

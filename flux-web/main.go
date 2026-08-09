@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,42 +18,15 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
-// ---------------------------------------------------------------------------
-// Global state
-// ---------------------------------------------------------------------------
+var iceUDPMux ice.UDPMux
 
-var (
-	// Current active WebRTC session (single-viewer for now)
-	currentSession   *Session
-	currentSessionMu sync.Mutex
-
-	// Latest H.264 frame from the Rust capture server
-	frameChan = make(chan frameMsg, 120)
-
-	// Command channel to send requests to the Rust server
-	upstreamCommandChan = make(chan []byte, 100)
-
-	// Shared UDP mux for all WebRTC traffic: a single socket lets us mark
-	// packets with a DSCP class and gives a fixed port to open in firewalls.
-	iceUDPMux ice.UDPMux
-)
-
-// webrtcUDPPort is the single UDP port used for all WebRTC media traffic.
 const webrtcUDPPort = 8443
-
-// dscpAF41 is the AF41 (DSCP 34) per-hop behavior for interactive video,
-// expressed as the value of the IP TOS byte / IPv6 traffic class (34 << 2).
 const dscpAF41 = 34 << 2
 
-// initUDPMux binds the WebRTC media socket and marks its packets AF41 so
-// WMM-capable WiFi gear and QoS-enabled routers prioritize the video stream.
-// DSCP marking is best-effort: Windows ignores socket-level TOS (use a
-// New-NetQosPolicy instead), and some home routers wash the field.
 func initUDPMux() error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: webrtcUDPPort})
 	if err != nil {
@@ -71,205 +43,32 @@ func initUDPMux() error {
 	return nil
 }
 
-// Session wraps a single WebRTC peer connection + video track.
 type Session struct {
 	PeerConnection *webrtc.PeerConnection
 	VideoTrack     *webrtc.TrackLocalStaticSample
-	needsIDR       bool // true until the first IDR is sent to this session
+	needsIDR       bool
+	machine        *machineUpstream
+	release        func()
+	releaseOnce    sync.Once
 }
 
-// ---------------------------------------------------------------------------
-// TCP frame reader — connects to flux-server's frame server
-// ---------------------------------------------------------------------------
-
-// frameMsg is one encoded H.264 access unit plus the capture timestamp
-// (microseconds since capture start) reported by the Rust server. The
-// timestamp lets the pusher pace playout by true capture spacing instead of
-// bursty network arrival time.
 type frameMsg struct {
 	tsMicros uint64
 	data     []byte
 }
 
-func connectFrameServer(addr string) {
-	for {
-		// Prefer QUIC (UDP, no head-of-line blocking on lossy links);
-		// fall back to the TCP frame protocol if the server is older.
-		if err := connectQUIC(addr); err != nil {
-			log.Printf("[frame] QUIC unavailable (%v), trying TCP", err)
-		} else {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		log.Printf("[frame] connecting to tcp %s ...", addr)
-		conn, err := net.Dial("tcp", addr)
-		if err != nil {
-			log.Printf("[frame] connection failed: %v, retrying in 2s", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		log.Printf("[frame] connected to %s", addr)
-
-		// Spawn writer for upstream commands
-		done := make(chan struct{})
-		go func() {
-			for {
-				select {
-				case cmd := <-upstreamCommandChan:
-					if _, err := conn.Write(cmd); err != nil {
-						log.Printf("[frame] write command error: %v", err)
-						return
-					}
-				case <-done:
-					return
-				}
-			}
-		}()
-
-		err = readFrames(conn)
-		close(done) // Stop the writer
-		conn.Close()
-		if err != nil {
-			log.Printf("[frame] read error: %v, reconnecting in 1s", err)
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func readFrames(conn net.Conn) error {
-	var frameCount uint64
-	for {
-		// Protocol: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
-		var hdr [12]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			return fmt.Errorf("read header: %w", err)
-		}
-		tsMicros := binary.BigEndian.Uint64(hdr[0:8])
-		frameLen := binary.BigEndian.Uint32(hdr[8:12])
-		if frameLen == 0 || frameLen > 10*1024*1024 {
-			return fmt.Errorf("invalid frame length: %d", frameLen)
-		}
-
-		// Read frame data
-		data := make([]byte, frameLen)
-		if _, err := io.ReadFull(conn, data); err != nil {
-			return fmt.Errorf("read frame data: %w", err)
-		}
-
-		frameCount++
-		abr.countFrameBytes(len(data))
-		if frameCount%300 == 0 {
-			log.Printf("[frame] received %d frames (last=%d bytes)", frameCount, frameLen)
-		}
-
-		msg := frameMsg{tsMicros: tsMicros, data: data}
-		// Non-blocking send to frameChan
-		select {
-		case frameChan <- msg:
-		default:
-			// Drop oldest frame if channel is full
-			select {
-			case <-frameChan:
-			default:
-			}
-			frameChan <- msg
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Frame pusher — writes frames from frameChan to the active WebRTC track
-// ---------------------------------------------------------------------------
-
-func framePusher() {
-	// The capture source (e.g. a Wayland/mutter screen-cast) delivers frames at
-	// a variable, damage-driven rate and the server drains backlogs in bursts,
-	// so network arrival time is a poor clock. Pace the RTP timestamp by the
-	// frame's capture timestamp (reported by the server) instead, so the
-	// browser's jitter buffer can absorb bursts and play at true capture
-	// cadence rather than running ahead and stalling.
-	const (
-		defaultFrameDuration = 16 * time.Millisecond  // ~60fps for the first sample
-		minFrameDuration     = 4 * time.Millisecond   // clamp absurdly fast bursts
-		maxFrameDuration     = 500 * time.Millisecond // clamp long idle gaps
-	)
-	var (
-		sampleCount uint64
-		lastTs      uint64
-		haveLastTs  bool
-	)
-
-	for msg := range frameChan {
-		idr := isIDRFrame(msg.data)
-
-		currentSessionMu.Lock()
-		sess := currentSession
-		currentSessionMu.Unlock()
-
-		if sess == nil || sess.VideoTrack == nil {
-			continue
-		}
-
-		sampleCount++
-
-		// New session: skip P-frames until the next live IDR arrives.
-		// P-frames can't be decoded without their preceding frames.
-		if sess.needsIDR {
-			if !idr {
-				continue
-			}
-			log.Printf("[webrtc] live IDR arrived (%d bytes), starting stream for new session", len(msg.data))
-			sess.needsIDR = false
-		}
-
-		// Duration = capture-time gap since the previous sent sample. The
-		// server timestamp resets on reconnect, so guard against going
-		// backwards and fall back to the nominal duration.
-		frameDuration := defaultFrameDuration
-		if haveLastTs && msg.tsMicros > lastTs {
-			frameDuration = time.Duration(msg.tsMicros-lastTs) * time.Microsecond
-			if frameDuration < minFrameDuration {
-				frameDuration = minFrameDuration
-			} else if frameDuration > maxFrameDuration {
-				frameDuration = maxFrameDuration
-			}
-		}
-		lastTs = msg.tsMicros
-		haveLastTs = true
-
-		// Log first few frames and IDRs for diagnostics
-		if sampleCount <= 5 || (idr && sampleCount > 5) {
-			naluTypes := describeNALUs(msg.data)
-			log.Printf("[webrtc] sample #%d: %d bytes, NALUs: %s", sampleCount, len(msg.data), naluTypes)
-		}
-
-		err := sess.VideoTrack.WriteSample(media.Sample{
-			Data:     msg.data,
-			Duration: frameDuration,
-		})
-		if err != nil {
-			log.Printf("[webrtc] write sample error: %v", err)
-		}
-	}
-}
-
-// describeNALUs parses Annex B start codes and returns NALU type descriptions.
 func describeNALUs(data []byte) string {
 	var types []string
 	i := 0
 	for i < len(data)-4 {
-		// Look for start code 00 00 00 01 or 00 00 01
 		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
 			if i+4 < len(data) {
-				naluType := data[i+4] & 0x1F
-				types = append(types, naluTypeName(naluType))
+				types = append(types, naluTypeName(data[i+4]&0x1F))
 			}
 			i += 4
 		} else if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
 			if i+3 < len(data) {
-				naluType := data[i+3] & 0x1F
-				types = append(types, naluTypeName(naluType))
+				types = append(types, naluTypeName(data[i+3]&0x1F))
 			}
 			i += 3
 		} else {
@@ -289,7 +88,6 @@ func describeNALUs(data []byte) string {
 	return result
 }
 
-// isIDRFrame checks if the H.264 Annex B data contains an IDR NALU (type 5).
 func isIDRFrame(data []byte) bool {
 	i := 0
 	for i < len(data)-4 {
@@ -329,98 +127,70 @@ func naluTypeName(t byte) string {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// WebRTC session management
-// ---------------------------------------------------------------------------
-
 func newSession() (*Session, error) {
-	// Use default codecs — lets browser and pion negotiate H.264 profile freely
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register default codecs: %w", err)
 	}
-
-	// Default interceptors provide the NACK responder (RTP retransmission of
-	// lost packets — essential on lossy links like WiFi), RTCP sender reports
-	// for A/V sync, and TWCC feedback. Without them every lost packet
-	// corrupts the stream until the next keyframe.
 	i := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
-
 	se := webrtc.SettingEngine{}
 	if iceUDPMux != nil {
 		se.SetICEUDPMux(iceUDPMux)
 	}
-
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(i),
 		webrtc.WithSettingEngine(se),
 	)
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	}
-
-	pc, err := api.NewPeerConnection(config)
+	pc, err := api.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create peer connection: %w", err)
 	}
-
-	// Create H.264 video track
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeH264,
-			ClockRate: 90000,
-		},
-		"video", "flux-screen",
-	)
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
+	}, "video", "flux-screen")
 	if err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
-
 	sender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("add track: %w", err)
 	}
-
-	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
-	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
-	// fresh IDR from the capture server so the picture recovers immediately
-	// instead of staying corrupted until the next scheduled keyframe.
-	go forwardKeyframeRequests(sender)
-
+	session := &Session{PeerConnection: pc, VideoTrack: videoTrack}
+	go forwardKeyframeRequests(session, sender)
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[webrtc] ICE connection state: %s", state.String())
-		if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateDisconnected || state == webrtc.ICEConnectionStateClosed {
-			currentSessionMu.Lock()
-			if currentSession != nil && currentSession.PeerConnection == pc {
-				currentSession = nil
-				log.Printf("[webrtc] session cleared")
-			}
-			currentSessionMu.Unlock()
+		if state == webrtc.ICEConnectionStateFailed ||
+			state == webrtc.ICEConnectionStateDisconnected ||
+			state == webrtc.ICEConnectionStateClosed {
+			session.releaseNow()
 		}
 	})
-
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[webrtc] connection state: %s", state.String())
 	})
-
-	return &Session{
-		PeerConnection: pc,
-		VideoTrack:     videoTrack,
-	}, nil
+	return session, nil
 }
 
-// forwardKeyframeRequests reads incoming RTCP on the video sender and turns
-// PLI/FIR feedback into upstream IDR requests, rate-limited to one per 250ms.
-func forwardKeyframeRequests(sender *webrtc.RTPSender) {
+func (s *Session) releaseNow() {
+	s.releaseOnce.Do(func() {
+		if s.machine != nil {
+			s.machine.clearSession(s)
+		}
+		if s.release != nil {
+			s.release()
+		}
+	})
+}
+
+func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
 	var lastIDR time.Time
 	for {
 		packets, _, err := sender.ReadRTCP()
@@ -428,60 +198,41 @@ func forwardKeyframeRequests(sender *webrtc.RTPSender) {
 			return
 		}
 		for _, pkt := range packets {
-			if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
+			if rr, ok := pkt.(*rtcp.ReceiverReport); ok && session.machine != nil {
 				for _, report := range rr.Reports {
-					abr.onReceiverReport(float64(report.FractionLost) / 256.0)
+					session.machine.abr.onReceiverReport(float64(report.FractionLost) / 256.0)
 				}
 			}
 			switch pkt.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-				if time.Since(lastIDR) < 250*time.Millisecond {
+				if time.Since(lastIDR) < 250*time.Millisecond || session.machine == nil {
 					continue
 				}
 				lastIDR = time.Now()
-				select {
-				case upstreamCommandChan <- []byte{0x01}:
-					log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
-				default:
-				}
+				session.machine.send([]byte{0x01})
 			}
 		}
 	}
 }
 
 func exchangeOffer(session *Session, offerSDP string) (string, error) {
-	offer := webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  offerSDP,
-	}
-
-	if err := session.PeerConnection.SetRemoteDescription(offer); err != nil {
+	if err := session.PeerConnection.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer, SDP: offerSDP,
+	}); err != nil {
 		return "", fmt.Errorf("set remote description: %w", err)
 	}
-
 	answer, err := session.PeerConnection.CreateAnswer(nil)
 	if err != nil {
 		return "", fmt.Errorf("create answer: %w", err)
 	}
-
 	if err := session.PeerConnection.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("set local description: %w", err)
 	}
-
-	// Wait for ICE gathering to complete
-	gatherComplete := webrtc.GatheringCompletePromise(session.PeerConnection)
-	<-gatherComplete
-
+	<-webrtc.GatheringCompletePromise(session.PeerConnection)
 	return session.PeerConnection.LocalDescription().SDP, nil
 }
 
-// ---------------------------------------------------------------------------
-// WebSocket signaling
-// ---------------------------------------------------------------------------
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 type WSMessage struct {
 	Type string          `json:"type"`
@@ -489,189 +240,135 @@ type WSMessage struct {
 }
 
 type OfferData struct {
-	SDP string `json:"sd"`
+	SDP       string `json:"sd"`
+	MachineID string `json:"machine_id,omitempty"`
 }
 
-func handleSignaling(c *gin.Context) {
+func handleSignaling(c *gin.Context, registry *machineRegistry) {
 	ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("[ws] upgrade error: %v", err)
 		return
 	}
 	defer ws.Close()
-
-	log.Printf("[ws] client connected: %s", c.ClientIP())
+	var session *Session
+	defer func() {
+		if session != nil {
+			session.releaseNow()
+			session.PeerConnection.Close()
+		}
+	}()
 
 	for {
 		_, msgBytes, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("[ws] read error: %v", err)
 			return
 		}
-
 		var msg WSMessage
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
-			log.Printf("[ws] parse error: %v", err)
 			continue
 		}
-
 		switch msg.Type {
 		case "offer":
 			var offerData OfferData
 			if err := json.Unmarshal(msg.Data, &offerData); err != nil {
-				log.Printf("[ws] parse offer error: %v", err)
+				sendWSError(ws, "Invalid offer")
 				continue
 			}
-
-			log.Printf("[ws] received offer from %s", c.ClientIP())
-
-			session, err := newSession()
+			machineID := offerData.MachineID
+			if machineID == "" {
+				machineID = "default"
+			}
+			upstream, err := registry.acquire(machineID)
 			if err != nil {
-				log.Printf("[ws] create session error: %v", err)
+				sendWSError(ws, err.Error()+": "+machineID)
+				continue
+			}
+			next, err := newSession()
+			if err != nil {
+				registry.release(upstream)
 				sendWSError(ws, "Failed to create session")
 				continue
 			}
-
-			// Set up ICE candidate trickle to client
-			session.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+			next.machine = upstream
+			next.release = func() { registry.release(upstream) }
+			if old := upstream.bindSession(next); old != nil {
+				old.releaseNow()
+				old.PeerConnection.Close()
+			}
+			if session != nil {
+				session.releaseNow()
+				session.PeerConnection.Close()
+			}
+			session = next
+			next.needsIDR = true
+			next.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 				if candidate == nil {
 					return
 				}
-				candidateJSON := candidate.ToJSON()
-				data, _ := json.Marshal(candidateJSON)
-				resp := WSMessage{Type: "new-ice-candidate", Data: data}
-				respBytes, _ := json.Marshal(resp)
-				ws.WriteMessage(websocket.TextMessage, respBytes)
+				data, _ := json.Marshal(candidate.ToJSON())
+				resp, _ := json.Marshal(WSMessage{Type: "new-ice-candidate", Data: data})
+				_ = ws.WriteMessage(websocket.TextMessage, resp)
 			})
-
-			answerSDP, err := exchangeOffer(session, offerData.SDP)
+			answerSDP, err := exchangeOffer(next, offerData.SDP)
 			if err != nil {
-				log.Printf("[ws] exchange offer error: %v", err)
-				session.PeerConnection.Close()
+				next.releaseNow()
+				next.PeerConnection.Close()
 				sendWSError(ws, "Failed to exchange offer")
 				continue
 			}
-
-			// Replace current session
-			currentSessionMu.Lock()
-			if currentSession != nil {
-				currentSession.PeerConnection.Close()
-			}
-			currentSession = session
-			currentSession.needsIDR = true
-			currentSessionMu.Unlock()
-
-			// Request an immediate IDR frame from the Rust server
-			select {
-			case upstreamCommandChan <- []byte{0x01}:
-				log.Printf("[ws] requested IDR from upstream")
-			default:
-				log.Printf("[ws] upstream command channel full, dropped IDR request")
-			}
-
-			// Send answer back
+			upstream.send([]byte{0x01})
 			answerData, _ := json.Marshal(map[string]string{"sd": answerSDP})
-			resp := WSMessage{Type: "answer", Data: answerData}
-			respBytes, _ := json.Marshal(resp)
-			ws.WriteMessage(websocket.TextMessage, respBytes)
-			log.Printf("[ws] sent answer to %s", c.ClientIP())
-
+			resp, _ := json.Marshal(WSMessage{Type: "answer", Data: answerData})
+			_ = ws.WriteMessage(websocket.TextMessage, resp)
 		case "new-ice-candidate":
 			var candidate webrtc.ICECandidateInit
-			if err := json.Unmarshal(msg.Data, &candidate); err != nil {
-				log.Printf("[ws] parse ICE candidate error: %v", err)
-				continue
+			if err := json.Unmarshal(msg.Data, &candidate); err == nil && session != nil && candidate.Candidate != "" {
+				if err := session.PeerConnection.AddICECandidate(candidate); err != nil {
+					log.Printf("[ws] add ICE candidate error: %v", err)
+				}
 			}
-
-			if candidate.Candidate == "" {
-				continue
-			}
-
-			currentSessionMu.Lock()
-			sess := currentSession
-			currentSessionMu.Unlock()
-
-			if sess == nil {
-				log.Printf("[ws] no active session for ICE candidate")
-				continue
-			}
-
-			if err := sess.PeerConnection.AddICECandidate(candidate); err != nil {
-				log.Printf("[ws] add ICE candidate error: %v", err)
-			}
-
 		case "input":
-			// Forward input event to Rust frame server
-			// Protocol: [0x02][4-byte len][JSON payload]
-			// We receive just the JSON payload in msg.Data
-
-			// 1. Calculate length
-			payload := []byte(msg.Data)
-			payloadLen := uint32(len(payload))
-
-			// 2. Construct packet
-			// [0x02] + [len (4 bytes)] + [payload]
-			packet := make([]byte, 1+4+len(payload))
-			packet[0] = 0x02
-			binary.BigEndian.PutUint32(packet[1:5], payloadLen)
-			copy(packet[5:], payload)
-
-			// 3. Send to upstream channel (non-blocking drop if full)
-			select {
-			case upstreamCommandChan <- packet:
-				// log.Printf("[ws] forwarded input event (%d bytes)", len(payload))
-			default:
-				log.Printf("[ws] upstream command channel full, dropped input event")
+			if session == nil || session.machine == nil {
+				sendWSError(ws, "No active machine session")
+				continue
 			}
-
-		default:
-			log.Printf("[ws] unknown message type: %s", msg.Type)
+			payload := []byte(msg.Data)
+			packet := make([]byte, 5+len(payload))
+			packet[0] = 0x02
+			binary.BigEndian.PutUint32(packet[1:5], uint32(len(payload)))
+			copy(packet[5:], payload)
+			session.machine.send(packet)
 		}
 	}
 }
 
 func sendWSError(ws *websocket.Conn, msg string) {
 	data, _ := json.Marshal(map[string]string{"error": msg})
-	resp := WSMessage{Type: "error", Data: data}
-	respBytes, _ := json.Marshal(resp)
-	ws.WriteMessage(websocket.TextMessage, respBytes)
+	resp, _ := json.Marshal(WSMessage{Type: "error", Data: data})
+	_ = ws.WriteMessage(websocket.TextMessage, resp)
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds | log.Lshortfile)
-
 	frameServerAddr := os.Getenv("FLUX_SERVER_ADDR")
 	if frameServerAddr == "" {
 		frameServerAddr = "127.0.0.1:8556"
 	}
-	webAddr := ":8080"
-
+	registry := newMachineRegistry()
+	// The relay remains the frame connection initiator. This static entry
+	// preserves single-host deployments and legacy offers without a machine ID.
+	registry.seedStatic("default", "Configured Flux Server", frameServerAddr)
 	if err := initUDPMux(); err != nil {
 		log.Printf("[webrtc] UDP mux unavailable, falling back to ephemeral ports: %v", err)
 	}
-
-	// Start TCP frame reader (connects to Rust flux-server)
-	go connectFrameServer(frameServerAddr)
-
-	// Start frame pusher (writes to WebRTC track)
-	go framePusher()
-
-	// HTTP server
+	webAddr := ":8080"
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	r.Use(cors.Default())
-
-	// WebSocket signaling endpoint
-	r.GET("/ws/signaling", handleSignaling)
-
-	// Serve the Next.js static export from ui/out/
-	// Use NoRoute to avoid conflict with /ws/* routes
+	registerMachineRoutes(r, registry)
+	r.GET("/ws/signaling", func(c *gin.Context) { handleSignaling(c, registry) })
 	r.NoRoute(gin.WrapH(http.FileServer(http.Dir("./ui/out"))))
-
 	log.Printf("flux-web listening on http://localhost%s", webAddr)
 	if err := r.Run(webAddr); err != nil {
 		log.Fatalf("server error: %v", err)
