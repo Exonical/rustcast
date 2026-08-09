@@ -21,6 +21,7 @@ mod virtual_display;
 mod tray;
 
 use flux_core::config::FluxConfig;
+use flux_core::error::FluxError;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
 #[cfg(target_os = "windows")]
@@ -822,12 +823,11 @@ fn capture_loop(
     };
     tracing::info!("Capture: found {} display(s)", displays.len());
 
-    let primary = if let Some(target) = target_display.as_ref() {
+    let mut primary = if let Some(target) = target_display.as_ref() {
         match displays.iter().find(|display| {
-            display.name == target.name
-                && display.adapter_luid == target.adapter_luid
+            display.name == target.name && display.adapter_luid == target.adapter_luid
         }) {
-            Some(display) => display,
+            Some(display) => display.clone(),
             None => {
                 tracing::error!(
                     "Virtual display output {} on adapter LUID {:?} is no longer present; refusing to capture another display",
@@ -838,7 +838,11 @@ fn capture_loop(
             }
         }
     } else {
-        displays.iter().find(|d| d.primary).unwrap_or(&displays[0])
+        displays
+            .iter()
+            .find(|d| d.primary)
+            .unwrap_or(&displays[0])
+            .clone()
     };
     if let Ok(mut status) = runtime_status.write() {
         status.display_name = Some(primary.name.clone());
@@ -931,16 +935,47 @@ fn capture_loop(
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("Capture error: {}", e);
+                if !matches!(e, FluxError::CaptureSessionLost(_)) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
                 let _ = session.stop();
                 drop(session);
                 loop {
+                    let displays = match capture.enumerate_displays() {
+                        Ok(displays) => displays,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Waiting for target display {} on adapter LUID {:?} after capture loss; display enumeration failed: {}",
+                                primary.name,
+                                primary.adapter_luid,
+                                error
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    let refreshed = displays.into_iter().find(|display| {
+                        display.name == primary.name
+                            && display.adapter_luid == primary.adapter_luid
+                    });
+                    let Some(refreshed) = refreshed else {
+                        tracing::warn!(
+                            "Waiting for target display {} on adapter LUID {:?} after capture loss; refusing to capture another display",
+                            primary.name,
+                            primary.adapter_luid
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    };
                     match capture.start_capture(
-                        Some(primary.id),
-                        primary.native_resolution,
+                        Some(refreshed.id),
+                        refreshed.native_resolution,
                         target_fps,
                     ) {
                         Ok(new_session) => {
                             session = new_session;
+                            primary = refreshed;
                             tracing::info!("Capture session recreated after capture loss");
                             break;
                         }
