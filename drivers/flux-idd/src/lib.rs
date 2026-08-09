@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDFDEVICE,
     WDFDEVICE_INIT, WDFDRIVER, WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
+    WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
 };
 
 use bindings as idd;
@@ -31,10 +31,12 @@ use bindings as idd;
 const STATUS_SUCCESS: NTSTATUS = 0;
 const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC0000002u32 as NTSTATUS;
 const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000000Du32 as NTSTATUS;
+const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC0000023u32 as NTSTATUS;
 const STATUS_DEVICE_BUSY: NTSTATUS = 0x80000011u32 as NTSTATUS;
 const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC00000A3u32 as NTSTATUS;
 const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC0000010u32 as NTSTATUS;
 const STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN: NTSTATUS = 0xC01E0003u32 as NTSTATUS;
+const STATUS_INIT_NOT_ATTEMPTED: NTSTATUS = 0xFFFFFFFFu32 as NTSTATUS;
 
 /// Device interface used by flux-server to find and control the driver:
 /// {5b1a4c37-6f5d-4a41-9c1d-8f2e4b6a7c01}
@@ -65,6 +67,8 @@ const DEFAULT_MODES: &[(u32, u32, u32)] = &[
 struct DriverState {
     adapter: idd::IDDCX_ADAPTER,
     adapter_ready: bool,
+    d0_entry_ran: bool,
+    adapter_init_async_status: NTSTATUS,
     adapter_init_status: NTSTATUS,
     monitor: idd::IDDCX_MONITOR,
     monitor_plugged_in: bool,
@@ -80,7 +84,9 @@ unsafe impl Send for DriverState {}
 static STATE: Mutex<DriverState> = Mutex::new(DriverState {
     adapter: ptr::null_mut(),
     adapter_ready: false,
-    adapter_init_status: STATUS_DEVICE_NOT_READY,
+    d0_entry_ran: false,
+    adapter_init_async_status: STATUS_INIT_NOT_ATTEMPTED,
+    adapter_init_status: STATUS_INIT_NOT_ATTEMPTED,
     monitor: ptr::null_mut(),
     monitor_plugged_in: false,
     monitor_operation_in_progress: false,
@@ -120,6 +126,20 @@ pub unsafe extern "system" fn driver_entry(
 extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INIT) -> NTSTATUS {
     let mut device_init = device_init;
 
+    // Match the Microsoft sample: register callbacks before IddCx config so IddCx can chain them.
+    let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
+        Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
+        EvtDeviceD0Entry: Some(evt_device_d0_entry),
+        ..Default::default()
+    };
+    unsafe {
+        call_unsafe_wdf_function_binding!(
+            WdfDeviceInitSetPnpPowerEventCallbacks,
+            device_init,
+            &mut pnp_callbacks,
+        );
+    }
+
     let mut idd_config = idd::IDD_CX_CLIENT_CONFIG {
         Size: size_of::<idd::IDD_CX_CLIENT_CONFIG>() as u32,
         EvtIddCxDeviceIoControl: Some(ioctl::evt_io_device_control),
@@ -136,22 +156,6 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
     let status = unsafe { idd::IddCxDeviceInitConfig(device_init as *mut _, &mut idd_config) };
     if status < 0 {
         return status;
-    }
-
-    // Must come after IddCxDeviceInitConfig: IddCx chains these callbacks, so
-    // registering first would let IddCx overwrite them (adapter init in
-    // EvtDeviceD0Entry would then never run).
-    let mut pnp_callbacks = WDF_PNPPOWER_EVENT_CALLBACKS {
-        Size: size_of::<WDF_PNPPOWER_EVENT_CALLBACKS>() as ULONG,
-        EvtDeviceD0Entry: Some(evt_device_d0_entry),
-        ..Default::default()
-    };
-    unsafe {
-        call_unsafe_wdf_function_binding!(
-            WdfDeviceInitSetPnpPowerEventCallbacks,
-            device_init,
-            &mut pnp_callbacks,
-        );
     }
 
     let mut device: WDFDEVICE = ptr::null_mut();
@@ -186,7 +190,9 @@ extern "C" fn evt_device_d0_entry(
     device: WDFDEVICE,
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
-    init_adapter(device)
+    STATE.lock().unwrap().d0_entry_ran = true;
+    let _ = init_adapter(device);
+    STATUS_SUCCESS
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -224,16 +230,22 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
 
+    let mut object_attributes = WDF_OBJECT_ATTRIBUTES {
+        Size: size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ..Default::default()
+    };
     let mut init = idd::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device as idd::WDFDEVICE,
         pCaps: &mut caps,
-        ObjectAttributes: ptr::null_mut(),
+        ObjectAttributes: &mut object_attributes,
     };
 
     let mut out = idd::IDARG_OUT_ADAPTER_INIT::default();
     let status = unsafe { idd::IddCxAdapterInitAsync(&mut init, &mut out) };
+    let mut state = STATE.lock().unwrap();
+    state.adapter_init_async_status = status;
     if status >= 0 {
-        STATE.lock().unwrap().adapter = out.AdapterObject;
+        state.adapter = out.AdapterObject;
     }
     status
 }
@@ -242,11 +254,17 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
     let (adapter, old_preferred) = {
         let mut state = STATE.lock().unwrap();
         if !state.adapter_ready || state.adapter.is_null() {
-            return if state.adapter_init_status < 0 {
-                state.adapter_init_status
-            } else {
-                STATUS_DEVICE_NOT_READY
-            };
+            if state.adapter_init_status != STATUS_INIT_NOT_ATTEMPTED
+                && state.adapter_init_status < 0
+            {
+                return state.adapter_init_status;
+            }
+            if state.adapter_init_async_status != STATUS_INIT_NOT_ATTEMPTED
+                && state.adapter_init_async_status < 0
+            {
+                return state.adapter_init_async_status;
+            }
+            return STATUS_DEVICE_NOT_READY;
         }
         if state.monitor_plugged_in || state.monitor_operation_in_progress {
             return STATUS_DEVICE_BUSY;
@@ -433,12 +451,24 @@ extern "C" fn evt_adapter_init_finished(
     let init_status = unsafe { (*in_args).AdapterInitStatus };
     let mut state = STATE.lock().unwrap();
     state.adapter_init_status = init_status;
+    state.adapter_ready = init_status >= 0;
     if init_status >= 0 {
         state.adapter = adapter;
-        state.adapter_ready = true;
     }
     // Monitor is plugged in on IOCTL request, not at adapter init.
     STATUS_SUCCESS
+}
+
+pub(crate) fn query_status() -> ioctl::FluxIddStatus {
+    let state = STATE.lock().unwrap();
+    ioctl::FluxIddStatus {
+        d0_entry_ran: state.d0_entry_ran as u32,
+        adapter_init_async_status: state.adapter_init_async_status,
+        adapter_init_status: state.adapter_init_status,
+        adapter_ready: state.adapter_ready as u32,
+        monitor_plugged_in: state.monitor_plugged_in as u32,
+        monitor_operation_in_progress: state.monitor_operation_in_progress as u32,
+    }
 }
 
 extern "C" fn evt_adapter_commit_modes(
@@ -547,6 +577,7 @@ extern "C" fn evt_monitor_unassign_swapchain(_monitor: idd::IDDCX_MONITOR) -> NT
 
 // Re-exported for ioctl.rs
 pub(crate) use {
+    STATUS_BUFFER_TOO_SMALL as ERR_BUFFER_TOO_SMALL,
     STATUS_INVALID_DEVICE_REQUEST as ERR_INVALID_REQUEST,
     STATUS_INVALID_PARAMETER as ERR_INVALID_PARAM,
 };
