@@ -25,6 +25,9 @@ pub struct DisplayInfo {
     /// Opaque identifier for this display.
     pub id: u32,
 
+    /// DXGI adapter LUID that owns this output, when applicable.
+    pub adapter_luid: Option<u64>,
+
     /// Human-readable name (e.g. "DELL U2723QE").
     pub name: String,
 
@@ -33,6 +36,9 @@ pub struct DisplayInfo {
 
     /// Whether this is the primary display.
     pub primary: bool,
+
+    /// Whether the backend confirmed that this display can be captured.
+    pub capture_supported: bool,
 }
 
 /// An active capture session that produces frames.
