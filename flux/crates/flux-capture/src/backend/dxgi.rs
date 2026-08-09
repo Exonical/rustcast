@@ -778,6 +778,7 @@ impl DxgiCaptureSession {
                 Some(scaler) => {
                     if let Err(e) = scaler.scale(&self.device, &self.context, &desktop_texture) {
                         if let Err(release_error) = frame_guard.release() {
+                            tracing::warn!("GPU scale failed before release error: {e}");
                             return Err(release_error);
                         }
                         return Err(e);
