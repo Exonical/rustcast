@@ -10,9 +10,9 @@ Provider=%ProviderString%
 PnpLockDown=1
 
 [Manufacturer]
-%ManufacturerName%=Standard,NT$ARCH$.10.0...22000
+%ManufacturerName%=Standard,NT$ARCH$.10.0...17763
 
-[Standard.NT$ARCH$.10.0...22000]
+[Standard.NT$ARCH$.10.0...17763]
 %DeviceName%=FluxIdd_Install, Root\FluxIdd
 
 [SourceDisksNames]
