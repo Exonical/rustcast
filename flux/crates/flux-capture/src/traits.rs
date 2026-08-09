@@ -1,6 +1,10 @@
+use flux_core::cursor::CursorMetadata;
 use flux_core::error::Result;
 use flux_core::frame::CapturedFrame;
 use flux_core::types::Resolution;
+use std::sync::Arc;
+
+pub type CursorUpdateSink = Arc<dyn Fn(CursorMetadata) + Send + Sync>;
 
 /// A screen capture backend that can enumerate displays and start capture sessions.
 pub trait ScreenCapture: Send + Sync {
@@ -16,6 +20,7 @@ pub trait ScreenCapture: Send + Sync {
         display_id: Option<u32>,
         resolution: Resolution,
         framerate: u32,
+        cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>>;
 }
 

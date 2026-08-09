@@ -118,7 +118,7 @@ impl StreamingPipeline {
 
         // ── Capture ──────────────────────────────────────────────────
         let capture_factory = flux_capture::create_capture(Some(capture_backend))?;
-        let capture_session = capture_factory.start_capture(None, params.resolution, params.fps)?;
+        let capture_session = capture_factory.start_capture(None, params.resolution, params.fps, None)?;
 
         // ── Encoder ──────────────────────────────────────────────────
         let encode_config = EncodeConfig {

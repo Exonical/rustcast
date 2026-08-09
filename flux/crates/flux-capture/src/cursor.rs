@@ -33,7 +33,7 @@
 //! Once such an accessor lands (or via a small `libspa-sys` shim), the capture
 //! loop can feed the meta bytes straight into [`parse_spa_meta_cursor`].
 
-use flux_core::cursor::{CursorBitmap, CursorMetadata};
+use flux_core::cursor::{CursorBitmap, CursorMetadata, CURSOR_FORMAT_RGBA8888};
 
 const CURSOR_HEADER_LEN: usize = 28;
 const BITMAP_HEADER_LEN: usize = 20;
@@ -79,6 +79,112 @@ pub fn parse_spa_meta_cursor(buf: &[u8]) -> Option<CursorMetadata> {
         hotspot,
         bitmap,
     })
+}
+
+/// Convert a DXGI desktop-duplication pointer shape into straight RGBA.
+///
+/// DXGI's monochrome and masked-color formats require the desktop pixels for
+/// exact AND/XOR composition. The metadata cursor is rendered over a video
+/// element, so invert cases are deliberately approximated as white.
+pub fn convert_dxgi_pointer_shape(
+    shape_type: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    data: &[u8],
+) -> Option<CursorBitmap> {
+    const MONOCHROME: u32 = 1;
+    const COLOR: u32 = 2;
+    const MASKED_COLOR: u32 = 4;
+    let width_usize = usize::try_from(width).ok()?;
+    let height_usize = usize::try_from(height).ok()?;
+    let pitch_usize = usize::try_from(pitch).ok()?;
+    if width_usize == 0 || height_usize == 0 || pitch_usize == 0 {
+        return None;
+    }
+    let output_stride = width_usize.checked_mul(4)?;
+    let output_len = output_stride.checked_mul(height_usize)?;
+    let mut pixels = vec![0u8; output_len];
+
+    match shape_type {
+        COLOR | MASKED_COLOR => {
+            let needed = pitch_usize.checked_mul(height_usize)?;
+            if data.len() < needed || pitch_usize < output_stride {
+                return None;
+            }
+            for y in 0..height_usize {
+                for x in 0..width_usize {
+                    let src = y * pitch_usize + x * 4;
+                    let dst = y * output_stride + x * 4;
+                    let b = data[src];
+                    let g = data[src + 1];
+                    let r = data[src + 2];
+                    let a = data[src + 3];
+                    if shape_type == COLOR {
+                        pixels[dst..dst + 4].copy_from_slice(&[r, g, b, a]);
+                    } else {
+                        pixels[dst..dst + 4].copy_from_slice(&[r, g, b, 255]);
+                    }
+                }
+            }
+        }
+        MONOCHROME => {
+            let mask_row_bytes = width_usize.checked_add(7)? / 8;
+            if pitch_usize < mask_row_bytes {
+                return None;
+            }
+            let mask_len = pitch_usize.checked_mul(height_usize)?;
+            let needed = mask_len.checked_mul(2)?;
+            if data.len() < needed {
+                return None;
+            }
+            for y in 0..height_usize {
+                for x in 0..width_usize {
+                    let byte = 0x80 >> (x & 7);
+                    let offset = y * pitch_usize + x / 8;
+                    let and_bit = data[offset] & byte != 0;
+                    let xor_bit = data[mask_len + offset] & byte != 0;
+                    let dst = y * output_stride + x * 4;
+                    match (and_bit, xor_bit) {
+                        (true, false) => pixels[dst..dst + 4].copy_from_slice(&[0, 0, 0, 0]),
+                        (true, true) | (false, true) => {
+                            pixels[dst..dst + 4].copy_from_slice(&[255, 255, 255, 255])
+                        }
+                        (false, false) => pixels[dst..dst + 4].copy_from_slice(&[0, 0, 0, 255]),
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(CursorBitmap {
+        width,
+        height,
+        stride: output_stride as u32,
+        format: CURSOR_FORMAT_RGBA8888,
+        pixels,
+    })
+}
+
+pub fn scale_cursor_bitmap(bitmap: &CursorBitmap, scale_x: f32, scale_y: f32) -> CursorBitmap {
+    if (scale_x - 1.0).abs() < f32::EPSILON && (scale_y - 1.0).abs() < f32::EPSILON {
+        return bitmap.clone();
+    }
+    let width = ((bitmap.width as f32 * scale_x).round() as u32).max(1);
+    let height = ((bitmap.height as f32 * scale_y).round() as u32).max(1);
+    let stride = width * 4;
+    let mut pixels = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let source_x = ((x as f32 / scale_x).floor() as u32).min(bitmap.width - 1);
+            let source_y = ((y as f32 / scale_y).floor() as u32).min(bitmap.height - 1);
+            let src = (source_y * bitmap.stride + source_x * 4) as usize;
+            let dst = (y * stride + x * 4) as usize;
+            pixels[dst..dst + 4].copy_from_slice(&bitmap.pixels[src..src + 4]);
+        }
+    }
+    CursorBitmap { width, height, stride, format: bitmap.format, pixels }
 }
 
 /// Decode a `spa_meta_bitmap` at `base` within `buf`, returning `None` if it is
@@ -199,5 +305,32 @@ mod tests {
         let buf = cursor_bytes(1, (5, 5), (0, 0), Some((12, 2, 2, -8, &[0u8; 16])));
         let c = parse_spa_meta_cursor(&buf).unwrap();
         assert!(c.bitmap.is_none());
+    }
+
+    #[test]
+    fn converts_color_shape_to_straight_rgba() {
+        let bitmap = convert_dxgi_pointer_shape(2, 1, 1, 4, &[3, 2, 1, 128]).unwrap();
+        assert_eq!(bitmap.pixels, vec![1, 2, 3, 128]);
+    }
+
+    #[test]
+    fn converts_masked_color_shape_without_xor_garbage() {
+        let bitmap = convert_dxgi_pointer_shape(4, 2, 1, 8, &[3, 2, 1, 0, 6, 5, 4, 255]).unwrap();
+        assert_eq!(bitmap.pixels, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn converts_odd_width_monochrome_with_padded_rows() {
+        // Width 9 requires two bytes per mask row; pitch is four-byte aligned.
+        let and_mask = [0b1100_0000, 0b0000_0000, 0, 0];
+        let xor_mask = [0b0101_0000, 0b0000_0000, 0, 0];
+        let mut shape = Vec::from(and_mask);
+        shape.extend_from_slice(&xor_mask);
+        let bitmap = convert_dxgi_pointer_shape(1, 9, 1, 4, &shape).unwrap();
+        assert_eq!(&bitmap.pixels[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&bitmap.pixels[4..8], &[255, 255, 255, 255]);
+        assert_eq!(&bitmap.pixels[8..12], &[0, 0, 0, 255]);
+        assert_eq!(&bitmap.pixels[12..16], &[255, 255, 255, 255]);
+        assert_eq!(&bitmap.pixels[32..36], &[0, 0, 0, 255]);
     }
 }

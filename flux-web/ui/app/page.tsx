@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Toggle from "@radix-ui/react-toggle";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import * as Separator from "@radix-ui/react-separator";
-import { WebRTCClient, type ConnectionState, type WebRTCStats } from "@/lib/webrtc-client";
+import { WebRTCClient, type ConnectionState, type CursorMetadata, type WebRTCStats } from "@/lib/webrtc-client";
+import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
 
 // ── Helper Functions ────────────────────────────────────────────────────────
@@ -40,6 +41,59 @@ function getModifiers(e: KeyboardEvent): number {
   if (e.getModifierState("CapsLock")) modifiers |= 0x0010;
   if (e.getModifierState("NumLock")) modifiers |= 0x0020;
   return modifiers;
+}
+
+function CursorOverlay({
+  cursor,
+  layout,
+}: {
+  cursor: CursorMetadata;
+  layout: { width: number; height: number; boxWidth: number; boxHeight: number } | null;
+}) {
+  const bitmap = cursor.bitmap;
+  const source = useMemo(() => {
+    if (!bitmap || typeof document === "undefined") return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) return null;
+    const encoded = atob(bitmap.pixels);
+    if (encoded.length < bitmap.stride * bitmap.height) return null;
+    const sourcePixels = Uint8Array.from(encoded, (character) => character.charCodeAt(0));
+    const rgba = new Uint8ClampedArray(bitmap.width * bitmap.height * 4);
+    for (let y = 0; y < bitmap.height; y++) {
+      rgba.set(sourcePixels.subarray(y * bitmap.stride, y * bitmap.stride + bitmap.width * 4), y * bitmap.width * 4);
+    }
+    context.putImageData(new ImageData(rgba, bitmap.width, bitmap.height), 0, 0);
+    return canvas.toDataURL();
+  }, [bitmap]);
+
+  if (!cursor.position || !bitmap || !source || !layout) return null;
+  const geometry = getContainedVideoGeometry(layout.boxWidth, layout.boxHeight, layout.width, layout.height);
+  if (!geometry) return null;
+  const placement = mapCursorToVideo(
+    cursor.position,
+    geometry,
+    layout.width,
+    layout.height,
+    bitmap.width,
+    bitmap.height,
+  );
+  return (
+    <img
+      src={source}
+      alt=""
+      aria-hidden="true"
+      className="pointer-events-none absolute"
+      style={{
+        left: placement.left,
+        top: placement.top,
+        width: placement.width,
+        height: placement.height,
+      }}
+    />
+  );
 }
 
 // ── Icons (inline SVG) ──────────────────────────────────────────────────────
@@ -132,6 +186,18 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [pointerLockEnabled, setPointerLockEnabled] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
+  const [cursor, setCursor] = useState<CursorMetadata>({
+    position: null,
+    hotspot: [0, 0],
+    bitmap: null,
+  });
+  const [videoHovered, setVideoHovered] = useState(false);
+  const [videoLayout, setVideoLayout] = useState<{
+    width: number;
+    height: number;
+    boxWidth: number;
+    boxHeight: number;
+  } | null>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heldKeys = useRef(new Map<string, { scan_code: number; key_code: number }>());
   const heldButtons = useRef(new Set<"Left" | "Right" | "Middle" | "Back" | "Forward">());
@@ -209,6 +275,13 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
       }
     };
     client.onStats = setStats;
+    client.onCursor = (next) => {
+      setCursor((previous) => ({
+        position: next.position,
+        hotspot: next.hotspot,
+        bitmap: next.bitmap ?? previous.bitmap,
+      }));
+    };
     client.connect().catch(console.error);
     const container = containerRef.current;
     return () => {
@@ -218,6 +291,28 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
       clientRef.current = null;
     };
   }, [machine.id, releaseAllInput]);
+
+  useEffect(() => {
+    const updateLayout = () => {
+      const video = videoRef.current;
+      if (!video) return;
+      const rect = video.getBoundingClientRect();
+      setVideoLayout({
+        width: video.videoWidth,
+        height: video.videoHeight,
+        boxWidth: rect.width,
+        boxHeight: rect.height,
+      });
+    };
+    updateLayout();
+    const video = videoRef.current;
+    video?.addEventListener("loadedmetadata", updateLayout);
+    window.addEventListener("resize", updateLayout);
+    return () => {
+      video?.removeEventListener("loadedmetadata", updateLayout);
+      window.removeEventListener("resize", updateLayout);
+    };
+  }, [isFullscreen]);
 
   useEffect(() => {
     const h = () => setIsFullscreen(!!document.fullscreenElement);
@@ -256,31 +351,20 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     const video = videoRef.current;
     const rect = video.getBoundingClientRect();
     
-    // Calculate the actual rendered video rectangle (accounting for object-contain)
-    const videoRatio = video.videoWidth / video.videoHeight;
-    const elementRatio = rect.width / rect.height;
-    
-    let renderWidth = rect.width;
-    let renderHeight = rect.height;
-    let offsetX = 0;
-    let offsetY = 0;
+    const geometry = getContainedVideoGeometry(
+      rect.width,
+      rect.height,
+      video.videoWidth,
+      video.videoHeight,
+    );
+    if (!geometry) return null;
 
-    if (elementRatio > videoRatio) {
-      // Element is wider than video - pillars (black bars on sides)
-      renderWidth = rect.height * videoRatio;
-      offsetX = (rect.width - renderWidth) / 2;
-    } else {
-      // Element is taller than video - letterbox (black bars on top/bottom)
-      renderHeight = rect.width / videoRatio;
-      offsetY = (rect.height - renderHeight) / 2;
-    }
-
-    const relativeX = e.clientX - rect.left - offsetX;
-    const relativeY = e.clientY - rect.top - offsetY;
+    const relativeX = e.clientX - rect.left - geometry.offsetX;
+    const relativeY = e.clientY - rect.top - geometry.offsetY;
 
     // Normalize and clamp to 0.0 - 1.0
-    const x = Math.max(0, Math.min(1, relativeX / renderWidth));
-    const y = Math.max(0, Math.min(1, relativeY / renderHeight));
+    const x = Math.max(0, Math.min(1, relativeX / geometry.renderWidth));
+    const y = Math.max(0, Math.min(1, relativeY / geometry.renderHeight));
 
     // If click is outside the video content (in the black bars), we might want to ignore it?
     // Or just clamping is enough. Clamping is safer.
@@ -518,9 +602,13 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         onMouseUp={handleMouseUp}
         onClick={handleSurfaceClick}
         onContextMenu={(e) => e.preventDefault()}
-        style={{ cursor: isPointerLocked || !showControls ? "none" : "default" }}
+        style={{ cursor: isPointerLocked || !showControls || (connectionState === "connected" && videoHovered) ? "none" : "default" }}
       >
-        <div className="absolute inset-0 bg-black">
+        <div
+          className="absolute inset-0 bg-black"
+          onMouseEnter={() => setVideoHovered(true)}
+          onMouseLeave={() => setVideoHovered(false)}
+        >
           <video
             ref={videoRef}
             autoPlay
@@ -528,6 +616,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
             muted
             className="absolute inset-0 h-full w-full object-contain bg-black pointer-events-none"
           />
+          <CursorOverlay cursor={cursor} layout={videoLayout} />
         </div>
 
         {/* Top bar */}
