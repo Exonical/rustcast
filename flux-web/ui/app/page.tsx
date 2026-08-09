@@ -287,11 +287,14 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     return { x, y };
   }, []);
 
-  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    // Show controls logic
+  const revealControls = useCallback(() => {
     setShowControls(true);
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => setShowControls(false), 3000);
+  }, []);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    revealControls();
 
     // Input capture
     if (!clientRef.current || !videoRef.current) return;
@@ -309,7 +312,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     } else {
       queueMove({ absolute: true, x: coords.x, y: coords.y });
     }
-  }, [getNormalizedCoords, isPointerLocked, queueMove]);
+  }, [getNormalizedCoords, isPointerLocked, queueMove, revealControls]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (!clientRef.current) return;
@@ -365,6 +368,18 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     container.addEventListener("wheel", handleWheel, { passive: false });
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const handleTouchStart = (e: TouchEvent) => {
+      revealControls();
+      if (!(e.target instanceof Element) || e.target.closest("button")) return;
+      e.preventDefault();
+    };
+    container.addEventListener("touchstart", handleTouchStart, { passive: false });
+    return () => container.removeEventListener("touchstart", handleTouchStart);
+  }, [revealControls]);
 
   const handleSurfaceClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (
