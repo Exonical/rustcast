@@ -28,6 +28,10 @@ pub struct FluxConfig {
 
     /// Security / crypto settings.
     pub security: SecurityConfig,
+
+    /// Optional relay registration settings.
+    #[serde(default)]
+    pub relay: RelayConfig,
 }
 
 impl FluxConfig {
@@ -59,8 +63,16 @@ impl Default for FluxConfig {
             audio: AudioConfig::default(),
             input: InputConfig::default(),
             security: SecurityConfig::default(),
+            relay: RelayConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayConfig {
+    /// Base URL of the Flux web relay, for example http://relay:8080.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

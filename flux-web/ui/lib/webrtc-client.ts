@@ -61,7 +61,7 @@ export class WebRTCClient {
 
   private signalingUrl: string;
 
-  constructor(signalingUrl?: string) {
+  constructor(signalingUrl?: string, private readonly machineId?: string) {
     if (signalingUrl) {
       this.signalingUrl = signalingUrl;
     } else {
@@ -114,7 +114,10 @@ export class WebRTCClient {
         try {
           const offer = await this.pc!.createOffer();
           await this.pc!.setLocalDescription(offer);
-          this.ws!.send(JSON.stringify({ type: "offer", data: { sd: offer.sdp } }));
+          this.ws!.send(JSON.stringify({
+            type: "offer",
+            data: { sd: offer.sdp, ...(this.machineId ? { machine_id: this.machineId } : {}) },
+          }));
           resolve();
         } catch (err) {
           reject(err);

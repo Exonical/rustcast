@@ -7,17 +7,16 @@ import (
 	"time"
 )
 
-// abr adapts the upstream encoder bitrate to what the viewer's link actually
+// abrState adapts the upstream encoder bitrate for one machine to what its viewer's link actually
 // sustains. It watches RTCP receiver reports from the browser: sustained loss
 // means the WiFi link is saturated, so the encoder target is cut (multiplicative
 // decrease); after a clean period it is raised back gradually (additive
 // increase) toward the highest rate ever observed working. Targets are sent
 // upstream as command 0x03 [4-byte BE kbps], which flux-server applies live
 // via the encoder's set_bitrate.
-var abr = &abrState{}
-
 type abrState struct {
-	mu sync.Mutex
+	mu          sync.Mutex
+	commandChan chan []byte
 
 	bytesReceived uint64    // video bytes since last sample
 	sampleStart   time.Time // start of current measurement window
@@ -90,7 +89,7 @@ func (a *abrState) onReceiverReport(fractionLost float64) {
 		a.targetKbps = target
 		a.lastDecrease = now
 		log.Printf("[abr] loss %.1f%% → lowering encoder bitrate to %d kbps", fractionLost*100, target)
-		sendBitrateCommand(target)
+		a.sendBitrateCommand(target)
 		return
 	}
 
@@ -112,16 +111,16 @@ func (a *abrState) onReceiverReport(fractionLost float64) {
 		a.targetKbps = target
 		a.lastIncrease = now
 		log.Printf("[abr] link clean → raising encoder bitrate to %d kbps", target)
-		sendBitrateCommand(target)
+		a.sendBitrateCommand(target)
 	}
 }
 
-func sendBitrateCommand(kbps uint32) {
+func (a *abrState) sendBitrateCommand(kbps uint32) {
 	cmd := make([]byte, 5)
 	cmd[0] = 0x03
 	binary.BigEndian.PutUint32(cmd[1:], kbps)
 	select {
-	case upstreamCommandChan <- cmd:
+	case a.commandChan <- cmd:
 	default:
 	}
 }

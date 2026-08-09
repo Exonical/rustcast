@@ -81,7 +81,29 @@ const WifiOffIcon = () => (
 
 // ── Main Component ──────────────────────────────────────────────────────────
 
-export default function StreamViewer() {
+type Machine = {
+  id: string;
+  name: string;
+  display_name?: string;
+  status: "online" | "offline";
+  os?: string;
+  gpu_vendor?: string;
+  encoder_backend?: string;
+  virtual_display: boolean;
+  width?: number;
+  height?: number;
+  target_fps?: number;
+};
+
+export default function App() {
+  const [selectedMachine, setSelectedMachine] = useState<Machine | null>(null);
+  if (selectedMachine) {
+    return <StreamViewer machine={selectedMachine} onBack={() => setSelectedMachine(null)} />;
+  }
+  return <MachinePicker onSelect={setSelectedMachine} />;
+}
+
+function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<WebRTCClient | null>(null);
@@ -156,7 +178,7 @@ export default function StreamViewer() {
 
   // WebRTC client
   useEffect(() => {
-    const client = new WebRTCClient();
+    const client = new WebRTCClient(undefined, machine.id);
     clientRef.current = client;
     client.onStateChange = (state) => {
       setConnectionState(state);
@@ -178,7 +200,7 @@ export default function StreamViewer() {
       client.disconnect();
       clientRef.current = null;
     };
-  }, [releaseAllInput]);
+  }, [machine.id, releaseAllInput]);
 
   useEffect(() => {
     const h = () => setIsFullscreen(!!document.fullscreenElement);
@@ -462,6 +484,9 @@ export default function StreamViewer() {
               <div className={`w-2 h-2 rounded-full pulse-dot ${dotColor}`} />
               <span className={`text-xs font-medium capitalize ${textColor}`}>{connectionState}</span>
             </div>
+            <button onClick={onBack} className="ml-2 text-xs text-zinc-400 hover:text-white">
+              Machines
+            </button>
           </div>
 
           {/* Controls */}
@@ -542,6 +567,93 @@ export default function StreamViewer() {
         )}
       </div>
     </Tooltip.Provider>
+  );
+}
+
+function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
+  const [machines, setMachines] = useState<Machine[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const response = await fetch("/api/machines", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setMachines((await response.json()) as Machine[]);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load machines");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const initial = window.setTimeout(() => void refresh(), 0);
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [refresh]);
+
+  return (
+    <main className="min-h-screen bg-black text-zinc-100 px-6 py-12">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex items-center justify-between mb-8">
+          <div className="flex items-center gap-3">
+            <span className="text-[var(--color-accent)]"><MonitorIcon /></span>
+            <div>
+              <h1 className="text-xl font-semibold">Flux Stream</h1>
+              <p className="text-sm text-zinc-500">Choose a machine to view</p>
+            </div>
+          </div>
+          <button onClick={() => void refresh()} className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800">
+            <RefreshIcon />
+          </button>
+        </div>
+        {loading ? (
+          <div className="glass rounded-2xl p-8 text-center text-zinc-400">Loading machines...</div>
+        ) : error ? (
+          <div className="glass rounded-2xl p-8 text-center">
+            <p className="text-red-400 mb-4">Could not reach the machine registry.</p>
+            <p className="text-sm text-zinc-500 mb-4">{error}</p>
+            <button onClick={() => void refresh()} className="px-4 py-2 rounded-lg bg-[var(--color-accent)] text-sm">Retry</button>
+          </div>
+        ) : machines.length === 0 ? (
+          <div className="glass rounded-2xl p-8 text-center text-zinc-400">No machines have registered yet.</div>
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2">
+            {machines.map((machine) => {
+              const online = machine.status === "online";
+              return (
+                <button
+                  key={machine.id}
+                  disabled={!online}
+                  onClick={() => onSelect(machine)}
+                  className={`glass rounded-2xl p-5 text-left transition ${online ? "hover:bg-zinc-800/80" : "opacity-50 cursor-not-allowed"}`}
+                >
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="font-semibold truncate">{machine.name}</h2>
+                    <span className={`text-xs ${online ? "text-emerald-400" : "text-zinc-500"}`}>
+                      {online ? "Online" : "Offline"}
+                    </span>
+                  </div>
+                  <div className="space-y-1 text-xs text-zinc-400">
+                    {machine.display_name && <p>Display: {machine.display_name}</p>}
+                    {machine.os && <p>OS: {machine.os}</p>}
+                    {machine.gpu_vendor && <p>GPU: {machine.gpu_vendor}</p>}
+                    {machine.encoder_backend && <p>Encoder: {machine.encoder_backend}</p>}
+                    {(machine.width && machine.height) && <p>Display: {machine.width}×{machine.height}{machine.target_fps ? ` @ ${machine.target_fps} FPS` : ""}</p>}
+                    <p>{machine.virtual_display ? "Virtual display" : "Physical display"}</p>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </main>
   );
 }
 
