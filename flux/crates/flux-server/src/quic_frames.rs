@@ -17,9 +17,11 @@ use std::time::Duration;
 use flux_crypto::CertificateManager;
 
 #[cfg(target_os = "windows")]
-use crate::ccd_display::PrivacyController;
+use crate::ccd_display::{PrivacyConnection, PrivacyController};
 #[cfg(not(target_os = "windows"))]
 type PrivacyController = ();
+#[cfg(not(target_os = "windows"))]
+type PrivacyConnection = ();
 
 pub const ALPN: &[u8] = b"flux-frames";
 
@@ -83,6 +85,14 @@ async fn handle_connection(
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &privacy_controller;
+    #[cfg(target_os = "windows")]
+    let privacy_connection = privacy_controller
+        .as_ref()
+        .map(|privacy| privacy.connection());
+    #[cfg(not(target_os = "windows"))]
+    let privacy_connection = None;
     let control_conn = connection.clone();
     let control = tokio::spawn(async move {
         loop {
@@ -93,8 +103,8 @@ async fn handle_connection(
             let idr_tx = idr_tx.clone();
             let bitrate_tx = bitrate_tx.clone();
             let input_tx = input_tx.clone();
-            let privacy_controller = privacy_controller.clone();
-            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx, privacy_controller));
+            let privacy_connection = privacy_connection.clone();
+            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx, privacy_connection));
         }
     });
 
@@ -137,10 +147,10 @@ async fn read_commands(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
-    privacy_controller: Option<PrivacyController>,
+    privacy_connection: Option<PrivacyConnection>,
 ) {
     #[cfg(not(target_os = "windows"))]
-    let _ = &privacy_controller;
+    let _ = &privacy_connection;
     loop {
         let mut cmd = [0u8; 1];
         if recv.read_exact(&mut cmd).await.is_err() {
@@ -189,8 +199,8 @@ async fn read_commands(
                 let count = u32::from_be_bytes(count_buf);
                 tracing::info!("QUIC client reported {} viewer(s)", count);
                 #[cfg(target_os = "windows")]
-                if let Some(privacy) = privacy_controller.as_ref() {
-                    if let Err(error) = privacy.update_viewer_count(count) {
+                if let Some(privacy) = privacy_connection.as_ref() {
+                    if let Err(error) = privacy.update(count) {
                         tracing::error!("Privacy mode viewer-count update failed: {error}");
                     }
                 }

@@ -213,10 +213,7 @@ func (r *machineRegistry) release(m *machineUpstream) {
 		log.Printf("[frame:%s] upstream command channel full, dropped viewer count %d", m.id, viewerCount)
 	}
 	if stop {
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			m.stop()
-		}()
+		m.stop()
 	}
 }
 

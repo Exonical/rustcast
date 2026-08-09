@@ -81,8 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("privacy_topology.bin");
-        ccd_display::recover_snapshot(&privacy_snapshot_path)
-            .map_err(|error| format!("recover privacy display topology: {error}"))?;
+        ccd_display::recover_snapshot(&privacy_snapshot_path);
     }
     if config.video.privacy.enabled && config.video.virtual_display.is_none() {
         return Err(
@@ -492,6 +491,8 @@ async fn frame_server(
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &privacy_controller;
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
@@ -517,9 +518,14 @@ async fn frame_server(
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
         let input_tx = input_tx.clone();
-        let privacy_controller = privacy_controller.clone();
+        #[cfg(target_os = "windows")]
+        let privacy_connection = privacy_controller
+            .as_ref()
+            .map(|privacy| privacy.connection());
         #[cfg(not(target_os = "windows"))]
-        let _ = &privacy_controller;
+        let privacy_connection: Option<()> = None;
+        #[cfg(not(target_os = "windows"))]
+        let _ = &privacy_connection;
 
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -527,7 +533,9 @@ async fn frame_server(
             let mut frames_sent: u64 = 0;
 
             // Spawn reader task to handle upstream commands
-            let reader_handle = tokio::spawn(async move {
+            let mut reader_handle = tokio::spawn(async move {
+                #[cfg(target_os = "windows")]
+                let privacy_connection = privacy_connection;
                 loop {
                     // Read command byte
                     let mut cmd = [0u8; 1];
@@ -599,8 +607,8 @@ async fn frame_server(
                             let count = u32::from_be_bytes(count_buf);
                             tracing::info!("Client {} reported {} viewer(s)", addr, count);
                             #[cfg(target_os = "windows")]
-                            if let Some(privacy) = privacy_controller.as_ref() {
-                                if let Err(error) = privacy.update_viewer_count(count) {
+                            if let Some(privacy) = privacy_connection.as_ref() {
+                                if let Err(error) = privacy.update(count) {
                                     tracing::error!(
                                         "Privacy mode viewer-count update failed: {error}"
                                     );
@@ -617,13 +625,19 @@ async fn frame_server(
             });
 
             loop {
-                let msg = match rx.recv().await {
-                    Ok(d) => d,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Frame client {} lagged by {} frames", addr, n);
-                        continue;
+                let msg = tokio::select! {
+                    result = &mut reader_handle => {
+                        let _ = result;
+                        break;
                     }
-                    Err(_) => break,
+                    result = rx.recv() => match result {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Frame client {} lagged by {} frames", addr, n);
+                            continue;
+                        }
+                        Err(_) => break,
+                    },
                 };
                 let (ts_micros, data) = (msg.0, &msg.1);
 
@@ -917,7 +931,28 @@ fn capture_loop(
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("Capture error: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                let _ = session.stop();
+                drop(session);
+                loop {
+                    match capture.start_capture(
+                        Some(primary.id),
+                        primary.native_resolution,
+                        target_fps,
+                    ) {
+                        Ok(new_session) => {
+                            session = new_session;
+                            tracing::info!("Capture session recreated after capture loss");
+                            break;
+                        }
+                        Err(restart_error) => {
+                            tracing::warn!(
+                                "Capture session recreation failed: {}; retrying",
+                                restart_error
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                }
                 continue;
             }
         };
