@@ -67,6 +67,19 @@ type Session struct {
 	machine        *machineUpstream
 	release        func()
 	releaseOnce    sync.Once
+	cursorChan     chan cursorMsg
+	cursorDone     chan struct{}
+}
+
+type wsWriter struct {
+	mu sync.Mutex
+	ws *websocket.Conn
+}
+
+func (w *wsWriter) write(messageType int, payload []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ws.WriteMessage(messageType, payload)
 }
 
 // frameMsg is one encoded H.264 access unit plus the capture timestamp
@@ -74,6 +87,11 @@ type Session struct {
 // timestamp lets the pusher pace playout by true capture spacing instead of
 // bursty network arrival time.
 type frameMsg struct {
+	tsMicros uint64
+	data     []byte
+}
+
+type cursorMsg struct {
 	tsMicros uint64
 	data     []byte
 }
@@ -215,6 +233,8 @@ func newSession() (*Session, error) {
 	}
 
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack}
+	session.cursorChan = make(chan cursorMsg, 1)
+	session.cursorDone = make(chan struct{})
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
 	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
@@ -246,6 +266,7 @@ func (s *Session) releaseNow() {
 		if s.release != nil {
 			s.release()
 		}
+		close(s.cursorDone)
 	})
 }
 
@@ -331,6 +352,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 		return
 	}
 	defer ws.Close()
+	writer := &wsWriter{ws: ws}
 
 	log.Printf("[ws] client connected: %s", c.ClientIP())
 	var session *Session
@@ -359,7 +381,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			var offerData OfferData
 			if err := json.Unmarshal(msg.Data, &offerData); err != nil {
 				log.Printf("[ws] parse offer error: %v", err)
-				sendWSError(ws, "Invalid offer")
+				sendWSError(writer, "Invalid offer")
 				continue
 			}
 
@@ -371,14 +393,14 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			}
 			upstream, err := registry.acquire(machineID)
 			if err != nil {
-				sendWSError(ws, err.Error()+": "+machineID)
+				sendWSError(writer, err.Error()+": "+machineID)
 				continue
 			}
 
 			next, err := newSession()
 			if err != nil {
 				registry.release(upstream)
-				sendWSError(ws, "Failed to create session")
+				sendWSError(writer, "Failed to create session")
 				continue
 			}
 
@@ -394,6 +416,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				session.PeerConnection.Close()
 			}
 			session = next
+			go forwardCursorUpdates(writer, next)
 			next.needsIDR = true
 
 			next.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -402,7 +425,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				}
 				data, _ := json.Marshal(candidate.ToJSON())
 				resp, _ := json.Marshal(WSMessage{Type: "new-ice-candidate", Data: data})
-				_ = ws.WriteMessage(websocket.TextMessage, resp)
+				_ = writer.write(websocket.TextMessage, resp)
 			})
 
 			answerSDP, err := exchangeOffer(next, offerData.SDP)
@@ -410,7 +433,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				log.Printf("[ws] exchange offer error: %v", err)
 				next.releaseNow()
 				next.PeerConnection.Close()
-				sendWSError(ws, "Failed to exchange offer")
+				sendWSError(writer, "Failed to exchange offer")
 				continue
 			}
 
@@ -421,7 +444,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			}
 			answerData, _ := json.Marshal(map[string]string{"sd": answerSDP})
 			resp, _ := json.Marshal(WSMessage{Type: "answer", Data: answerData})
-			_ = ws.WriteMessage(websocket.TextMessage, resp)
+			_ = writer.write(websocket.TextMessage, resp)
 			log.Printf("[ws] sent answer to %s", c.ClientIP())
 		case "new-ice-candidate":
 			var candidate webrtc.ICECandidateInit
@@ -433,7 +456,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 
 		case "input":
 			if session == nil || session.machine == nil {
-				sendWSError(ws, "No active machine session")
+				sendWSError(writer, "No active machine session")
 				continue
 			}
 			payload := []byte(msg.Data)
@@ -453,10 +476,35 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 	}
 }
 
-func sendWSError(ws *websocket.Conn, msg string) {
+func sendWSError(writer *wsWriter, msg string) {
 	data, _ := json.Marshal(map[string]string{"error": msg})
 	resp, _ := json.Marshal(WSMessage{Type: "error", Data: data})
-	_ = ws.WriteMessage(websocket.TextMessage, resp)
+	_ = writer.write(websocket.TextMessage, resp)
+}
+
+func forwardCursorUpdates(writer *wsWriter, session *Session) {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+	var latest *cursorMsg
+	for {
+		select {
+		case <-session.cursorDone:
+			return
+		case msg := <-session.cursorChan:
+			latest = &msg
+		case <-ticker.C:
+			if latest == nil {
+				continue
+			}
+			resp, err := json.Marshal(WSMessage{Type: "cursor", Data: json.RawMessage(latest.data)})
+			if err == nil {
+				if err := writer.write(websocket.TextMessage, resp); err != nil {
+					return
+				}
+			}
+			latest = nil
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

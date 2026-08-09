@@ -17,6 +17,20 @@ export interface WebRTCStats {
   bitrate: number;
 }
 
+export interface CursorBitmap {
+  width: number;
+  height: number;
+  stride: number;
+  format: number;
+  pixels: number[];
+}
+
+export interface CursorMetadata {
+  position: [number, number] | null;
+  hotspot: [number, number];
+  bitmap: CursorBitmap | null;
+}
+
 interface WSMessage {
   type: string;
   data: unknown;
@@ -58,6 +72,7 @@ export class WebRTCClient {
   onStateChange: ((state: ConnectionState) => void) | null = null;
   onStream: ((stream: MediaStream) => void) | null = null;
   onStats: ((stats: WebRTCStats) => void) | null = null;
+  onCursor: ((cursor: CursorMetadata) => void) | null = null;
 
   private signalingUrl: string;
 
@@ -139,6 +154,8 @@ export class WebRTCClient {
             if (this.remoteDescSet) await this.pc!.addIceCandidate(candidate);
             else this.pendingCandidates.push(candidate);
           }
+        } else if (msg.type === "cursor") {
+          this.onCursor?.(msg.data as CursorMetadata);
         }
       };
 

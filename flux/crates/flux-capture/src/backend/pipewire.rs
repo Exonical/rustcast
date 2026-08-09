@@ -10,7 +10,7 @@ use flux_core::frame::CapturedFrame;
 use flux_core::types::PixelFormat;
 use flux_core::types::Resolution;
 
-use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
+use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
 
 /// Placeholder display id returned by [`PipeWireCapture::enumerate_displays`]
 /// until it can report real per-output PipeWire node ids. It is *not* a real
@@ -63,6 +63,7 @@ impl ScreenCapture for PipeWireCapture {
         display_id: Option<u32>,
         resolution: Resolution,
         framerate: u32,
+        _cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>> {
         tracing::info!(
             "Starting PipeWire capture on display {:?} at {}@{}fps",

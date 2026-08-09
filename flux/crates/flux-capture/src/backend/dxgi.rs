@@ -4,11 +4,13 @@
 //! the GPU. Provides both a GPU zero-copy path (shared texture handle for
 //! hardware encoders) and a CPU fallback path (staging texture map/read).
 
+use flux_core::cursor::{CursorBitmap, CursorMetadata};
 use flux_core::error::{FluxError, Result};
 use flux_core::frame::CapturedFrame;
 use flux_core::types::{PixelFormat, Resolution};
 
-use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
+use crate::cursor::{convert_dxgi_pointer_shape, scale_cursor_bitmap};
+use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -382,6 +384,7 @@ impl ScreenCapture for DxgiCapture {
         display_id: Option<u32>,
         resolution: Resolution,
         framerate: u32,
+        cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>> {
         let display_id = display_id.unwrap_or(0);
         let state = self
@@ -412,6 +415,7 @@ impl ScreenCapture for DxgiCapture {
             display_id,
             resolution,
             framerate,
+            cursor_sink,
         )?))
     }
 }
@@ -583,6 +587,11 @@ struct DxgiCaptureSession {
     last_frame_time: std::time::Instant,
     last_delivery: std::time::Instant,
     has_copied_frame: bool,
+    cursor_sink: Option<CursorUpdateSink>,
+    cursor_bitmap: Option<CursorBitmap>,
+    cursor_hotspot: (i32, i32),
+    cursor_scale_x: f32,
+    cursor_scale_y: f32,
 }
 
 struct AcquiredFrame {
@@ -638,6 +647,7 @@ impl DxgiCaptureSession {
         display_id: u32,
         requested_resolution: Resolution,
         framerate: u32,
+        cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Self> {
         unsafe {
             // Need IDXGIOutput1 for DuplicateOutput
@@ -722,7 +732,92 @@ impl DxgiCaptureSession {
                 last_frame_time: std::time::Instant::now(),
                 last_delivery: std::time::Instant::now(),
                 has_copied_frame: false,
+                cursor_sink,
+                cursor_bitmap: None,
+                cursor_hotspot: (0, 0),
+                cursor_scale_x: output.width as f32 / desktop.width.max(1) as f32,
+                cursor_scale_y: output.height as f32 / desktop.height.max(1) as f32,
             })
+        }
+    }
+
+    fn process_pointer_update(&mut self, frame_info: &DXGI_OUTDUPL_FRAME_INFO) {
+        if frame_info.LastMouseUpdateTime == 0 {
+            return;
+        }
+
+        if frame_info.PointerShapeBufferSize != 0 {
+            let size = frame_info.PointerShapeBufferSize as usize;
+            if size > 1024 * 1024 {
+                tracing::warn!("DXGI cursor shape is too large: {} bytes", size);
+            } else {
+                let mut data = vec![0u8; size];
+                let mut required = 0u32;
+                let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                let result = unsafe {
+                    self.duplication.GetFramePointerShape(
+                        size as u32,
+                        data.as_mut_ptr().cast(),
+                        &mut required,
+                        &mut info,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        if let Some(bitmap) = convert_dxgi_pointer_shape(
+                            info.Type,
+                            info.Width,
+                            info.Height,
+                            info.Pitch,
+                            &data[..if required == 0 {
+                                size
+                            } else {
+                                required.min(size as u32) as usize
+                            }],
+                        ) {
+                            self.cursor_bitmap = Some(scale_cursor_bitmap(
+                                &bitmap,
+                                self.cursor_scale_x,
+                                self.cursor_scale_y,
+                            ));
+                            self.cursor_hotspot = (
+                                (info.HotSpot.x as f32 * self.cursor_scale_x).round() as i32,
+                                (info.HotSpot.y as f32 * self.cursor_scale_y).round() as i32,
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Failed to convert DXGI cursor shape type={} {}x{} pitch={} required={}",
+                                info.Type,
+                                info.Width,
+                                info.Height,
+                                info.Pitch,
+                                required
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!("GetFramePointerShape failed: {}", error),
+                }
+            }
+        }
+
+        let metadata = if frame_info.PointerPosition.Visible.as_bool() {
+            CursorMetadata {
+                position: Some((
+                    (frame_info.PointerPosition.Position.x as f32 * self.cursor_scale_x).round() as i32,
+                    (frame_info.PointerPosition.Position.y as f32 * self.cursor_scale_y).round() as i32,
+                )),
+                hotspot: self.cursor_hotspot,
+                bitmap: if frame_info.PointerShapeBufferSize != 0 {
+                    self.cursor_bitmap.clone()
+                } else {
+                    None
+                },
+            }
+        } else {
+            CursorMetadata::hidden()
+        };
+        if let Some(sink) = &self.cursor_sink {
+            sink(metadata);
         }
     }
 
@@ -790,6 +885,11 @@ impl DxgiCaptureSession {
 
             let frame_guard = AcquiredFrame::new(&self.duplication);
             let resource = resource.ok_or_else(|| FluxError::Capture("Frame resource is null".into()))?;
+
+            // Pointer metadata is independent of desktop-pixel presents. Read
+            // it before unchanged-frame suppression so cursor-only updates are
+            // delivered without becoming video frames.
+            self.process_pointer_update(&frame_info);
 
             // LastPresentTime == 0 means the desktop image was unchanged since the last acquisition.
             if frame_info.LastPresentTime == 0

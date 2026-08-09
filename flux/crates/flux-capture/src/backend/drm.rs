@@ -8,7 +8,7 @@ use flux_core::error::{FluxError, Result};
 use flux_core::frame::CapturedFrame;
 use flux_core::types::{PixelFormat, Resolution};
 
-use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
+use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
 
 /// DRM/KMS direct framebuffer capture backend.
 pub struct DrmCapture {
@@ -51,6 +51,7 @@ impl ScreenCapture for DrmCapture {
         display_id: Option<u32>,
         resolution: Resolution,
         framerate: u32,
+        _cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>> {
         let display_id = display_id.unwrap_or(0);
         tracing::info!(

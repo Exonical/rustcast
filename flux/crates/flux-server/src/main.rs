@@ -337,7 +337,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // capture start) so downstream playout can pace by true capture spacing
     // rather than bursty network arrival time.
     let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(8);
+    let (cursor_tx, _) = tokio::sync::watch::channel(Arc::new((
+        0u64,
+        flux_core::cursor::CursorMetadata::hidden(),
+    )));
     let h264_tx2 = h264_tx.clone();
+    let cursor_tx2 = cursor_tx.clone();
 
     // IDR request channel: Frame server (TCP) -> Capture thread
     let (idr_tx, idr_rx) = std::sync::mpsc::channel::<()>();
@@ -357,6 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             capture_loop(
                 h264_tx2,
+                cursor_tx2,
                 idr_rx,
                 bitrate_rx,
                 input_rx,
@@ -403,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(endpoint) => {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
                 let h264_tx = h264_tx.clone();
+                let cursor_rx = cursor_tx.subscribe();
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
                 let input_tx = input_tx.clone();
@@ -411,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     quic_frames::serve(
                         endpoint,
                         h264_tx,
+                        cursor_rx,
                         idr_tx,
                         bitrate_tx,
                         input_tx,
@@ -431,10 +439,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let frame_privacy_controller = privacy_controller.clone();
+    let cursor_rx = cursor_tx.subscribe();
     let frame_handle = tokio::spawn(async move {
         frame_server(
             frame_listener,
             h264_tx,
+            cursor_rx,
             idr_tx,
             bitrate_tx,
             input_tx,
@@ -483,10 +493,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
-/// Protocol: [8-byte BE capture-timestamp µs][4-byte BE length][H.264 data] per packet.
+/// Protocol: [1-byte type][8-byte BE capture-timestamp µs][4-byte BE length][payload].
+/// Type 0x01 is an H.264 access unit; type 0x02 is cursor JSON metadata.
 async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
@@ -516,6 +528,7 @@ async fn frame_server(
             tracing::debug!("DSCP not set (normal on Windows): {}", e);
         }
         let mut rx = h264_tx.subscribe();
+        let mut cursor_rx = cursor_rx.clone();
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
         let input_tx = input_tx.clone();
@@ -625,11 +638,51 @@ async fn frame_server(
                 }
             });
 
+            let initial_cursor = cursor_rx.borrow_and_update().clone();
+            let initial_payload = match serde_json::to_vec(&initial_cursor.1) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!("Failed to serialize initial cursor: {}", error);
+                    Vec::new()
+                }
+            };
+            if !initial_payload.is_empty() {
+                let mut header = [0u8; 13];
+                header[0] = 0x02;
+                header[1..9].copy_from_slice(&initial_cursor.0.to_be_bytes());
+                header[9..13].copy_from_slice(&(initial_payload.len() as u32).to_be_bytes());
+                if writer.write_all(&header).await.is_err()
+                    || writer.write_all(&initial_payload).await.is_err()
+                {
+                    reader_handle.abort();
+                    return;
+                }
+            }
+
             loop {
                 let msg = tokio::select! {
                     result = &mut reader_handle => {
                         let _ = result;
                         break;
+                    }
+                    result = cursor_rx.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        let cursor = cursor_rx.borrow_and_update().clone();
+                        let Ok(payload) = serde_json::to_vec(&cursor.1) else {
+                            continue;
+                        };
+                        let mut header = [0u8; 13];
+                        header[0] = 0x02;
+                        header[1..9].copy_from_slice(&cursor.0.to_be_bytes());
+                        header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+                        if writer.write_all(&header).await.is_err()
+                            || writer.write_all(&payload).await.is_err()
+                        {
+                            break;
+                        }
+                        continue;
                     }
                     result = rx.recv() => match result {
                         Ok(d) => d,
@@ -640,22 +693,13 @@ async fn frame_server(
                         Err(_) => break,
                     },
                 };
-                let (ts_micros, data) = (msg.0, &msg.1);
-
-                if data.is_empty() {
-                    continue;
-                }
-
-                // Write timestamped frame: [8-byte BE ts µs][4-byte BE len][data]
-                let ts_bytes = ts_micros.to_be_bytes();
-                let len_bytes = (data.len() as u32).to_be_bytes();
-                if writer.write_all(&ts_bytes).await.is_err() {
-                    break;
-                }
-                if writer.write_all(&len_bytes).await.is_err() {
-                    break;
-                }
-                if writer.write_all(data).await.is_err() {
+                let mut header = [0u8; 13];
+                header[0] = 0x01;
+                header[1..9].copy_from_slice(&msg.0.to_be_bytes());
+                header[9..13].copy_from_slice(&(msg.1.len() as u32).to_be_bytes());
+                if writer.write_all(&header).await.is_err()
+                    || writer.write_all(&msg.1).await.is_err()
+                {
                     break;
                 }
                 frames_sent += 1;
@@ -797,6 +841,7 @@ fn build_encode_session_for(
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    cursor_tx: tokio::sync::watch::Sender<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
@@ -859,6 +904,14 @@ fn capture_loop(
             return;
         }
     };
+    let loop_start = std::time::Instant::now();
+    let cursor_sink: flux_capture::traits::CursorUpdateSink = {
+        let cursor_tx = cursor_tx.clone();
+        Arc::new(move |metadata| {
+            let ts_micros = loop_start.elapsed().as_micros() as u64;
+            let _ = cursor_tx.send(Arc::new((ts_micros, metadata)));
+        })
+    };
 
     // Spawn a dedicated thread for input handling to ensure low latency
     // and avoid blocking the capture loop.
@@ -876,6 +929,7 @@ fn capture_loop(
         Some(primary.id),
         primary.native_resolution,
         target_fps,
+        Some(cursor_sink.clone()),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -906,8 +960,6 @@ fn capture_loop(
     );
 
     let mut frame_count: u64 = 0;
-    let loop_start = std::time::Instant::now();
-
     loop {
         // Check for IDR requests
         if let Ok(_) = idr_rx.try_recv() {
@@ -972,6 +1024,7 @@ fn capture_loop(
                         Some(refreshed.id),
                         refreshed.native_resolution,
                         target_fps,
+                        Some(cursor_sink.clone()),
                     ) {
                         Ok(new_session) => {
                             session = new_session;
@@ -1038,7 +1091,12 @@ fn capture_loop(
                 // DuplicateOutput fails while the old one is alive.
                 let _ = session.stop();
                 drop(session);
-                match capture.start_capture(Some(primary.id), encode_resolution, target_fps) {
+                match capture.start_capture(
+                    Some(primary.id),
+                    encode_resolution,
+                    target_fps,
+                    Some(cursor_sink.clone()),
+                ) {
                     Ok(s) => {
                         session = s;
                         capture_resolution = encode_resolution;
@@ -1054,6 +1112,7 @@ fn capture_loop(
                             Some(primary.id),
                             primary.native_resolution,
                             target_fps,
+                            Some(cursor_sink.clone()),
                         ) {
                             Ok(s) => s,
                             Err(e) => {

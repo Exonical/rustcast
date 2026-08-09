@@ -6,13 +6,17 @@
 //! latency and at the client's native resolution. These types are the
 //! platform-independent representation of that metadata; the PipeWire/SPA
 //! decoding lives in `flux-capture`.
+use serde::{Deserialize, Serialize};
 
 /// Cursor position and (optionally) shape for a single moment in time.
 ///
 /// A cursor update may carry only a new position (the common case, every
 /// frame) or also a new shape (`bitmap`), which changes far less often. When
 /// the cursor is hidden / cleared, `position` is `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+
+pub const CURSOR_FORMAT_RGBA8888: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorMetadata {
     /// Cursor position in the capture stream's coordinate space, or `None`
     /// when the cursor is hidden / has left the captured region.
@@ -29,7 +33,7 @@ pub struct CursorMetadata {
 }
 
 /// A cursor shape: raw pixels plus their geometry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorBitmap {
     /// Bitmap width in pixels.
     pub width: u32,

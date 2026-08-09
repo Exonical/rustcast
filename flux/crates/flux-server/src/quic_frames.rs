@@ -6,7 +6,8 @@
 //! stream using the same byte protocol as the TCP frame server.
 //!
 //! Stream formats:
-//!   frame (server→client uni): [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
+//!   frame (server→client uni): [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload]
+//!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
 //!                                | [0x03][4-byte BE target bitrate kbps]
 //!                                | [0x04][4-byte BE viewer count]
@@ -50,6 +51,7 @@ pub fn make_endpoint(
 pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
@@ -66,9 +68,11 @@ pub async fn serve(
         tracing::info!("QUIC frame client connected: {}", connection.remote_address());
 
         let rx = h264_tx.subscribe();
+        let cursor_rx = cursor_rx.clone();
         tokio::spawn(handle_connection(
             connection,
             rx,
+            cursor_rx,
             idr_tx.clone(),
             bitrate_tx.clone(),
             input_tx.clone(),
@@ -80,6 +84,7 @@ pub async fn serve(
 async fn handle_connection(
     connection: quinn::Connection,
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
+    mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
@@ -108,38 +113,71 @@ async fn handle_connection(
         }
     });
 
-    loop {
-        let frame = match rx.recv().await {
-            Ok(f) => f,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::debug!("QUIC frame sender lagged by {} frames", n);
-                continue;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        };
-
-        let mut stream = match connection.open_uni().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::info!("QUIC frame client disconnected: {}", e);
-                break;
-            }
-        };
-
-        let (ts, data) = (&frame.0, &frame.1);
-        let mut header = [0u8; 12];
-        header[0..8].copy_from_slice(&ts.to_be_bytes());
-        header[8..12].copy_from_slice(&(data.len() as u32).to_be_bytes());
-
-        if stream.write_all(&header).await.is_err() || stream.write_all(data).await.is_err() {
-            tracing::info!("QUIC frame write failed; client disconnected");
-            break;
+    let initial = cursor_rx.borrow_and_update().clone();
+    if let Ok(payload) = serde_json::to_vec(&initial.1) {
+        if !send_message(&connection, 0x02, initial.0, payload).await {
+            control.abort();
+            return;
         }
-        let _ = stream.finish();
+    }
+
+    loop {
+        tokio::select! {
+            result = rx.recv() => {
+                let frame = match result {
+                    Ok(f) => f,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("QUIC frame sender lagged by {} frames", n);
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if !send_message(&connection, 0x01, frame.0, frame.1.clone()).await {
+                    break;
+                }
+            }
+            result = cursor_rx.changed() => {
+                if result.is_err() {
+                    break;
+                }
+                let cursor = cursor_rx.borrow_and_update().clone();
+                let Ok(payload) = serde_json::to_vec(&cursor.1) else {
+                    continue;
+                };
+                if !send_message(&connection, 0x02, cursor.0, payload).await {
+                    break;
+                }
+            }
+        }
     }
 
     control.abort();
     connection.close(0u32.into(), b"done");
+}
+
+async fn send_message(
+    connection: &quinn::Connection,
+    message_type: u8,
+    ts: u64,
+    payload: Vec<u8>,
+) -> bool {
+    let mut stream = match connection.open_uni().await {
+        Ok(s) => s,
+        Err(error) => {
+            tracing::info!("QUIC frame client disconnected: {}", error);
+            return false;
+        }
+    };
+    let mut header = [0u8; 13];
+    header[0] = message_type;
+    header[1..9].copy_from_slice(&ts.to_be_bytes());
+    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    if stream.write_all(&header).await.is_err() || stream.write_all(&payload).await.is_err() {
+        tracing::info!("QUIC frame write failed; client disconnected");
+        return false;
+    }
+    let _ = stream.finish();
+    true
 }
 
 async fn read_commands(

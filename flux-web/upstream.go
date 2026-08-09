@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,7 @@ type machineUpstream struct {
 	id          string
 	addr        string
 	frameChan   chan frameMsg
+	cursorChan  chan cursorMsg
 	commandChan chan []byte
 	abr         *abrState
 	stopChan    chan struct{}
@@ -32,6 +34,7 @@ type machineUpstream struct {
 	viewerCount atomic.Uint32
 	mu          sync.Mutex
 	session     *Session
+	lastCursor  *cursorMsg
 	conn        net.Conn
 	cancel      context.CancelFunc
 	status      func(string)
@@ -65,6 +68,7 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 	u := &machineUpstream{
 		id: id, addr: addr,
 		frameChan:   make(chan frameMsg, 120),
+		cursorChan:  make(chan cursorMsg, 1),
 		commandChan: make(chan []byte, 100),
 		stopChan:    make(chan struct{}),
 		status:      status,
@@ -76,7 +80,46 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 func (u *machineUpstream) run() {
 	u.status("connecting")
 	go u.framePusher()
+	go u.cursorPusher()
 	u.connectFrameServer()
+}
+
+func (u *machineUpstream) cursorPusher() {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+	var latest *cursorMsg
+	for {
+		select {
+		case <-u.stopChan:
+			return
+		case msg := <-u.cursorChan:
+			latest = &msg
+			u.mu.Lock()
+			copy := msg
+			u.lastCursor = &copy
+			u.mu.Unlock()
+		case <-ticker.C:
+			if latest == nil {
+				continue
+			}
+			sess := u.currentSession()
+			if sess != nil {
+				select {
+				case sess.cursorChan <- *latest:
+				default:
+					select {
+					case <-sess.cursorChan:
+					default:
+					}
+					select {
+					case sess.cursorChan <- *latest:
+					default:
+					}
+				}
+			}
+			latest = nil
+		}
+	}
 }
 
 func (u *machineUpstream) stop() {
@@ -103,6 +146,21 @@ func (u *machineUpstream) send(cmd []byte) bool {
 	}
 }
 
+func (u *machineUpstream) sendCursor(msg cursorMsg) {
+	select {
+	case u.cursorChan <- msg:
+	default:
+		select {
+		case <-u.cursorChan:
+		default:
+		}
+		select {
+		case u.cursorChan <- msg:
+		default:
+		}
+	}
+}
+
 func (u *machineUpstream) sendViewerCount(count int) bool {
 	u.viewerCount.Store(uint32(count))
 	cmd := make([]byte, 5)
@@ -116,6 +174,12 @@ func (u *machineUpstream) bindSession(session *Session) *Session {
 	defer u.mu.Unlock()
 	old := u.session
 	u.session = session
+	if u.lastCursor != nil {
+		select {
+		case session.cursorChan <- *u.lastCursor:
+		default:
+		}
+	}
 	return old
 }
 
@@ -217,36 +281,46 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			return nil
 		default:
 		}
-		// Protocol: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
-		var hdr [12]byte
+		// Protocol: [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload].
+		// Type 0x01 is H.264; type 0x02 is cursor JSON metadata.
+		var hdr [13]byte
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 			return fmt.Errorf("read header: %w", err)
 		}
-		tsMicros := binary.BigEndian.Uint64(hdr[0:8])
-		frameLen := binary.BigEndian.Uint32(hdr[8:12])
-		if frameLen == 0 || frameLen > 10*1024*1024 {
-			return fmt.Errorf("invalid frame length: %d", frameLen)
+		messageType := hdr[0]
+		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
+		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
+		if payloadLen == 0 || payloadLen > 10*1024*1024 {
+			return fmt.Errorf("invalid frame length: %d", payloadLen)
 		}
-		// Read frame data.
-		data := make([]byte, frameLen)
+		data := make([]byte, payloadLen)
 		if _, err := io.ReadFull(conn, data); err != nil {
 			return fmt.Errorf("read frame data: %w", err)
 		}
-		frameCount++
-		u.abr.countFrameBytes(len(data))
-		if frameCount%300 == 0 {
-			log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, frameLen)
-		}
-		// Non-blocking send; drop oldest frame if channel is full.
-		select {
-		case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
-		default:
-			// Drop oldest frame if channel is full.
-			select {
-			case <-u.frameChan:
-			default:
+		switch messageType {
+		case 0x01:
+			frameCount++
+			u.abr.countFrameBytes(len(data))
+			if frameCount%300 == 0 {
+				log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
-			u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+			select {
+			case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
+			default:
+				select {
+				case <-u.frameChan:
+				default:
+				}
+				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+			}
+		case 0x02:
+			if !json.Valid(data) {
+				log.Printf("[frame:%s] invalid cursor JSON", u.id)
+				continue
+			}
+			u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
+		default:
+			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
 	}
 }
@@ -311,33 +385,43 @@ func (u *machineUpstream) connectQUIC() error {
 		if err != nil {
 			return fmt.Errorf("accept stream: %w", err)
 		}
-		// Frame stream: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
-		var hdr [12]byte
+		// Frame stream: [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload].
+		var hdr [13]byte
 		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
 			continue
 		}
-		tsMicros := binary.BigEndian.Uint64(hdr[0:8])
-		frameLen := binary.BigEndian.Uint32(hdr[8:12])
-		if frameLen == 0 || frameLen > 10*1024*1024 {
+		messageType := hdr[0]
+		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
+		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
+		if payloadLen == 0 || payloadLen > 10*1024*1024 {
 			continue
 		}
-		data := make([]byte, frameLen)
+		data := make([]byte, payloadLen)
 		if _, err := io.ReadFull(stream, data); err != nil {
 			continue
 		}
-		frameCount++
-		u.abr.countFrameBytes(len(data))
-		if frameCount%300 == 0 {
-			log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, frameLen)
-		}
-		select {
-		case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
-		default:
-			select {
-			case <-u.frameChan:
-			default:
+		switch messageType {
+		case 0x01:
+			frameCount++
+			u.abr.countFrameBytes(len(data))
+			if frameCount%300 == 0 {
+				log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
-			u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+			select {
+			case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
+			default:
+				select {
+				case <-u.frameChan:
+				default:
+				}
+				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+			}
+		case 0x02:
+			if json.Valid(data) {
+				u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
+			}
+		default:
+			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
 	}
 }
