@@ -13,6 +13,7 @@ const machineExpiry = 15 * time.Second
 type machineInfo struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
+	DisplayName    string    `json:"display_name,omitempty"`
 	FrameEndpoint  string    `json:"frame_endpoint"`
 	OS             string    `json:"os,omitempty"`
 	GPUVendor      string    `json:"gpu_vendor,omitempty"`
@@ -29,6 +30,7 @@ type machineInfo struct {
 type machineRegistration struct {
 	ID             string `json:"id" binding:"required"`
 	Name           string `json:"name" binding:"required"`
+	DisplayName    string `json:"display_name"`
 	FrameEndpoint  string `json:"frame_endpoint" binding:"required"`
 	OS             string `json:"os"`
 	GPUVendor      string `json:"gpu_vendor"`
@@ -85,7 +87,8 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 	}
 	m.machineInfo = machineInfo{
 		ID: input.ID, Name: input.Name, FrameEndpoint: input.FrameEndpoint,
-		OS: input.OS, GPUVendor: input.GPUVendor, EncoderBackend: input.EncoderBackend,
+		DisplayName: input.DisplayName,
+		OS:          input.OS, GPUVendor: input.GPUVendor, EncoderBackend: input.EncoderBackend,
 		VirtualDisplay: input.VirtualDisplay, Width: input.Width, Height: input.Height,
 		TargetFPS: input.TargetFPS, LastSeen: now, Status: "online",
 		UpstreamStatus: upstreamStatus,
@@ -96,52 +99,64 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 
 func (r *machineRegistry) get(id string) (*machineRecord, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	m := r.machines[id]
 	if m == nil {
+		r.mu.Unlock()
 		return nil, errMachineNotFound
 	}
+	var stale *machineUpstream
 	if !m.static && time.Since(m.LastSeen) > machineExpiry {
 		m.Status = "offline"
-		if m.upstream != nil {
-			m.upstream.stop()
+		stale = m.upstream
+		if stale != nil {
 			m.upstream = nil
 		}
 	}
 	if m.Status != "online" {
+		r.mu.Unlock()
+		if stale != nil {
+			stale.stop()
+		}
 		return nil, errMachineOffline
 	}
+	r.mu.Unlock()
 	return m, nil
 }
 
 func (r *machineRegistry) list() []machineInfo {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	result := make([]machineInfo, 0, len(r.machines))
+	var stale []*machineUpstream
 	for _, m := range r.machines {
 		if !m.static && time.Since(m.LastSeen) > machineExpiry {
 			m.Status = "offline"
 			if m.upstream != nil {
-				m.upstream.stop()
+				stale = append(stale, m.upstream)
 				m.upstream = nil
 			}
 		}
 		result = append(result, m.machineInfo)
+	}
+	r.mu.Unlock()
+	for _, upstream := range stale {
+		upstream.stop()
 	}
 	return result
 }
 
 func (r *machineRegistry) deregister(id string) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	m := r.machines[id]
 	if m == nil || m.static {
+		r.mu.Unlock()
 		return false
 	}
-	if m.upstream != nil {
-		m.upstream.stop()
-	}
+	upstream := m.upstream
 	delete(r.machines, id)
+	r.mu.Unlock()
+	if upstream != nil {
+		upstream.stop()
+	}
 	return true
 }
 
@@ -172,18 +187,22 @@ func (r *machineRegistry) setUpstreamStatus(id, status string) {
 
 func (r *machineRegistry) release(m *machineUpstream) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if m.viewers > 0 {
 		m.viewers--
 	}
+	stop := false
 	if m.viewers == 0 {
-		m.stop()
+		stop = true
 		for _, record := range r.machines {
 			if record.upstream == m {
 				record.upstream = nil
 				break
 			}
 		}
+	}
+	r.mu.Unlock()
+	if stop {
+		m.stop()
 	}
 }
 

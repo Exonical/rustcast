@@ -15,6 +15,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// ---------------------------------------------------------------------------
+// TCP/QUIC frame reader — connects to flux-server's frame server
+// ---------------------------------------------------------------------------
+
 type machineUpstream struct {
 	id          string
 	addr        string
@@ -23,7 +27,7 @@ type machineUpstream struct {
 	abr         *abrState
 	stopChan    chan struct{}
 	stopOnce    sync.Once
-	viewers     int
+	viewers     int // Protected by machineRegistry.mu.
 	mu          sync.Mutex
 	session     *Session
 	conn        net.Conn
@@ -64,10 +68,12 @@ func (u *machineUpstream) stop() {
 	})
 }
 
-func (u *machineUpstream) send(cmd []byte) {
+func (u *machineUpstream) send(cmd []byte) bool {
 	select {
 	case u.commandChan <- cmd:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -103,6 +109,9 @@ func (u *machineUpstream) connectFrameServer() {
 		if err := u.connectQUIC(); err != nil {
 			log.Printf("[frame:%s] QUIC unavailable (%v), trying TCP", u.id, err)
 		} else {
+			if !u.wait(time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -121,6 +130,7 @@ func (u *machineUpstream) connectFrameServer() {
 		u.conn = conn
 		u.mu.Unlock()
 
+		// Spawn writer for upstream commands.
 		done := make(chan struct{})
 		go func() {
 			for {
@@ -138,7 +148,7 @@ func (u *machineUpstream) connectFrameServer() {
 			}
 		}()
 		err = u.readFrames(conn)
-		close(done)
+		close(done) // Stop the writer.
 		conn.Close()
 		u.mu.Lock()
 		u.conn = nil
@@ -172,6 +182,7 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			return nil
 		default:
 		}
+		// Protocol: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
 		var hdr [12]byte
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 			return fmt.Errorf("read header: %w", err)
@@ -181,6 +192,7 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 		if frameLen == 0 || frameLen > 10*1024*1024 {
 			return fmt.Errorf("invalid frame length: %d", frameLen)
 		}
+		// Read frame data.
 		data := make([]byte, frameLen)
 		if _, err := io.ReadFull(conn, data); err != nil {
 			return fmt.Errorf("read frame data: %w", err)
@@ -190,9 +202,11 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 		if frameCount%300 == 0 {
 			log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, frameLen)
 		}
+		// Non-blocking send; drop oldest frame if channel is full.
 		select {
 		case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
 		default:
+			// Drop oldest frame if channel is full.
 			select {
 			case <-u.frameChan:
 			default:
@@ -217,6 +231,7 @@ func (u *machineUpstream) connectQUIC() error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
+	u.status("connected")
 	ctx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
 	defer conn.CloseWithError(0, "done")
@@ -227,6 +242,11 @@ func (u *machineUpstream) connectQUIC() error {
 		u.mu.Lock()
 		u.cancel = nil
 		u.mu.Unlock()
+		select {
+		case <-u.stopChan:
+		default:
+			u.status("reconnecting")
+		}
 	}()
 	control, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -255,6 +275,7 @@ func (u *machineUpstream) connectQUIC() error {
 		if err != nil {
 			return fmt.Errorf("accept stream: %w", err)
 		}
+		// Frame stream: [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
 		var hdr [12]byte
 		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
 			continue
@@ -286,10 +307,16 @@ func (u *machineUpstream) connectQUIC() error {
 }
 
 func (u *machineUpstream) framePusher() {
+	// The capture source (e.g. a Wayland/mutter screen-cast) delivers frames at
+	// a variable, damage-driven rate and the server drains backlogs in bursts,
+	// so network arrival time is a poor clock. Pace the RTP timestamp by the
+	// frame's capture timestamp (reported by the server) instead, so the browser's
+	// jitter buffer can absorb bursts and play at true capture cadence rather than
+	// running ahead and stalling.
 	const (
-		defaultFrameDuration = 16 * time.Millisecond
-		minFrameDuration     = 4 * time.Millisecond
-		maxFrameDuration     = 500 * time.Millisecond
+		defaultFrameDuration = 16 * time.Millisecond  // ~60fps for the first sample
+		minFrameDuration     = 4 * time.Millisecond   // clamp absurdly fast bursts
+		maxFrameDuration     = 500 * time.Millisecond // clamp long idle gaps
 	)
 	var sampleCount uint64
 	var lastTs uint64
@@ -305,13 +332,18 @@ func (u *machineUpstream) framePusher() {
 				continue
 			}
 			sampleCount++
+			// New session: skip P-frames until the next live IDR arrives.
+			// P-frames can't be decoded without their preceding frames.
 			if sess.needsIDR {
 				if !idr {
 					continue
 				}
-				log.Printf("[webrtc:%s] live IDR arrived (%d bytes)", u.id, len(msg.data))
+				log.Printf("[webrtc:%s] live IDR arrived (%d bytes), starting stream for new session", u.id, len(msg.data))
 				sess.needsIDR = false
 			}
+			// Duration = capture-time gap since the previous sent sample. The
+			// server timestamp resets on reconnect, so guard against going
+			// backwards and fall back to the nominal duration.
 			frameDuration := defaultFrameDuration
 			if haveLastTs && msg.tsMicros > lastTs {
 				frameDuration = time.Duration(msg.tsMicros-lastTs) * time.Microsecond
@@ -322,6 +354,7 @@ func (u *machineUpstream) framePusher() {
 				}
 			}
 			lastTs, haveLastTs = msg.tsMicros, true
+			// Log first few frames and IDRs for diagnostics.
 			if sampleCount <= 5 || idr {
 				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}

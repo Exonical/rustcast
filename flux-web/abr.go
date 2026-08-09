@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// abrState adapts one machine's upstream encoder bitrate to what its viewer's link actually
+// abrState adapts the upstream encoder bitrate for one machine to what its viewer's link actually
 // sustains. It watches RTCP receiver reports from the browser: sustained loss
 // means the WiFi link is saturated, so the encoder target is cut (multiplicative
 // decrease); after a clean period it is raised back gradually (additive

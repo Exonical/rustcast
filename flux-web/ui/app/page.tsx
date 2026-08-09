@@ -84,6 +84,7 @@ const WifiOffIcon = () => (
 type Machine = {
   id: string;
   name: string;
+  display_name?: string;
   status: "online" | "offline";
   os?: string;
   gpu_vendor?: string;
@@ -639,6 +640,7 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
                     </span>
                   </div>
                   <div className="space-y-1 text-xs text-zinc-400">
+                    {machine.display_name && <p>Display: {machine.display_name}</p>}
                     {machine.os && <p>OS: {machine.os}</p>}
                     {machine.gpu_vendor && <p>GPU: {machine.gpu_vendor}</p>}
                     {machine.encoder_backend && <p>Encoder: {machine.encoder_backend}</p>}

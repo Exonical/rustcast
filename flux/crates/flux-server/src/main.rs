@@ -589,6 +589,7 @@ fn build_encode_session_for(
 
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
+#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,

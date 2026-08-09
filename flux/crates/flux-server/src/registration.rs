@@ -21,6 +21,7 @@ pub struct RuntimeStatus {
 struct Registration {
     id: String,
     name: String,
+    display_name: String,
     frame_endpoint: String,
     os: String,
     gpu_vendor: String,
@@ -49,6 +50,7 @@ pub fn start(
     let registration = Registration {
         id,
         name: config.name.clone(),
+        display_name: String::new(),
         frame_endpoint,
         os: format!("{:?}", platform.os),
         gpu_vendor: format!("{:?}", platform.gpu_vendor),
@@ -89,9 +91,7 @@ pub fn start(
         loop {
             let mut current = registration.clone();
             if let Ok(snapshot) = status.read() {
-                if let Some(display) = &snapshot.display_name {
-                    current.name = format!("{} ({display})", registration.name);
-                }
+                current.display_name = snapshot.display_name.clone().unwrap_or_default();
                 if let Some(backend) = &snapshot.encoder_backend {
                     current.encoder_backend = backend.clone();
                 }

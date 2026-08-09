@@ -68,17 +68,11 @@ impl Default for FluxConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RelayConfig {
     /// Base URL of the Flux web relay, for example http://relay:8080.
     #[serde(default)]
     pub base_url: Option<String>,
-}
-
-impl Default for RelayConfig {
-    fn default() -> Self {
-        Self { base_url: None }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
