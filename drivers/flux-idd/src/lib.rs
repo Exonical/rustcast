@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDFDEVICE,
     WDFDEVICE_INIT, WDFDRIVER, WDF_DRIVER_CONFIG, WDF_NO_HANDLE, WDF_NO_OBJECT_ATTRIBUTES,
-    WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
+    WDF_PNPPOWER_EVENT_CALLBACKS, WDF_POWER_DEVICE_STATE,
 };
 
 use bindings as idd;
@@ -230,8 +230,8 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
 
-    let mut object_attributes = WDF_OBJECT_ATTRIBUTES {
-        Size: size_of::<WDF_OBJECT_ATTRIBUTES>() as ULONG,
+    let mut object_attributes = idd::WDF_OBJECT_ATTRIBUTES {
+        Size: size_of::<idd::WDF_OBJECT_ATTRIBUTES>() as ULONG,
         ..Default::default()
     };
     let mut init = idd::IDARG_IN_ADAPTER_INIT {

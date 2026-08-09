@@ -67,7 +67,7 @@ pub unsafe extern "C" fn evt_io_device_control(
             WdfRequestCompleteWithInformation,
             request,
             status,
-            information,
+            information as u64,
         );
     }
 }
