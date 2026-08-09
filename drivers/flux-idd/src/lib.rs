@@ -206,7 +206,10 @@ extern "C" fn evt_device_d0_entry(
     _previous_state: WDF_POWER_DEVICE_STATE,
 ) -> NTSTATUS {
     STATE.lock().unwrap().d0_entry_ran = true;
-    init_adapter(device)
+    // Keep device start successful so the status IOCTL remains available when
+    // adapter initialization fails; init_adapter records its status above.
+    let _ = init_adapter(device);
+    STATUS_SUCCESS
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
