@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 use flux_capture::traits::DisplayInfo;
 use windows::Win32::Devices::Display::*;
 use windows::Win32::Foundation::{LUID, POINTL};
-use windows::Win32::Graphics::Gdi::{
-    DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE,
-};
+use windows::Win32::Graphics::Gdi::{DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_MODE_IDX_INVALID};
 
-const ACTIVE_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS | QDC_VIRTUAL_MODE_AWARE;
-const ALL_PATHS_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
-const VALIDATE_FLAGS: SET_DISPLAY_CONFIG_FLAGS =
-    SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;
-const APPLY_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE;
+// Deliberately omit *_VIRTUAL_MODE_AWARE. CCD supports the legacy-compatible
+// path/mode view when callers do not opt into virtual-mode unions and desktop
+// image entries; this keeps modeInfoIdx a plain index.
+const ACTIVE_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
+const ALL_PATHS_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ALL_PATHS;
+const VALIDATE_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG;
+const APPLY_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG;
 const QUERY_RETRIES: usize = 4;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -34,10 +34,18 @@ pub fn configure_virtual_display(target: &DisplayInfo, width: u32, height: u32, 
         .adapter_luid
         .ok_or_else(|| format!("DXGI output {} has no adapter LUID", target.name))?;
     let deadline = Instant::now() + CONFIGURATION_TIMEOUT;
-    let mut last_error = "CCD path is not ready".to_string();
+    let mut last_error = "CCD path never appeared".to_string();
+    let mut resolved_path_logged = false;
 
     while Instant::now() < deadline {
-        match configure_once(target, adapter_luid, width, height, refresh_hz) {
+        match configure_once(
+            target,
+            adapter_luid,
+            width,
+            height,
+            refresh_hz,
+            &mut resolved_path_logged,
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = error;
@@ -58,9 +66,19 @@ fn configure_once(
     width: u32,
     height: u32,
     refresh_hz: u32,
+    resolved_path_logged: &mut bool,
 ) -> Result<(), String> {
     let mut config = query_config(ACTIVE_QUERY_FLAGS)?;
-    let virtual_index = find_source_path(&config.paths, adapter_luid, &target.name)?;
+    let (virtual_index, ccd_adapter_luid) = find_source_path(&config.paths, adapter_luid, &target.name)?;
+    if !*resolved_path_logged {
+        tracing::info!(
+            "Resolved virtual CCD source {}: CCD adapter LUID 0x{:016X}, DXGI adapter LUID 0x{:016X}",
+            target.name,
+            ccd_adapter_luid,
+            adapter_luid
+        );
+        *resolved_path_logged = true;
+    }
 
     // If the active topology cloned this source, look for an alternate path
     // connecting the same target to an unused source. This makes the supplied
@@ -135,14 +153,22 @@ fn configure_once(
 
     let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
     if status != 0 {
-        return Err(format!("SetDisplayConfig validation failed: {}", status));
+        return Err(format!("CCD validate rejected (status {}): SetDisplayConfig", status));
     }
     let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
     if status != 0 {
-        return Err(format!("SetDisplayConfig apply failed: {}", status));
+        return Err(format!("CCD apply failed (status {}): SetDisplayConfig", status));
     }
 
-    verify_config(&target.name, adapter_luid, width, height, refresh_hz, position)
+    verify_config(
+        &target.name,
+        adapter_luid,
+        ccd_adapter_luid,
+        width,
+        height,
+        refresh_hz,
+        position,
+    )
 }
 
 fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, String> {
@@ -151,7 +177,10 @@ fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, Stri
         let mut mode_count = 0u32;
         let status = unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
         if status.0 != 0 {
-            return Err(format!("GetDisplayConfigBufferSizes failed: {}", status.0));
+            return Err(format!(
+                "CCD query failed (GetDisplayConfigBufferSizes status {})",
+                status.0
+            ));
         }
 
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
@@ -174,29 +203,43 @@ fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, Stri
         // ERROR_INSUFFICIENT_BUFFER: the topology changed between the size
         // query and QueryDisplayConfig. Start over with fresh arrays.
         if status.0 != 122 {
-            return Err(format!("QueryDisplayConfig failed: {}", status.0));
+            return Err(format!("CCD query failed (QueryDisplayConfig status {})", status.0));
         }
     }
-    Err("QueryDisplayConfig topology changed while querying".into())
+    Err("CCD query failed: topology changed while querying".into())
 }
 
 fn find_source_path(
     paths: &[DISPLAYCONFIG_PATH_INFO],
-    adapter_luid: u64,
+    dxgi_adapter_luid: u64,
     expected_name: &str,
-) -> Result<usize, String> {
+) -> Result<(usize, u64), String> {
+    let mut matches = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        if luid_value(path.sourceInfo.adapterId) != adapter_luid {
-            continue;
-        }
         if source_name(path.sourceInfo.adapterId, path.sourceInfo.id)? == expected_name {
-            return Ok(index);
+            matches.push((index, luid_value(path.sourceInfo.adapterId)));
         }
     }
-    Err(format!(
-        "CCD source {} on adapter LUID 0x{:016X} is not ready",
-        expected_name, adapter_luid
-    ))
+    match matches.as_slice() {
+        [] => Err(format!("CCD path never appeared for source {}", expected_name)),
+        [match_] => Ok(*match_),
+        matches => {
+            let dxgi_matches: Vec<_> = matches
+                .iter()
+                .copied()
+                .filter(|(_, luid)| *luid == dxgi_adapter_luid)
+                .collect();
+            match dxgi_matches.as_slice() {
+                [match_] => Ok(*match_),
+                _ => Err(format!(
+                    "CCD source {} is ambiguous across {} paths (DXGI adapter LUID 0x{:016X})",
+                    expected_name,
+                    matches.len(),
+                    dxgi_adapter_luid
+                )),
+            }
+        }
+    }
 }
 
 fn source_name(adapter_id: LUID, source_id: u32) -> Result<String, String> {
@@ -259,14 +302,8 @@ fn copy_path_modes(
 }
 
 fn source_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
-    let (index, virtual_mode) = unsafe {
-        if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
-            (path.sourceInfo.Anonymous.Anonymous._bitfield & 0xffff, true)
-        } else {
-            (path.sourceInfo.Anonymous.modeInfoIdx, false)
-        }
-    };
-    if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || (virtual_mode && index == 0xffff) {
+    let index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+    if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
         Err("CCD path has no source mode".into())
     } else {
         Ok(index as usize)
@@ -274,14 +311,8 @@ fn source_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
 }
 
 fn target_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
-    let (index, virtual_mode) = unsafe {
-        if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
-            ((path.targetInfo.Anonymous.Anonymous._bitfield >> 16) & 0xffff, true)
-        } else {
-            (path.targetInfo.Anonymous.modeInfoIdx, false)
-        }
-    };
-    if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || (virtual_mode && index == 0xffff) {
+    let index = unsafe { path.targetInfo.Anonymous.modeInfoIdx };
+    if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
         Err("CCD path has no target mode".into())
     } else {
         Ok(index as usize)
@@ -289,31 +320,15 @@ fn target_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
 }
 
 fn set_source_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
-    if index > 0xffff {
-        return Err("CCD source mode index exceeds virtual-mode field".into());
-    }
     unsafe {
-        if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
-            let bits = path.sourceInfo.Anonymous.Anonymous._bitfield;
-            path.sourceInfo.Anonymous.Anonymous._bitfield = (bits & 0xffff0000) | index;
-        } else {
-            path.sourceInfo.Anonymous.modeInfoIdx = index;
-        }
+        path.sourceInfo.Anonymous.modeInfoIdx = index;
     }
     Ok(())
 }
 
 fn set_target_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
-    if index > 0xffff {
-        return Err("CCD target mode index exceeds virtual-mode field".into());
-    }
     unsafe {
-        if path.flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE != 0 {
-            let bits = path.targetInfo.Anonymous.Anonymous._bitfield;
-            path.targetInfo.Anonymous.Anonymous._bitfield = (bits & 0x0000ffff) | (index << 16);
-        } else {
-            path.targetInfo.Anonymous.modeInfoIdx = index;
-        }
+        path.targetInfo.Anonymous.modeInfoIdx = index;
     }
     Ok(())
 }
@@ -337,14 +352,21 @@ fn non_overlapping_position(config: &DisplayConfig, virtual_index: usize) -> Res
 
 fn verify_config(
     expected_name: &str,
-    adapter_luid: u64,
+    dxgi_adapter_luid: u64,
+    expected_ccd_adapter_luid: u64,
     width: u32,
     height: u32,
     refresh_hz: u32,
     expected_position: POINTL,
 ) -> Result<(), String> {
     let config = query_config(ACTIVE_QUERY_FLAGS)?;
-    let index = find_source_path(&config.paths, adapter_luid, expected_name)?;
+    let (index, ccd_adapter_luid) = find_source_path(&config.paths, dxgi_adapter_luid, expected_name)?;
+    if ccd_adapter_luid != expected_ccd_adapter_luid {
+        return Err(format!(
+            "CCD verification resolved source {} on unexpected adapter LUID 0x{:016X} (expected 0x{:016X})",
+            expected_name, ccd_adapter_luid, expected_ccd_adapter_luid
+        ));
+    }
     let path = &config.paths[index];
     if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
         return Err("CCD virtual path is not active after apply".into());
@@ -383,7 +405,6 @@ fn verify_config(
         || target_width != width
         || target_height != height
         || target_refresh != refresh_hz
-        || source_position != expected_position
     {
         return Err(format!(
             "CCD verification mismatch: source={}x{} at ({},{}), target={}x{}@{}Hz",
@@ -395,6 +416,16 @@ fn verify_config(
             target_height,
             target_refresh
         ));
+    }
+    if source_position != expected_position {
+        tracing::warn!(
+            "CCD virtual source {} was placed at ({},{}), requested ({},{})",
+            expected_name,
+            source_position.x,
+            source_position.y,
+            expected_position.x,
+            expected_position.y
+        );
     }
     Ok(())
 }
