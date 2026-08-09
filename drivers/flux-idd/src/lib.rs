@@ -230,8 +230,14 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
 
+    // Mirrors WDF_OBJECT_ATTRIBUTES_INIT: a zeroed struct has invalid
+    // ExecutionLevel/SynchronizationScope and IddCx rejects it with
+    // STATUS_WDF_OBJECT_ATTRIBUTES_INVALID.
     let mut object_attributes = idd::_WDF_OBJECT_ATTRIBUTES {
         Size: size_of::<idd::_WDF_OBJECT_ATTRIBUTES>() as ULONG,
+        ExecutionLevel: idd::_WDF_EXECUTION_LEVEL_WdfExecutionLevelInheritFromParent,
+        SynchronizationScope:
+            idd::_WDF_SYNCHRONIZATION_SCOPE_WdfSynchronizationScopeInheritFromParent,
         ..Default::default()
     };
     let mut init = idd::IDARG_IN_ADAPTER_INIT {
