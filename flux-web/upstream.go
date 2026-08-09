@@ -37,6 +37,30 @@ type machineUpstream struct {
 	status      func(string)
 }
 
+const (
+	defaultFrameDuration = 16 * time.Millisecond // ~60fps for the first sample
+	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
+	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
+)
+
+func captureFrameDuration(lastTs, currentTs uint64, haveLastTs bool) time.Duration {
+	if !haveLastTs || currentTs <= lastTs {
+		return defaultFrameDuration
+	}
+
+	deltaMicros := currentTs - lastTs
+	maxMicros := uint64(maxSaneFrameDuration / time.Microsecond)
+	if deltaMicros > maxMicros {
+		return maxSaneFrameDuration
+	}
+
+	frameDuration := time.Duration(deltaMicros) * time.Microsecond
+	if frameDuration < minFrameDuration {
+		return minFrameDuration
+	}
+	return frameDuration
+}
+
 func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 	u := &machineUpstream{
 		id: id, addr: addr,
@@ -325,11 +349,6 @@ func (u *machineUpstream) framePusher() {
 	// frame's capture timestamp (reported by the server) instead, so the browser's
 	// jitter buffer can absorb bursts and play at true capture cadence rather than
 	// running ahead and stalling.
-	const (
-		defaultFrameDuration = 16 * time.Millisecond  // ~60fps for the first sample
-		minFrameDuration     = 4 * time.Millisecond   // clamp absurdly fast bursts
-		maxFrameDuration     = 500 * time.Millisecond // clamp long idle gaps
-	)
 	var sampleCount uint64
 	var lastTs uint64
 	var haveLastTs bool
@@ -356,15 +375,7 @@ func (u *machineUpstream) framePusher() {
 			// Duration = capture-time gap since the previous sent sample. The
 			// server timestamp resets on reconnect, so guard against going
 			// backwards and fall back to the nominal duration.
-			frameDuration := defaultFrameDuration
-			if haveLastTs && msg.tsMicros > lastTs {
-				frameDuration = time.Duration(msg.tsMicros-lastTs) * time.Microsecond
-				if frameDuration < minFrameDuration {
-					frameDuration = minFrameDuration
-				} else if frameDuration > maxFrameDuration {
-					frameDuration = maxFrameDuration
-				}
-			}
+			frameDuration := captureFrameDuration(lastTs, msg.tsMicros, haveLastTs)
 			lastTs, haveLastTs = msg.tsMicros, true
 			// Log first few frames and IDRs for diagnostics.
 			if sampleCount <= 5 || idr {

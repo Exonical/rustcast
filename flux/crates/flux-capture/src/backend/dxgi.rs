@@ -23,6 +23,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::core::Interface;
 
+const DXGI_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// DXGI Desktop Duplication capture backend.
 pub struct DxgiCapture {
     state: Mutex<DxgiState>,
@@ -580,6 +582,7 @@ struct DxgiCaptureSession {
     running: bool,
     last_frame_time: std::time::Instant,
     last_delivery: std::time::Instant,
+    has_copied_frame: bool,
 }
 
 struct AcquiredFrame {
@@ -718,7 +721,28 @@ impl DxgiCaptureSession {
                 running: true,
                 last_frame_time: std::time::Instant::now(),
                 last_delivery: std::time::Instant::now(),
+                has_copied_frame: false,
             })
+        }
+    }
+
+    fn make_heartbeat_frame(&mut self) -> CapturedFrame {
+        self.frame_sequence += 1;
+        self.last_delivery = std::time::Instant::now();
+        CapturedFrame {
+            sequence: self.frame_sequence,
+            timestamp: std::time::Instant::now(),
+            format: PixelFormat::Bgra8,
+            resolution: self.resolution,
+            stride: 0,
+            data: Vec::new(),
+            gpu_handle: Some(flux_core::frame::GpuFrameHandle::DxgiSharedTexture(
+                flux_core::frame::DxgiTextureHandle {
+                    handle: self.shared_handle,
+                    width: self.resolution.width,
+                    height: self.resolution.height,
+                },
+            )),
         }
     }
 
@@ -739,6 +763,13 @@ impl DxgiCaptureSession {
                     // DXGI_ERROR_WAIT_TIMEOUT — no new frame available
                     let code = e.code().0 as u32;
                     if code == 0x887A0027 {
+                        // No duplication frame exists to copy, so re-use the
+                        // last flushed shared texture as a low-rate heartbeat.
+                        if self.has_copied_frame
+                            && self.last_delivery.elapsed() >= DXGI_HEARTBEAT_INTERVAL
+                        {
+                            return Ok(Some(self.make_heartbeat_frame()));
+                        }
                         return Ok(None);
                     }
                     // DXGI_ERROR_ACCESS_LOST — need to recreate duplication
@@ -762,7 +793,7 @@ impl DxgiCaptureSession {
 
             // LastPresentTime == 0 means the desktop image was unchanged since the last acquisition.
             if frame_info.LastPresentTime == 0
-                && self.last_delivery.elapsed() < std::time::Duration::from_secs(1)
+                && self.last_delivery.elapsed() < DXGI_HEARTBEAT_INTERVAL
             {
                 frame_guard.release()?;
                 return Ok(None);
@@ -790,6 +821,7 @@ impl DxgiCaptureSession {
             // Flush to ensure the GPU copy is submitted before the encoder
             // reads from this texture on a different D3D11 device.
             self.context.Flush();
+            self.has_copied_frame = true;
 
             frame_guard.release()?;
 
