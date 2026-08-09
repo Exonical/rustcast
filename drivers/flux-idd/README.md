@@ -19,6 +19,9 @@ build time. Architecture mirrors Microsoft's IddCx sample driver.
   monitor; actual capture + encode happens in flux-server through DXGI duplication of
   the new display.
 - Device access is restricted to SYSTEM/Administrators (INF `Security` descriptor).
+- The INF registers `IndirectKmd` as the device's `UpperFilters` multi-string. This
+  kernel-side upper filter is the top of the IddCx display stack and is required for
+  asynchronous adapter initialization to complete.
 
 ## Building (Windows only)
 
