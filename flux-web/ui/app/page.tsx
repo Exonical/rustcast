@@ -112,7 +112,18 @@ export default function StreamViewer() {
   }, []);
 
   const queueMove = useCallback((move: NonNullable<typeof pendingMove.current>) => {
-    pendingMove.current = move;
+    const pending = pendingMove.current;
+    if (!pending || pending.absolute !== move.absolute) {
+      pendingMove.current = move;
+    } else if (move.absolute) {
+      pendingMove.current = move;
+    } else if (!pending.absolute) {
+      pendingMove.current = {
+        absolute: false,
+        dx: pending.dx + move.dx,
+        dy: pending.dy + move.dy,
+      };
+    }
     if (moveFrame.current === null) {
       moveFrame.current = requestAnimationFrame(flushMove);
     }
@@ -290,24 +301,30 @@ export default function StreamViewer() {
     }
   }, []);
 
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    if (!clientRef.current) return;
-    e.preventDefault();
-    // e.deltaY is usually 100 or -100. Flux expects windows WHEEL_DELTA (120).
-    // But we are sending raw delta. The server injects it as mouseData.
-    // Standard mouse wheel is 120 per notch.
-    // e.deltaY is positive for scrolling down (towards user).
-    // Windows WHEEL_DELTA is negative for scrolling down? No, SendInput:
-    // "If dwFlags contains MOUSEEVENTF_WHEEL, then mouseData specifies the amount of wheel movement. A positive value indicates that the wheel was rotated forward, away from the user; a negative value indicates that the wheel was rotated backward, toward the user."
-    // e.deltaY > 0 is scroll down (toward user) -> should be negative for Windows.
-    // Browser deltaX and MOUSEEVENTF_HWHEEL both use positive for rightward scrolling.
-    const deltaX = Math.round(e.deltaX);
-    const deltaY = Math.round(-e.deltaY);
-    clientRef.current.sendInput({
-      Mouse: {
-        Scroll: { dx: deltaX, dy: deltaY }
-      }
-    });
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (!clientRef.current) return;
+      e.preventDefault();
+      // e.deltaY is usually 100 or -100. Flux expects windows WHEEL_DELTA (120).
+      // But we are sending raw delta. The server injects it as mouseData.
+      // Standard mouse wheel is 120 per notch.
+      // e.deltaY is positive for scrolling down (towards user).
+      // Windows WHEEL_DELTA is negative for scrolling down? No, SendInput:
+      // "If dwFlags contains MOUSEEVENTF_WHEEL, then mouseData specifies the amount of wheel movement. A positive value indicates that the wheel was rotated forward, away from the user; a negative value indicates that the wheel was rotated backward, toward the user."
+      // e.deltaY > 0 is scroll down (toward user) -> should be negative for Windows.
+      // Browser deltaX and MOUSEEVENTF_HWHEEL both use positive for rightward scrolling.
+      const deltaX = Math.round(e.deltaX);
+      const deltaY = Math.round(-e.deltaY);
+      clientRef.current.sendInput({
+        Mouse: {
+          Scroll: { dx: deltaX, dy: deltaY }
+        }
+      });
+    };
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
   }, []);
 
   const handleSurfaceClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -422,7 +439,6 @@ export default function StreamViewer() {
         onMouseMove={handleMouseMove}
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
-        onWheel={handleWheel}
         onClick={handleSurfaceClick}
         onContextMenu={(e) => e.preventDefault()}
         style={{ cursor: isPointerLocked || !showControls ? "none" : "default" }}
