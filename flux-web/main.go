@@ -83,15 +83,17 @@ func describeNALUs(data []byte) string {
 	var types []string
 	i := 0
 	for i < len(data)-4 {
-		// Look for start code 00 00 00 01 or 00 00 01.
+		// Look for start code 00 00 00 01 or 00 00 01
 		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
 			if i+4 < len(data) {
-				types = append(types, naluTypeName(data[i+4]&0x1F))
+				naluType := data[i+4] & 0x1F
+				types = append(types, naluTypeName(naluType))
 			}
 			i += 4
 		} else if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
 			if i+3 < len(data) {
-				types = append(types, naluTypeName(data[i+3]&0x1F))
+				naluType := data[i+3] & 0x1F
+				types = append(types, naluTypeName(naluType))
 			}
 			i += 3
 		} else {
@@ -161,6 +163,7 @@ func newSession() (*Session, error) {
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register default codecs: %w", err)
 	}
+
 	// Default interceptors provide the NACK responder (RTP retransmission of
 	// lost packets — essential on lossy links like WiFi), RTCP sender reports
 	// for A/V sync, and TWCC feedback. Without them every lost packet
@@ -169,24 +172,29 @@ func newSession() (*Session, error) {
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
+
 	se := webrtc.SettingEngine{}
 	if iceUDPMux != nil {
 		se.SetICEUDPMux(iceUDPMux)
 	}
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(i),
 		webrtc.WithSettingEngine(se),
 	)
+
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
 	}
+
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("create peer connection: %w", err)
 	}
+
 	// Create H.264 video track
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{
@@ -199,17 +207,21 @@ func newSession() (*Session, error) {
 		pc.Close()
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
+
 	sender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		pc.Close()
 		return nil, fmt.Errorf("add track: %w", err)
 	}
+
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack}
+
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
 	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
 	// fresh IDR from the capture server so the picture recovers immediately
 	// instead of staying corrupted until the next scheduled keyframe.
 	go forwardKeyframeRequests(session, sender)
+
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[webrtc] ICE connection state: %s", state.String())
 		if state == webrtc.ICEConnectionStateFailed ||
@@ -218,9 +230,11 @@ func newSession() (*Session, error) {
 			session.releaseNow()
 		}
 	})
+
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[webrtc] connection state: %s", state.String())
 	})
+
 	return session, nil
 }
 
@@ -275,16 +289,20 @@ func exchangeOffer(session *Session, offerSDP string) (string, error) {
 	); err != nil {
 		return "", fmt.Errorf("set remote description: %w", err)
 	}
+
 	answer, err := session.PeerConnection.CreateAnswer(nil)
 	if err != nil {
 		return "", fmt.Errorf("create answer: %w", err)
 	}
+
 	if err := session.PeerConnection.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("set local description: %w", err)
 	}
+
 	// Wait for ICE gathering to complete
 	gatherComplete := webrtc.GatheringCompletePromise(session.PeerConnection)
 	<-gatherComplete
+
 	return session.PeerConnection.LocalDescription().SDP, nil
 }
 
@@ -313,6 +331,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 		return
 	}
 	defer ws.Close()
+
 	log.Printf("[ws] client connected: %s", c.ClientIP())
 	var session *Session
 	defer func() {
@@ -328,11 +347,13 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			log.Printf("[ws] read error: %v", err)
 			return
 		}
+
 		var msg WSMessage
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
 			log.Printf("[ws] parse error: %v", err)
 			continue
 		}
+
 		switch msg.Type {
 		case "offer":
 			var offerData OfferData
@@ -341,7 +362,9 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				sendWSError(ws, "Invalid offer")
 				continue
 			}
+
 			log.Printf("[ws] received offer from %s", c.ClientIP())
+
 			machineID := offerData.MachineID
 			if machineID == "" {
 				machineID = "default"
@@ -351,14 +374,17 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				sendWSError(ws, err.Error()+": "+machineID)
 				continue
 			}
+
 			next, err := newSession()
 			if err != nil {
 				registry.release(upstream)
 				sendWSError(ws, "Failed to create session")
 				continue
 			}
+
 			next.machine = upstream
 			next.release = func() { registry.release(upstream) }
+
 			if old := upstream.bindSession(next); old != nil {
 				old.releaseNow()
 				old.PeerConnection.Close()
@@ -369,6 +395,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			}
 			session = next
 			next.needsIDR = true
+
 			next.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 				if candidate == nil {
 					return
@@ -377,6 +404,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				resp, _ := json.Marshal(WSMessage{Type: "new-ice-candidate", Data: data})
 				_ = ws.WriteMessage(websocket.TextMessage, resp)
 			})
+
 			answerSDP, err := exchangeOffer(next, offerData.SDP)
 			if err != nil {
 				log.Printf("[ws] exchange offer error: %v", err)
@@ -385,6 +413,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				sendWSError(ws, "Failed to exchange offer")
 				continue
 			}
+
 			if !upstream.send([]byte{0x01}) {
 				log.Printf("[ws] upstream command channel full, dropped IDR request")
 			} else {
@@ -401,6 +430,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 					log.Printf("[ws] add ICE candidate error: %v", err)
 				}
 			}
+
 		case "input":
 			if session == nil || session.machine == nil {
 				sendWSError(ws, "No active machine session")
