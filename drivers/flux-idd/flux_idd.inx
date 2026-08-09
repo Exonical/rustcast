@@ -35,6 +35,9 @@ AddReg = FluxIdd_HardwareDeviceSettings
 ; Restrict device access to SYSTEM and Administrators: the plug-in/out IOCTLs
 ; change display topology and must not be reachable from normal user code.
 HKR,, Security,, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+; IndirectKmd is the kernel-side top of the IddCx display stack; without this
+; upper filter, asynchronous adapter initialization never completes.
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
 HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "FluxIddGroup"
 
 [FluxIdd_Install.NT.Services]
@@ -67,3 +70,4 @@ ManufacturerName="Rustcast"
 DeviceName="Flux Virtual Display"
 DiskName="FluxIdd Installation Disk"
 REG_SZ=0x00000000
+REG_MULTI_SZ=0x00010000
