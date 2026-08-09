@@ -599,7 +599,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         )}
 
         {/* Stats overlay */}
-        {showStats && (
+        {showStats && connectionState === "connected" && (
           <div className="absolute bottom-3 left-3 z-10 w-[min(22rem,calc(100vw-1.5rem))] glass rounded-2xl p-3 sm:bottom-5 sm:left-5 sm:p-4 animate-fade-in">
             <div className="mb-3 flex items-center justify-between">
               <div>
@@ -701,7 +701,7 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
         ) : machines.length === 0 ? (
           <div className="glass rounded-2xl p-8 text-center text-zinc-400">No machines have registered yet.</div>
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid auto-rows-fr gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {machines.map((machine) => {
               const online = machine.status === "online";
               return (
@@ -709,7 +709,7 @@ function MachinePicker({ onSelect }: { onSelect: (machine: Machine) => void }) {
                   key={machine.id}
                   disabled={!online}
                   onClick={() => onSelect(machine)}
-                  className={`glass w-full rounded-2xl p-5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] ${online ? "hover:-translate-y-0.5 hover:border-zinc-700 hover:bg-zinc-800/80" : "cursor-not-allowed opacity-50"}`}
+                  className={`glass h-full w-full rounded-2xl p-5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)] ${online ? "hover:-translate-y-0.5 hover:border-zinc-700 hover:bg-zinc-800/80" : "cursor-not-allowed opacity-50"}`}
                 >
                   <div className="mb-4 flex items-start justify-between gap-3">
                     <div className="min-w-0">
