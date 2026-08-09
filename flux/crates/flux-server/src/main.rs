@@ -162,10 +162,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Vec::new()
             }
         };
-        let before_names: std::collections::HashSet<String> =
+        let mut before_names: std::collections::HashSet<String> =
             before.into_iter().map(|display| display.name).collect();
-        let display = virtual_display::VirtualDisplay::plug_in(vd.width, vd.height, vd.refresh_hz)
+        let mut display =
+            virtual_display::VirtualDisplay::plug_in(vd.width, vd.height, vd.refresh_hz)
             .map_err(|e| format!("plug in virtual display: {e}"))?;
+        if display.was_adopted() {
+            // The 60-byte status IOCTL reports whether a monitor is present
+            // but not its mode. Recreate an adopted monitor at the requested
+            // mode so the existing new-output identity check remains strict.
+            display
+                .unplug()
+                .map_err(|e| format!("unplug existing virtual display: {e}"))?;
+            let display_count_before_unplug = before_names.len();
+            let unplug_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let after_unplug = loop {
+                match capture_probe.enumerate_displays() {
+                    Ok(displays) if displays.len() < display_count_before_unplug => {
+                        break displays;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!("waiting for existing virtual DXGI output removal: {e}")
+                    }
+                }
+                if std::time::Instant::now() >= unplug_deadline {
+                    drop(display);
+                    return Err(
+                        "existing virtual display could not be removed within 2 seconds"
+                            .into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            before_names = after_unplug
+                .into_iter()
+                .map(|display| display.name)
+                .collect();
+            display
+                .plug_in_mode(vd.width, vd.height, vd.refresh_hz)
+                .map_err(|e| format!("re-plug virtual display: {e}"))?;
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let target = loop {
             if std::time::Instant::now() >= deadline {
