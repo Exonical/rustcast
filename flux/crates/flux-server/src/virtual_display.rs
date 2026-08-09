@@ -6,8 +6,8 @@
 //! `{5b1a4c37-6f5d-4a41-9c1d-8f2e4b6a7c01}`; the monitor is plugged in with
 //! `IOCTL_FLUXIDD_PLUG_IN` (mode payload) and removed with
 //! `IOCTL_FLUXIDD_PLUG_OUT`. `IOCTL_FLUXIDD_GET_STATUS` returns adapter
-//! initialization state for diagnostics. The monitor is automatically plugged
-//! out when the [`VirtualDisplay`] handle is dropped.
+//! initialization state for diagnostics. A monitor acquired by the
+//! [`VirtualDisplay`] handle is automatically plugged out when it is dropped.
 
 #![cfg(target_os = "windows")]
 
@@ -64,9 +64,10 @@ struct FluxIddStatus {
 }
 
 /// An open handle to the FluxIdd driver with the virtual monitor plugged in.
-/// Dropping it plugs the monitor back out.
+/// Dropping it plugs out a monitor acquired by this handle.
 pub struct VirtualDisplay {
     device: HANDLE,
+    owns_monitor: bool,
 }
 
 // HANDLE is a process-wide kernel handle, safe to move across threads.
@@ -98,47 +99,26 @@ impl VirtualDisplay {
             height,
             refresh_hz,
         };
-        let mut returned = 0u32;
-        let result = unsafe {
-            DeviceIoControl(
-                device,
-                IOCTL_FLUXIDD_PLUG_IN,
-                Some(&mode as *const _ as *const _),
-                std::mem::size_of::<FluxIddMonitorMode>() as u32,
-                None,
-                0,
-                Some(&mut returned),
-                None,
-            )
-        };
-        if let Err(e) = result {
+        if let Err(e) = issue_plug_in(device, mode) {
             match query_status(device) {
-                Ok(status) => tracing::error!(
-                    "FluxIdd status after plug-in failure: d0_entry_ran={}, \
-                     adapter_init_async_status=0x{:08x}, adapter_init_status=0x{:08x}, \
-                     adapter_ready={}, monitor_plugged_in={}, \
-                     monitor_operation_in_progress={}, \
-                     adapter_init_finished_entry_count={}, \
-                     device_init_config_status=0x{:08x}, \
-                     device_initialize_status=0x{:08x}, \
-                     adapter_handle_nonnull={}, adapter_config_size={}, \
-                     adapter_caps_size={}, iddcx_version={}.{} min={}",
-                    status.d0_entry_ran,
-                    status.adapter_init_async_status as u32,
-                    status.adapter_init_status as u32,
-                    status.adapter_ready,
-                    status.monitor_plugged_in,
-                    status.monitor_operation_in_progress,
-                    status.adapter_init_finished_entry_count,
-                    status.device_init_config_status as u32,
-                    status.device_initialize_status as u32,
-                    status.adapter_handle_nonnull,
-                    status.adapter_config_size,
-                    status.adapter_caps_size,
-                    status.iddcx_version_major,
-                    status.iddcx_version_minor,
-                    status.iddcx_minimum_version_required,
-                ),
+                Ok(status) => {
+                    log_status("after plug-in failure", status);
+                    if status.monitor_plugged_in != 0
+                        && status.monitor_operation_in_progress == 0
+                    {
+                        tracing::warn!(
+                            "FluxIdd monitor is already plugged in; adopting it before \
+                             reconfiguring to {}x{}@{}Hz",
+                            width,
+                            height,
+                            refresh_hz
+                        );
+                        return Ok(Self {
+                            device,
+                            owns_monitor: false,
+                        });
+                    }
+                }
                 Err(status_error) => {
                     tracing::error!("FluxIdd status query after plug-in failure failed: {status_error}")
                 }
@@ -157,8 +137,78 @@ impl VirtualDisplay {
             height,
             refresh_hz
         );
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            owns_monitor: true,
+        })
     }
+
+    /// Whether the monitor was already plugged in when this handle acquired it.
+    pub fn was_adopted(&self) -> bool {
+        !self.owns_monitor
+    }
+
+    /// Remove the current monitor while retaining the driver handle.
+    ///
+    /// This is used when an existing monitor was found: the status IOCTL does
+    /// not expose its current mode, so the server re-plugs it at the requested
+    /// mode before relying on the DXGI output identity.
+    pub fn unplug(&mut self) -> Result<(), String> {
+        issue_plug_out(self.device)?;
+        self.owns_monitor = false;
+        Ok(())
+    }
+
+    /// Plug a monitor into an already-open FluxIdd handle.
+    pub fn plug_in_mode(
+        &mut self,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> Result<(), String> {
+        let mode = FluxIddMonitorMode {
+            width,
+            height,
+            refresh_hz,
+        };
+        issue_plug_in(self.device, mode)?;
+        self.owns_monitor = true;
+        Ok(())
+    }
+}
+
+fn issue_plug_in(device: HANDLE, mode: FluxIddMonitorMode) -> Result<(), String> {
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            device,
+            IOCTL_FLUXIDD_PLUG_IN,
+            Some(&mode as *const _ as *const _),
+            std::mem::size_of::<FluxIddMonitorMode>() as u32,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .map_err(|e| format!("{e}"))
+}
+
+fn issue_plug_out(device: HANDLE) -> Result<(), String> {
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            device,
+            IOCTL_FLUXIDD_PLUG_OUT,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .map_err(|e| format!("IOCTL_FLUXIDD_PLUG_OUT failed: {e}"))
 }
 
 fn query_status(device: HANDLE) -> Result<FluxIddStatus, String> {
@@ -202,23 +252,43 @@ fn query_status(device: HANDLE) -> Result<FluxIddStatus, String> {
     Ok(status)
 }
 
+fn log_status(context: &str, status: FluxIddStatus) {
+    tracing::error!(
+        "FluxIdd status {context}: d0_entry_ran={}, \
+         adapter_init_async_status=0x{:08x}, adapter_init_status=0x{:08x}, \
+         adapter_ready={}, monitor_plugged_in={}, \
+         monitor_operation_in_progress={}, \
+         adapter_init_finished_entry_count={}, \
+         device_init_config_status=0x{:08x}, \
+         device_initialize_status=0x{:08x}, \
+         adapter_handle_nonnull={}, adapter_config_size={}, \
+         adapter_caps_size={}, iddcx_version={}.{} min={}",
+        status.d0_entry_ran,
+        status.adapter_init_async_status as u32,
+        status.adapter_init_status as u32,
+        status.adapter_ready,
+        status.monitor_plugged_in,
+        status.monitor_operation_in_progress,
+        status.adapter_init_finished_entry_count,
+        status.device_init_config_status as u32,
+        status.device_initialize_status as u32,
+        status.adapter_handle_nonnull,
+        status.adapter_config_size,
+        status.iddcx_version_major,
+        status.iddcx_version_minor,
+        status.iddcx_minimum_version_required,
+    );
+}
+
 impl Drop for VirtualDisplay {
     fn drop(&mut self) {
+        if self.owns_monitor {
+            let _ = issue_plug_out(self.device);
+            tracing::info!("Virtual display plugged out");
+        }
         unsafe {
-            let mut returned = 0u32;
-            let _ = DeviceIoControl(
-                self.device,
-                IOCTL_FLUXIDD_PLUG_OUT,
-                None,
-                0,
-                None,
-                0,
-                Some(&mut returned),
-                None,
-            );
             let _ = CloseHandle(self.device);
         }
-        tracing::info!("Virtual display plugged out");
     }
 }
 
