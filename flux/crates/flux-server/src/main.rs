@@ -905,9 +905,36 @@ fn capture_loop(
         }
     };
     let loop_start = std::time::Instant::now();
+    let cursor_dimensions = Arc::new(std::sync::RwLock::new((
+        primary.native_resolution.width,
+        primary.native_resolution.height,
+        primary.native_resolution.width,
+        primary.native_resolution.height,
+    )));
     let cursor_sink: flux_capture::traits::CursorUpdateSink = {
         let cursor_tx = cursor_tx.clone();
+        let cursor_dimensions = cursor_dimensions.clone();
         Arc::new(move |metadata| {
+            let metadata = if let Ok(dimensions) = cursor_dimensions.read() {
+                let (capture_width, capture_height, encode_width, encode_height) = *dimensions;
+                let scale_x = encode_width as f32 / capture_width.max(1) as f32;
+                let scale_y = encode_height as f32 / capture_height.max(1) as f32;
+                let mut metadata = metadata;
+                if let Some((x, y)) = metadata.position {
+                    metadata.position = Some((
+                        (x as f32 * scale_x).round() as i32,
+                        (y as f32 * scale_y).round() as i32,
+                    ));
+                }
+                if let Some(bitmap) = metadata.bitmap.as_ref() {
+                    metadata.bitmap = Some(flux_capture::cursor::scale_cursor_bitmap(
+                        bitmap, scale_x, scale_y,
+                    ));
+                }
+                metadata
+            } else {
+                metadata
+            };
             let ts_micros = loop_start.elapsed().as_micros() as u64;
             let _ = cursor_tx.send(Arc::new((ts_micros, metadata)));
         })
@@ -1071,6 +1098,12 @@ fn capture_loop(
                 status.encode_height = encode_resolution.height;
                 status.encoder_backend = Some(format!("{backend:?}"));
             }
+            if let Ok(mut dimensions) = cursor_dimensions.write() {
+                dimensions.0 = capture_resolution.width;
+                dimensions.1 = capture_resolution.height;
+                dimensions.2 = encode_resolution.width;
+                dimensions.3 = encode_resolution.height;
+            }
             tracing::info!(
                 "Capture+encode loop: {}x{} captured → {}x{}@{}fps {:?} H.264",
                 capture_resolution.width, capture_resolution.height,
@@ -1099,6 +1132,12 @@ fn capture_loop(
                 ) {
                     Ok(s) => {
                         session = s;
+                        if let Ok(mut dimensions) = cursor_dimensions.write() {
+                            dimensions.0 = encode_resolution.width;
+                            dimensions.1 = encode_resolution.height;
+                            dimensions.2 = encode_resolution.width;
+                            dimensions.3 = encode_resolution.height;
+                        }
                         capture_resolution = encode_resolution;
                         tracing::info!("Capture restarted with GPU downscale to {}", encode_resolution);
                         continue;
@@ -1120,6 +1159,12 @@ fn capture_loop(
                                 return;
                             }
                         };
+                        if let Ok(mut dimensions) = cursor_dimensions.write() {
+                            dimensions.0 = primary.native_resolution.width;
+                            dimensions.1 = primary.native_resolution.height;
+                            dimensions.2 = encode_resolution.width;
+                            dimensions.3 = encode_resolution.height;
+                        }
                     }
                 }
             }
