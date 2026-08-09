@@ -16,8 +16,9 @@ use windows::Win32::Graphics::Gdi::{DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PAT
 // image entries; this keeps modeInfoIdx a plain index.
 const ACTIVE_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ONLY_ACTIVE_PATHS;
 const ALL_PATHS_QUERY_FLAGS: QUERY_DISPLAY_CONFIG_FLAGS = QDC_ALL_PATHS;
-const VALIDATE_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG;
-const APPLY_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG;
+const VALIDATE_FLAGS: SET_DISPLAY_CONFIG_FLAGS =
+    SET_DISPLAY_CONFIG_FLAGS(SDC_VALIDATE.0 | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0);
+const APPLY_FLAGS: SET_DISPLAY_CONFIG_FLAGS = SET_DISPLAY_CONFIG_FLAGS(SDC_APPLY.0 | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0);
 const QUERY_RETRIES: usize = 4;
 const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -320,16 +321,12 @@ fn target_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
 }
 
 fn set_source_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
-    unsafe {
-        path.sourceInfo.Anonymous.modeInfoIdx = index;
-    }
+    path.sourceInfo.Anonymous.modeInfoIdx = index;
     Ok(())
 }
 
 fn set_target_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
-    unsafe {
-        path.targetInfo.Anonymous.modeInfoIdx = index;
-    }
+    path.targetInfo.Anonymous.modeInfoIdx = index;
     Ok(())
 }
 
