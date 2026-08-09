@@ -25,8 +25,17 @@ use windows::core::Interface;
 
 /// DXGI Desktop Duplication capture backend.
 pub struct DxgiCapture {
+    state: Mutex<DxgiState>,
+}
+
+struct DxgiState {
+    /// Held to keep the factory that produced `targets` alive for as long as
+    /// those adapter-derived objects are cached.
+    #[allow(dead_code)]
     factory: IDXGIFactory1,
-    targets: Mutex<HashMap<u32, DxgiDisplayTarget>>,
+    inventory_key: Vec<String>,
+    displays: Vec<DisplayInfo>,
+    targets: HashMap<u32, DxgiDisplayTarget>,
 }
 
 /// The complete adapter/output/device tuple selected during enumeration.
@@ -59,8 +68,12 @@ impl DxgiCapture {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()
                 .map_err(|e| FluxError::Capture(format!("CreateDXGIFactory1 failed: {}", e)))?;
             let capture = Self {
-                factory,
-                targets: Mutex::new(HashMap::new()),
+                state: Mutex::new(DxgiState {
+                    factory,
+                    inventory_key: Vec::new(),
+                    displays: Vec::new(),
+                    targets: HashMap::new(),
+                }),
             };
 
             // Emit the complete inventory once for each backend instance.
@@ -72,14 +85,92 @@ impl DxgiCapture {
         }
     }
 
+    fn inventory_key(factory: &IDXGIFactory1) -> Result<Vec<String>> {
+        let mut key = Vec::new();
+        let mut adapter_index = 0u32;
+
+        unsafe {
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
+                let desc = adapter
+                    .GetDesc1()
+                    .map_err(|e| FluxError::Capture(format!("GetDesc1 failed: {}", e)))?;
+                let adapter_luid =
+                    u64::from(desc.AdapterLuid.LowPart) | ((desc.AdapterLuid.HighPart as i64 as u64) << 32);
+                let adapter_name_len =
+                    desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                let adapter_name =
+                    String::from_utf16_lossy(&desc.Description[..adapter_name_len]);
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                let mut adapter_key = format!(
+                    "adapter:{}:{}:{}:{}:{}:{}:{}",
+                    adapter_index,
+                    adapter_luid,
+                    adapter_name,
+                    desc.VendorId,
+                    desc.DeviceId,
+                    desc.Flags,
+                    desc.DedicatedVideoMemory,
+                );
+
+                if !software {
+                    let mut output_index = 0u32;
+                    while let Ok(output) = adapter.EnumOutputs(output_index) {
+                        let output_desc = output
+                            .GetDesc()
+                            .map_err(|e| FluxError::Capture(format!("GetDesc failed: {}", e)))?;
+                        let name_len =
+                            output_desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+                        let name =
+                            String::from_utf16_lossy(&output_desc.DeviceName[..name_len]);
+                        let rect = output_desc.DesktopCoordinates;
+                        adapter_key.push_str(&format!(
+                            "|output:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                            output_index,
+                            name,
+                            (rect.right - rect.left).max(0),
+                            (rect.bottom - rect.top).max(0),
+                            output_desc.AttachedToDesktop.as_bool(),
+                            output_desc.Rotation.0,
+                            rect.left,
+                            rect.top,
+                            rect.right,
+                            rect.bottom,
+                        ));
+                        output_index += 1;
+                    }
+                }
+                key.push(adapter_key);
+                adapter_index += 1;
+            }
+        }
+
+        Ok(key)
+    }
+
     fn enumerate_displays_internal(&self, diagnostics: bool) -> Result<Vec<DisplayInfo>> {
+        // DXGI factories snapshot the adapter/output set at creation. A new
+        // factory is therefore required while polling for a hot-plugged
+        // indirect display; the cached COM generation is replaced below only
+        // when the inventory key changes.
+        let fresh_factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|e| FluxError::Capture(format!("CreateDXGIFactory1 failed: {}", e)))?;
+        let fresh_key = Self::inventory_key(&fresh_factory)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FluxError::Capture("DXGI state cache poisoned".into()))?;
+        if state.inventory_key == fresh_key {
+            return Ok(state.displays.clone());
+        }
+        let log_inventory = diagnostics || !state.inventory_key.is_empty();
+        let factory = &fresh_factory;
         let mut displays = Vec::new();
         let mut targets = HashMap::new();
         let mut adapter_index = 0u32;
         let mut attached_display_count = 0u32;
 
         unsafe {
-            while let Ok(adapter) = self.factory.EnumAdapters1(adapter_index) {
+            while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
                 let desc = adapter
                     .GetDesc1()
                     .map_err(|e| FluxError::Capture(format!("GetDesc1 failed: {}", e)))?;
@@ -91,7 +182,7 @@ impl DxgiCapture {
                     String::from_utf16_lossy(&desc.Description[..adapter_name_len]);
 
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                    if diagnostics {
+                    if log_inventory {
                         tracing::info!(
                             "DXGI Adapter {}: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, software=true; skipped)",
                             adapter_index,
@@ -133,7 +224,7 @@ impl DxgiCapture {
                 let device = device;
                 let context = context;
 
-                if diagnostics {
+                if log_inventory {
                     tracing::info!(
                         "DXGI Adapter {}: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, VRAM={} MB)",
                         adapter_index,
@@ -196,7 +287,7 @@ impl DxgiCapture {
                         _ => (false, Some("D3D11 device unavailable".into())),
                     };
 
-                    if diagnostics {
+                    if log_inventory {
                         match duplication_error.as_deref() {
                             Some(error) => tracing::info!(
                                 "DXGI Adapter {} Output {}: {} ({}x{}, attached={}, rotation={:?}, desktop=({},{})-({},{}), duplicate_output=false, error={})",
@@ -262,10 +353,10 @@ impl DxgiCapture {
             }
         }
 
-        *self
-            .targets
-            .lock()
-            .map_err(|_| FluxError::Capture("DXGI target cache poisoned".into()))? = targets;
+        state.factory = fresh_factory;
+        state.inventory_key = fresh_key;
+        state.displays = displays.clone();
+        state.targets = targets;
         Ok(displays)
     }
 }
@@ -291,11 +382,12 @@ impl ScreenCapture for DxgiCapture {
         framerate: u32,
     ) -> Result<Box<dyn CaptureSession>> {
         let display_id = display_id.unwrap_or(0);
-        let targets = self
-            .targets
+        let state = self
+            .state
             .lock()
-            .map_err(|_| FluxError::Capture("DXGI target cache poisoned".into()))?;
-        let target = targets
+            .map_err(|_| FluxError::Capture("DXGI state cache poisoned".into()))?;
+        let target = state
+            .targets
             .get(&display_id)
             .ok_or_else(|| FluxError::Capture(format!("DXGI display {} was not enumerated", display_id)))?;
         if !target.capture_supported {
