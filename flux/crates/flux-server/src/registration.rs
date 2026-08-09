@@ -39,6 +39,30 @@ pub fn start(
     status: Arc<RwLock<RuntimeStatus>>,
 ) -> Option<oneshot::Sender<()>> {
     let base_url = config.relay.base_url.clone()?;
+    let parsed_base_url = match reqwest::Url::parse(&base_url) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some() =>
+        {
+            url
+        }
+        Ok(url) => {
+            tracing::warn!(
+                "Relay registration disabled: invalid base_url {:?}: expected http:// or https:// URL with a host (parsed scheme {:?})",
+                base_url,
+                url.scheme()
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Relay registration disabled: invalid base_url {:?}: {}",
+                base_url,
+                error
+            );
+            return None;
+        }
+    };
     let id_path = config_path(config).with_file_name("flux-machine-id");
     let id = match load_or_create_id(&id_path) {
         Ok(id) => id,
@@ -75,15 +99,14 @@ pub fn start(
     let (stop_tx, mut stop_rx) = oneshot::channel();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let endpoint = format!("{}/api/machines/register", base_url.trim_end_matches('/'));
+        let base_url = parsed_base_url.as_str().trim_end_matches('/').to_string();
+        let endpoint = format!("{base_url}/api/machines/register");
         let heartbeat = format!(
-            "{}/api/machines/{}/heartbeat",
-            base_url.trim_end_matches('/'),
+            "{base_url}/api/machines/{}/heartbeat",
             registration.id
         );
         let deregister = format!(
-            "{}/api/machines/{}/deregister",
-            base_url.trim_end_matches('/'),
+            "{base_url}/api/machines/{}/deregister",
             registration.id
         );
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -107,7 +130,7 @@ pub fn start(
             };
             first = false;
             if let Err(error) = client.post(url).json(&current).send().await {
-                tracing::warn!("Relay registration request failed: {error}");
+                tracing::warn!("Relay registration request failed for {url}: {error}");
             }
             tokio::select! {
                 _ = interval.tick() => {},

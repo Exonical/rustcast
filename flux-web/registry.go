@@ -1,6 +1,8 @@
 package main
 
 import (
+	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -222,6 +224,7 @@ func registerMachineRoutes(r *gin.Engine, registry *machineRegistry) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid registration: " + err.Error()})
 			return
 		}
+		input.FrameEndpoint = rewriteFrameEndpoint(c, input.FrameEndpoint)
 		// These endpoints are intentionally unauthenticated in this PR.
 		m := registry.upsert(input, false)
 		c.JSON(http.StatusOK, m.machineInfo)
@@ -236,6 +239,7 @@ func registerMachineRoutes(r *gin.Engine, registry *machineRegistry) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "heartbeat ID does not match path"})
 			return
 		}
+		input.FrameEndpoint = rewriteFrameEndpoint(c, input.FrameEndpoint)
 		m := registry.upsert(input, false)
 		c.JSON(http.StatusOK, m.machineInfo)
 	})
@@ -249,4 +253,31 @@ func registerMachineRoutes(r *gin.Engine, registry *machineRegistry) {
 	r.GET("/api/machines", func(c *gin.Context) {
 		c.JSON(http.StatusOK, registry.list())
 	})
+}
+
+func rewriteFrameEndpoint(c *gin.Context, endpoint string) string {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || (!ip.IsUnspecified() && !ip.IsLoopback()) {
+		return endpoint
+	}
+	clientIP := net.ParseIP(c.ClientIP())
+	if clientIP == nil {
+		log.Printf(
+			"[registry] cannot rewrite frame endpoint %q: registration client IP %q is invalid",
+			endpoint,
+			c.ClientIP(),
+		)
+		return endpoint
+	}
+	rewritten := net.JoinHostPort(clientIP.String(), port)
+	log.Printf(
+		"[registry] rewriting frame endpoint %q to %q using registration client IP",
+		endpoint,
+		rewritten,
+	)
+	return rewritten
 }
