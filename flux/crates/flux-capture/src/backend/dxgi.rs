@@ -582,6 +582,51 @@ struct DxgiCaptureSession {
     last_delivery: std::time::Instant,
 }
 
+struct AcquiredFrame {
+    duplication: IDXGIOutputDuplication,
+    released: bool,
+}
+
+impl AcquiredFrame {
+    fn new(duplication: &IDXGIOutputDuplication) -> Self {
+        Self {
+            duplication: duplication.clone(),
+            released: false,
+        }
+    }
+
+    fn release(mut self) -> Result<()> {
+        let result = unsafe { self.duplication.ReleaseFrame() };
+        self.released = true;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let code = error.code().0 as u32;
+                if code == 0x887A0026 {
+                    return Err(FluxError::CaptureSessionLost(
+                        "Desktop Duplication access lost while releasing frame".into(),
+                    ));
+                }
+                tracing::warn!(
+                    "DXGI ReleaseFrame failed (0x{code:08X}): {error}"
+                );
+                Err(FluxError::Capture(format!("ReleaseFrame: {error}")))
+            }
+        }
+    }
+}
+
+impl Drop for AcquiredFrame {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Err(error) = unsafe { self.duplication.ReleaseFrame() } {
+            tracing::error!("DXGI ReleaseFrame during frame-guard drop failed: {error}");
+        }
+    }
+}
+
 impl DxgiCaptureSession {
     fn new(
         device: &ID3D11Device,
@@ -702,20 +747,24 @@ impl DxgiCaptureSession {
                             "Desktop Duplication access lost — display mode changed".into(),
                         ));
                     }
+                    // DXGI_ERROR_INVALID_CALL — the previous frame was not released.
+                    if code == 0x887A0001 {
+                        return Err(FluxError::CaptureSessionLost(
+                            "Desktop Duplication frame was not released before the next acquisition".into(),
+                        ));
+                    }
                     return Err(FluxError::Capture(format!("AcquireNextFrame: {}", e)));
                 }
             }
 
+            let frame_guard = AcquiredFrame::new(&self.duplication);
             let resource = resource.ok_or_else(|| FluxError::Capture("Frame resource is null".into()))?;
 
-            // Skip unchanged desktop images (LastPresentTime == 0 means only
-            // the mouse moved) to keep GPU copy/scale/encode work near zero on
-            // a static screen. Still deliver a heartbeat frame periodically so
-            // late joiners and IDR requests aren't starved.
+            // LastPresentTime == 0 means the desktop image was unchanged since the last acquisition.
             if frame_info.LastPresentTime == 0
                 && self.last_delivery.elapsed() < std::time::Duration::from_secs(1)
             {
-                let _ = self.duplication.ReleaseFrame();
+                frame_guard.release()?;
                 return Ok(None);
             }
 
@@ -728,7 +777,9 @@ impl DxgiCaptureSession {
             match &self.scaler {
                 Some(scaler) => {
                     if let Err(e) = scaler.scale(&self.device, &self.context, &desktop_texture) {
-                        let _ = self.duplication.ReleaseFrame();
+                        if let Err(release_error) = frame_guard.release() {
+                            return Err(release_error);
+                        }
                         return Err(e);
                     }
                 }
@@ -739,7 +790,7 @@ impl DxgiCaptureSession {
             // reads from this texture on a different D3D11 device.
             self.context.Flush();
 
-            let _ = self.duplication.ReleaseFrame();
+            frame_guard.release()?;
 
             self.frame_sequence += 1;
             self.last_delivery = std::time::Instant::now();
