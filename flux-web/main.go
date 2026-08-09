@@ -67,7 +67,6 @@ type Session struct {
 	machine        *machineUpstream
 	release        func()
 	releaseOnce    sync.Once
-	cursorChan     chan cursorMsg
 	cursorDone     chan struct{}
 }
 
@@ -233,7 +232,6 @@ func newSession() (*Session, error) {
 	}
 
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack}
-	session.cursorChan = make(chan cursorMsg, 1)
 	session.cursorDone = make(chan struct{})
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
@@ -486,11 +484,19 @@ func forwardCursorUpdates(writer *wsWriter, session *Session) {
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 	var latest *cursorMsg
+	if session.machine != nil {
+		session.machine.mu.Lock()
+		if session.machine.lastCursor != nil {
+			copy := *session.machine.lastCursor
+			latest = &copy
+		}
+		session.machine.mu.Unlock()
+	}
 	for {
 		select {
 		case <-session.cursorDone:
 			return
-		case msg := <-session.cursorChan:
+		case msg := <-session.machine.cursorChan:
 			latest = &msg
 		case <-ticker.C:
 			if latest == nil {

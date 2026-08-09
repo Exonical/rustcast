@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "trap 'rm -rf .test-build' EXIT; tsc --target ES2020 --module commonjs --moduleResolution node --esModuleInterop --outDir .test-build lib/cursor-overlay.ts lib/cursor-overlay.test.ts && node --test .test-build/cursor-overlay.test.js"
   },
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.15",

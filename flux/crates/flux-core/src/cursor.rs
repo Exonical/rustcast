@@ -8,6 +8,26 @@
 //! decoding lives in `flux-capture`.
 use serde::{Deserialize, Serialize};
 
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Cursor position and (optionally) shape for a single moment in time.
 ///
 /// A cursor update may carry only a new position (the common case, every
@@ -44,6 +64,7 @@ pub struct CursorBitmap {
     /// Pixel format as a SPA `spa_video_format` id (e.g. BGRA). `0` is invalid.
     pub format: u32,
     /// Tightly-referenced pixel data of length `stride * height`.
+    #[serde(with = "base64_bytes")]
     pub pixels: Vec<u8>,
 }
 

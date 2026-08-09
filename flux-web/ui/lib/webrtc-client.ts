@@ -22,7 +22,7 @@ export interface CursorBitmap {
   height: number;
   stride: number;
   format: number;
-  pixels: number[];
+  pixels: string;
 }
 
 export interface CursorMetadata {

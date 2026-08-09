@@ -80,46 +80,7 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 func (u *machineUpstream) run() {
 	u.status("connecting")
 	go u.framePusher()
-	go u.cursorPusher()
 	u.connectFrameServer()
-}
-
-func (u *machineUpstream) cursorPusher() {
-	ticker := time.NewTicker(16 * time.Millisecond)
-	defer ticker.Stop()
-	var latest *cursorMsg
-	for {
-		select {
-		case <-u.stopChan:
-			return
-		case msg := <-u.cursorChan:
-			latest = &msg
-			u.mu.Lock()
-			copy := msg
-			u.lastCursor = &copy
-			u.mu.Unlock()
-		case <-ticker.C:
-			if latest == nil {
-				continue
-			}
-			sess := u.currentSession()
-			if sess != nil {
-				select {
-				case sess.cursorChan <- *latest:
-				default:
-					select {
-					case <-sess.cursorChan:
-					default:
-					}
-					select {
-					case sess.cursorChan <- *latest:
-					default:
-					}
-				}
-			}
-			latest = nil
-		}
-	}
 }
 
 func (u *machineUpstream) stop() {
@@ -147,6 +108,10 @@ func (u *machineUpstream) send(cmd []byte) bool {
 }
 
 func (u *machineUpstream) sendCursor(msg cursorMsg) {
+	u.mu.Lock()
+	copy := msg
+	u.lastCursor = &copy
+	u.mu.Unlock()
 	select {
 	case u.cursorChan <- msg:
 	default:
@@ -174,12 +139,6 @@ func (u *machineUpstream) bindSession(session *Session) *Session {
 	defer u.mu.Unlock()
 	old := u.session
 	u.session = session
-	if u.lastCursor != nil {
-		select {
-		case session.cursorChan <- *u.lastCursor:
-		default:
-		}
-	}
 	return old
 }
 

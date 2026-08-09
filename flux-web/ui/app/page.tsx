@@ -57,10 +57,13 @@ function CursorOverlay({
     canvas.width = bitmap.width;
     canvas.height = bitmap.height;
     const context = canvas.getContext("2d");
-    if (!context || bitmap.pixels.length < bitmap.stride * bitmap.height) return null;
+    if (!context) return null;
+    const encoded = atob(bitmap.pixels);
+    if (encoded.length < bitmap.stride * bitmap.height) return null;
+    const sourcePixels = Uint8Array.from(encoded, (character) => character.charCodeAt(0));
     const rgba = new Uint8ClampedArray(bitmap.width * bitmap.height * 4);
     for (let y = 0; y < bitmap.height; y++) {
-      rgba.set(bitmap.pixels.slice(y * bitmap.stride, y * bitmap.stride + bitmap.width * 4), y * bitmap.width * 4);
+      rgba.set(sourcePixels.subarray(y * bitmap.stride, y * bitmap.stride + bitmap.width * 4), y * bitmap.width * 4);
     }
     context.putImageData(new ImageData(rgba, bitmap.width, bitmap.height), 0, 0);
     return canvas.toDataURL();
@@ -309,7 +312,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
       video?.removeEventListener("loadedmetadata", updateLayout);
       window.removeEventListener("resize", updateLayout);
     };
-  }, [connectionState, cursor]);
+  }, [isFullscreen]);
 
   useEffect(() => {
     const h = () => setIsFullscreen(!!document.fullscreenElement);
