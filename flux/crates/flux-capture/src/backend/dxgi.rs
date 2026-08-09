@@ -152,7 +152,7 @@ impl DxgiCapture {
         // factory is therefore required while polling for a hot-plugged
         // indirect display; the cached COM generation is replaced below only
         // when the inventory key changes.
-        let fresh_factory: IDXGIFactory1 = CreateDXGIFactory1()
+        let fresh_factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
             .map_err(|e| FluxError::Capture(format!("CreateDXGIFactory1 failed: {}", e)))?;
         let fresh_key = Self::inventory_key(&fresh_factory)?;
         let mut state = self
