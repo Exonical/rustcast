@@ -52,6 +52,15 @@ struct FluxIddStatus {
     adapter_ready: u32,
     monitor_plugged_in: u32,
     monitor_operation_in_progress: u32,
+    adapter_init_finished_entry_count: u32,
+    device_init_config_status: i32,
+    device_initialize_status: i32,
+    adapter_handle_nonnull: u32,
+    adapter_config_size: u32,
+    adapter_caps_size: u32,
+    iddcx_version_major: u32,
+    iddcx_version_minor: u32,
+    iddcx_minimum_version_required: u32,
 }
 
 /// An open handle to the FluxIdd driver with the virtual monitor plugged in.
@@ -108,13 +117,27 @@ impl VirtualDisplay {
                     "FluxIdd status after plug-in failure: d0_entry_ran={}, \
                      adapter_init_async_status=0x{:08x}, adapter_init_status=0x{:08x}, \
                      adapter_ready={}, monitor_plugged_in={}, \
-                     monitor_operation_in_progress={}",
+                     monitor_operation_in_progress={}, \
+                     adapter_init_finished_entry_count={}, \
+                     device_init_config_status=0x{:08x}, \
+                     device_initialize_status=0x{:08x}, \
+                     adapter_handle_nonnull={}, adapter_config_size={}, \
+                     adapter_caps_size={}, iddcx_version={}.{} min={}",
                     status.d0_entry_ran,
                     status.adapter_init_async_status as u32,
                     status.adapter_init_status as u32,
                     status.adapter_ready,
                     status.monitor_plugged_in,
                     status.monitor_operation_in_progress,
+                    status.adapter_init_finished_entry_count,
+                    status.device_init_config_status as u32,
+                    status.device_initialize_status as u32,
+                    status.adapter_handle_nonnull,
+                    status.adapter_config_size,
+                    status.adapter_caps_size,
+                    status.iddcx_version_major,
+                    status.iddcx_version_minor,
+                    status.iddcx_minimum_version_required,
                 ),
                 Err(status_error) => {
                     tracing::error!("FluxIdd status query after plug-in failure failed: {status_error}")
@@ -146,6 +169,15 @@ fn query_status(device: HANDLE) -> Result<FluxIddStatus, String> {
         adapter_ready: 0,
         monitor_plugged_in: 0,
         monitor_operation_in_progress: 0,
+        adapter_init_finished_entry_count: 0,
+        device_init_config_status: 0,
+        device_initialize_status: 0,
+        adapter_handle_nonnull: 0,
+        adapter_config_size: 0,
+        adapter_caps_size: 0,
+        iddcx_version_major: 0,
+        iddcx_version_minor: 0,
+        iddcx_minimum_version_required: 0,
     };
     let mut returned = 0u32;
     unsafe {

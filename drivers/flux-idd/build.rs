@@ -2,7 +2,15 @@
 //! bindgen bindings for IddCx (not shipped by wdk-sys).
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
+
+// This ABI version is intentionally pinned; selecting the newest WDK
+// directory would silently change bindgen layouts.
+const IDDCX_VERSION_MAJOR: u32 = 1;
+const IDDCX_VERSION_MINOR: u32 = 4;
+const IDDCX_MINIMUM_VERSION_REQUIRED: u32 = 4;
+const IDDCX_VERSION_DIRECTORY: &str = "1.4";
 
 // IddCx exposes its API as FORCEINLINE functions dispatching through the
 // IddCxFunctions table. Defining IDD_STUB before including iddcx.h makes the
@@ -28,21 +36,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std::error::Error>> {
-    let out_path = PathBuf::from(env::var("OUT_DIR")?).join("iddcx_bindings.rs");
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let out_path = out_dir.join("iddcx_bindings.rs");
+    fs::write(
+        out_dir.join("iddcx_version.rs"),
+        format!(
+            "pub const FLUX_IDDCX_VERSION_MAJOR: u32 = {IDDCX_VERSION_MAJOR};\n\
+             pub const FLUX_IDDCX_VERSION_MINOR: u32 = {IDDCX_VERSION_MINOR};\n\
+             pub const FLUX_IDDCX_MINIMUM_VERSION_REQUIRED: u32 = {IDDCX_MINIMUM_VERSION_REQUIRED};\n"
+        ),
+    )?;
 
     let mut builder = bindgen::Builder::default()
         .header_contents(
             "iddcx_wrapper.h",
-            r#"
+            &format!(
+                r#"
 #include <windows.h>
 #include <wudfwdm.h>
 #include <wdf.h>
-#define IDDCX_VERSION_MAJOR 1
-#define IDDCX_VERSION_MINOR 4
-#define IDDCX_MINIMUM_VERSION_REQUIRED 4
+#define IDDCX_VERSION_MAJOR {IDDCX_VERSION_MAJOR}
+#define IDDCX_VERSION_MINOR {IDDCX_VERSION_MINOR}
+#define IDDCX_MINIMUM_VERSION_REQUIRED {IDDCX_MINIMUM_VERSION_REQUIRED}
 #define IDD_STUB
 #include <iddcx.h>
-"#,
+"#
+            ),
         )
         .allowlist_item("Idd.*")
         .allowlist_item("IDDCX_.*")
@@ -108,46 +127,21 @@ fn iddcx_stub_lib_dir(iddcx_include_dir: &Path) -> Option<PathBuf> {
     lib_dir.is_dir().then_some(lib_dir)
 }
 
-/// IddCx.h is not on the standard WDK include paths: it lives in a versioned
-/// subdirectory `Include\<sdk-version>\um\iddcx\<iddcx-version>\` (newer
-/// WDKs) or directly in `um\iddcx\`. Probe the WDK include paths for it and
-/// return the newest matching directory.
+/// IddCx.h is not on the standard WDK include paths: it lives in the pinned
+/// subdirectory `Include\<sdk-version>\um\iddcx\<iddcx-version>\`. Do not
+/// fall back to another version because the generated layout is ABI-sensitive.
 fn find_iddcx_include_dir(
     config: &wdk_build::Config,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
     for include_dir in config.include_paths()? {
         let iddcx_root = include_dir.join("iddcx");
-        if iddcx_root.join("IddCx.h").exists() {
-            candidates.push(iddcx_root.clone());
-        }
-        if let Ok(entries) = std::fs::read_dir(&iddcx_root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.join("IddCx.h").exists() {
-                    candidates.push(path);
-                }
-            }
+        let pinned_dir = iddcx_root.join(IDDCX_VERSION_DIRECTORY);
+        if pinned_dir.join("IddCx.h").exists() {
+            return Ok(pinned_dir);
         }
     }
-
-    // Version directories sort lexicographically well enough (e.g. 1.10 > 1.9
-    // is the one wrinkle, so compare numerically when both parse).
-    candidates.sort_by(|a, b| {
-        let ver = |p: &PathBuf| -> Option<(u32, u32)> {
-            let name = p.file_name()?.to_str()?;
-            let (major, minor) = name.split_once('.')?;
-            Some((major.parse().ok()?, minor.parse().ok()?))
-        };
-        match (ver(a), ver(b)) {
-            (Some(va), Some(vb)) => va.cmp(&vb),
-            _ => a.cmp(b),
-        }
-    });
-
-    candidates.pop().ok_or_else(|| {
-        "IddCx.h not found under any WDK include path (looked for um\\iddcx[\\<version>]\\IddCx.h). Is the full WDK installed?"
-            .into()
-    })
+    Err(format!(
+        "pinned IddCx {IDDCX_VERSION_DIRECTORY} headers not found under any WDK include path; refusing to select another version"
+    )
+    .into())
 }
