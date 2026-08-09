@@ -2,7 +2,9 @@
 
 #![cfg(target_os = "windows")]
 
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,262 @@ const CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(5);
 struct DisplayConfig {
     paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+}
+
+#[derive(Clone)]
+pub struct PrivacyController {
+    inner: Arc<Mutex<PrivacyState>>,
+}
+
+struct PrivacyState {
+    target: DisplayInfo,
+    snapshot_path: PathBuf,
+    lock_on_disconnect: bool,
+    privacy_applied: bool,
+}
+
+impl PrivacyController {
+    pub fn new(target: DisplayInfo, snapshot_path: PathBuf, lock_on_disconnect: bool) -> Result<Self, String> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(PrivacyState {
+                target,
+                snapshot_path,
+                lock_on_disconnect,
+                privacy_applied: false,
+            })),
+        })
+    }
+
+    pub fn update_viewer_count(&self, count: u32) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "privacy state lock poisoned".to_string())?;
+        if count > 0 {
+            if state.privacy_applied {
+                return Ok(());
+            }
+            apply_privacy(&state.target, &state.snapshot_path)?;
+            state.privacy_applied = true;
+            tracing::info!("Privacy mode enabled for {} remote viewer(s)", count);
+        } else if state.privacy_applied {
+            restore_snapshot(&state.snapshot_path)?;
+            state.privacy_applied = false;
+            tracing::info!("Privacy mode disabled; physical display topology restored");
+            if state.lock_on_disconnect {
+                // LockWorkStation is asynchronous; success only means that the
+                // request was initiated, not that the secure desktop is active.
+                lock_workstation()?;
+                tracing::info!(
+                    "Workstation lock requested after privacy topology restoration; \
+                     reconnecting viewers will see the lock screen until sign-in"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn restore(&self) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "privacy state lock poisoned".to_string())?;
+        if !state.privacy_applied && !state.snapshot_path.exists() {
+            return Ok(());
+        }
+        restore_snapshot(&state.snapshot_path)?;
+        state.privacy_applied = false;
+        tracing::info!("Restored physical display topology during shutdown");
+        Ok(())
+    }
+}
+
+impl Drop for PrivacyController {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
+        if let Ok(mut state) = self.inner.lock() {
+            if state.privacy_applied || state.snapshot_path.exists() {
+                if let Err(error) = restore_snapshot(&state.snapshot_path) {
+                    tracing::error!("Failed to restore privacy topology during drop: {error}");
+                } else {
+                    state.privacy_applied = false;
+                    tracing::info!("Restored physical display topology during drop");
+                }
+            }
+        }
+    }
+}
+
+pub fn recover_snapshot(snapshot_path: &Path) -> Result<(), String> {
+    if !snapshot_path.exists() {
+        return Ok(());
+    }
+    tracing::warn!(
+        "Found an unclean privacy topology snapshot at {}; restoring it before startup",
+        snapshot_path.display()
+    );
+    restore_snapshot(snapshot_path)
+}
+
+fn apply_privacy(target: &DisplayInfo, snapshot_path: &Path) -> Result<(), String> {
+    let config = query_config(ACTIVE_QUERY_FLAGS)?;
+    let adapter_luid = target
+        .adapter_luid
+        .ok_or_else(|| format!("DXGI output {} has no adapter LUID", target.name))?;
+    let (virtual_index, _) = find_source_path(&config.paths, adapter_luid, &target.name)?;
+    write_snapshot(snapshot_path, &config)?;
+
+    let mut privacy_config = config;
+    for (index, path) in privacy_config.paths.iter_mut().enumerate() {
+        if index == virtual_index {
+            path.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        } else {
+            path.flags &= !DISPLAYCONFIG_PATH_ACTIVE;
+        }
+    }
+    apply_and_verify_privacy(&privacy_config, target, adapter_luid)
+}
+
+fn apply_and_verify_privacy(config: &DisplayConfig, target: &DisplayInfo, adapter_luid: u64) -> Result<(), String> {
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
+    if status != 0 {
+        return Err(format!(
+            "CCD privacy validate rejected (status {}): SetDisplayConfig",
+            status
+        ));
+    }
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
+    if status != 0 {
+        return Err(format!(
+            "CCD privacy apply failed (status {}): SetDisplayConfig",
+            status
+        ));
+    }
+
+    let active = query_config(ACTIVE_QUERY_FLAGS)?;
+    let (virtual_index, _) = find_source_path(&active.paths, adapter_luid, &target.name)?;
+    if active.paths[virtual_index].flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+        return Err("CCD privacy verification mismatch: virtual path is inactive".into());
+    }
+    let all_paths = query_config(ALL_PATHS_QUERY_FLAGS)?;
+    for path in all_paths.paths {
+        if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        if source_name(path.sourceInfo.adapterId, path.sourceInfo.id)? != target.name {
+            return Err("CCD privacy verification mismatch: a physical source remains active".into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_snapshot(snapshot_path: &Path) -> Result<(), String> {
+    let config = read_snapshot(snapshot_path)?;
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
+    if status != 0 {
+        return Err(format!(
+            "CCD restore validate rejected (status {}): SetDisplayConfig",
+            status
+        ));
+    }
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
+    if status != 0 {
+        return Err(format!(
+            "CCD restore apply failed (status {}): SetDisplayConfig",
+            status
+        ));
+    }
+
+    let active = query_config(ACTIVE_QUERY_FLAGS)?;
+    for expected in &config.paths {
+        if expected.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        if !active.paths.iter().any(|actual| {
+            actual.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+                && actual.sourceInfo.adapterId == expected.sourceInfo.adapterId
+                && actual.sourceInfo.id == expected.sourceInfo.id
+                && actual.targetInfo.adapterId == expected.targetInfo.adapterId
+                && actual.targetInfo.id == expected.targetInfo.id
+        }) {
+            return Err("CCD restore verification mismatch: a saved active path is missing".into());
+        }
+    }
+    std::fs::remove_file(snapshot_path).map_err(|error| format!("remove privacy topology snapshot: {error}"))?;
+    Ok(())
+}
+
+fn write_snapshot(snapshot_path: &Path, config: &DisplayConfig) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    append_snapshot_vec(&mut bytes, &config.paths);
+    append_snapshot_vec(&mut bytes, &config.modes);
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("create privacy snapshot directory: {error}"))?;
+    }
+    let temporary = snapshot_path.with_extension("tmp");
+    std::fs::write(&temporary, bytes).map_err(|error| format!("write privacy topology snapshot: {error}"))?;
+    std::fs::rename(&temporary, snapshot_path).map_err(|error| format!("commit privacy topology snapshot: {error}"))?;
+    Ok(())
+}
+
+fn read_snapshot(snapshot_path: &Path) -> Result<DisplayConfig, String> {
+    let bytes = std::fs::read(snapshot_path).map_err(|error| format!("read privacy topology snapshot: {error}"))?;
+    let mut offset = 0;
+    let paths = read_snapshot_vec::<DISPLAYCONFIG_PATH_INFO>(&bytes, &mut offset)?;
+    let modes = read_snapshot_vec::<DISPLAYCONFIG_MODE_INFO>(&bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err("privacy topology snapshot contains trailing data".into());
+    }
+    Ok(DisplayConfig { paths, modes })
+}
+
+fn append_snapshot_vec<T: Copy>(bytes: &mut Vec<u8>, values: &[T]) {
+    bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    let raw = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of::<T>() * values.len()) };
+    bytes.extend_from_slice(raw);
+}
+
+fn read_snapshot_vec<T: Copy>(bytes: &[u8], offset: &mut usize) -> Result<Vec<T>, String> {
+    let count = read_snapshot_u32(bytes, offset)? as usize;
+    let size = size_of::<T>()
+        .checked_mul(count)
+        .ok_or_else(|| "privacy topology snapshot size overflow".to_string())?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| "privacy topology snapshot offset overflow".to_string())?;
+    if end > bytes.len() {
+        return Err("privacy topology snapshot is truncated".into());
+    }
+    let mut values = Vec::with_capacity(count);
+    for chunk in bytes[*offset..end].chunks_exact(size_of::<T>()) {
+        let mut value = MaybeUninit::<T>::uninit();
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), value.as_mut_ptr().cast::<u8>(), size_of::<T>());
+            values.push(value.assume_init());
+        }
+    }
+    *offset = end;
+    Ok(values)
+}
+
+fn read_snapshot_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| "privacy topology snapshot offset overflow".to_string())?;
+    if end > bytes.len() {
+        return Err("privacy topology snapshot is truncated".into());
+    }
+    let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+fn lock_workstation() -> Result<(), String> {
+    unsafe {
+        windows::Win32::System::Shutdown::LockWorkStation().map_err(|error| format!("LockWorkStation failed: {error}"))
+    }
 }
 
 /// Apply a temporary Extend topology and the requested mode to the virtual

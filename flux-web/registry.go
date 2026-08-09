@@ -168,7 +168,6 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		return nil, err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if m.upstream == nil {
 		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
@@ -176,7 +175,13 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		go m.upstream.run()
 	}
 	m.upstream.viewers++
-	return m.upstream, nil
+	upstream := m.upstream
+	viewerCount := m.upstream.viewers
+	r.mu.Unlock()
+	if !upstream.sendViewerCount(viewerCount) {
+		log.Printf("[frame:%s] upstream command channel full, dropped viewer count %d", upstream.id, viewerCount)
+	}
+	return upstream, nil
 }
 
 func (r *machineRegistry) setUpstreamStatus(id, status string) {
@@ -202,9 +207,16 @@ func (r *machineRegistry) release(m *machineUpstream) {
 			}
 		}
 	}
+	viewerCount := m.viewers
 	r.mu.Unlock()
+	if !m.sendViewerCount(viewerCount) {
+		log.Printf("[frame:%s] upstream command channel full, dropped viewer count %d", m.id, viewerCount)
+	}
 	if stop {
-		m.stop()
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			m.stop()
+		}()
 	}
 }
 

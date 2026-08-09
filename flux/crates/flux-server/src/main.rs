@@ -23,6 +23,10 @@ mod tray;
 use flux_core::config::FluxConfig;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
+#[cfg(target_os = "windows")]
+type PrivacyController = ccd_display::PrivacyController;
+#[cfg(not(target_os = "windows"))]
+type PrivacyController = ();
 #[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
@@ -68,6 +72,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.save(&args.config)?;
         config
     };
+
+    #[cfg(target_os = "windows")]
+    {
+        let privacy_snapshot_path = config
+            .security
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("privacy_topology.bin");
+        ccd_display::recover_snapshot(&privacy_snapshot_path)
+            .map_err(|error| format!("recover privacy display topology: {error}"))?;
+    }
+    if config.video.privacy.enabled && config.video.virtual_display.is_none() {
+        return Err(
+            "privacy mode requires [video.virtual_display]; refusing to disable the only display"
+                .into(),
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    if config.video.privacy.enabled {
+        return Err("privacy mode is only supported on Windows".into());
+    }
 
     tracing::info!("Starting Flux Server: {}", config.name);
 
@@ -281,6 +307,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     let virtual_display_target = None;
 
+    #[cfg(target_os = "windows")]
+    let privacy_controller = if config.video.privacy.enabled {
+        let privacy_snapshot_path = config
+            .security
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("privacy_topology.bin");
+        Some(
+            ccd_display::PrivacyController::new(
+                virtual_display_target
+                    .clone()
+                    .ok_or("privacy mode requires a confirmed virtual display output")?,
+                privacy_snapshot_path,
+                config.video.privacy.lock_on_disconnect,
+            )
+            .map_err(|error| format!("initialize privacy mode: {error}"))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "windows"))]
+    let privacy_controller: Option<PrivacyController> = None;
+
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
     // Each message carries the frame's capture timestamp (microseconds since
@@ -356,8 +406,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
                 let input_tx = input_tx.clone();
+                let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
-                    quic_frames::serve(endpoint, h264_tx, idr_tx, bitrate_tx, input_tx).await;
+                    quic_frames::serve(
+                        endpoint,
+                        h264_tx,
+                        idr_tx,
+                        bitrate_tx,
+                        input_tx,
+                        privacy_controller,
+                    )
+                    .await;
                 }))
             }
             Err(e) => {
@@ -371,8 +430,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let frame_privacy_controller = privacy_controller.clone();
     let frame_handle = tokio::spawn(async move {
-        frame_server(frame_listener, h264_tx, idr_tx, bitrate_tx, input_tx).await;
+        frame_server(
+            frame_listener,
+            h264_tx,
+            idr_tx,
+            bitrate_tx,
+            input_tx,
+            frame_privacy_controller,
+        )
+        .await;
     });
 
     // Build the server.
@@ -400,6 +468,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(h) = quic_handle {
         h.abort();
     }
+    #[cfg(target_os = "windows")]
+    if let Some(privacy) = privacy_controller {
+        if let Err(error) = privacy.restore() {
+            tracing::error!("Failed to restore privacy display topology: {error}");
+        }
+    }
     server.shutdown().await;
     if let Some(stop) = registration_stop {
         let _ = stop.send(());
@@ -416,6 +490,7 @@ async fn frame_server(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    privacy_controller: Option<PrivacyController>,
 ) {
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -442,6 +517,9 @@ async fn frame_server(
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
         let input_tx = input_tx.clone();
+        let privacy_controller = privacy_controller.clone();
+        #[cfg(not(target_os = "windows"))]
+        let _ = &privacy_controller;
 
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -512,6 +590,22 @@ async fn frame_server(
                             let kbps = u32::from_be_bytes(kbps_buf);
                             tracing::info!("Client {} requested bitrate {} kbps", addr, kbps);
                             let _ = bitrate_tx.send(kbps);
+                        }
+                        0x04 => {
+                            let mut count_buf = [0u8; 4];
+                            if reader.read_exact(&mut count_buf).await.is_err() {
+                                break;
+                            }
+                            let count = u32::from_be_bytes(count_buf);
+                            tracing::info!("Client {} reported {} viewer(s)", addr, count);
+                            #[cfg(target_os = "windows")]
+                            if let Some(privacy) = privacy_controller.as_ref() {
+                                if let Err(error) = privacy.update_viewer_count(count) {
+                                    tracing::error!(
+                                        "Privacy mode viewer-count update failed: {error}"
+                                    );
+                                }
+                            }
                         }
                         _ => {
                             tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);

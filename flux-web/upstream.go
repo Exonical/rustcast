@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -28,6 +29,7 @@ type machineUpstream struct {
 	stopChan    chan struct{}
 	stopOnce    sync.Once
 	viewers     int // Protected by machineRegistry.mu.
+	viewerCount atomic.Uint32
 	mu          sync.Mutex
 	session     *Session
 	conn        net.Conn
@@ -75,6 +77,14 @@ func (u *machineUpstream) send(cmd []byte) bool {
 	default:
 		return false
 	}
+}
+
+func (u *machineUpstream) sendViewerCount(count int) bool {
+	u.viewerCount.Store(uint32(count))
+	cmd := make([]byte, 5)
+	cmd[0] = 0x04
+	binary.BigEndian.PutUint32(cmd[1:], uint32(count))
+	return u.send(cmd)
 }
 
 func (u *machineUpstream) bindSession(session *Session) *Session {
@@ -129,6 +139,7 @@ func (u *machineUpstream) connectFrameServer() {
 		u.mu.Lock()
 		u.conn = conn
 		u.mu.Unlock()
+		_ = u.sendViewerCount(int(u.viewerCount.Load()))
 
 		// Spawn writer for upstream commands.
 		done := make(chan struct{})
@@ -238,6 +249,7 @@ func (u *machineUpstream) connectQUIC() error {
 	u.mu.Lock()
 	u.cancel = connCancel
 	u.mu.Unlock()
+	_ = u.sendViewerCount(int(u.viewerCount.Load()))
 	defer func() {
 		u.mu.Lock()
 		u.cancel = nil
