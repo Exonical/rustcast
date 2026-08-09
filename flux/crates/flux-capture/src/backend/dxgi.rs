@@ -10,8 +10,11 @@ use flux_core::types::{PixelFormat, Resolution};
 
 use crate::traits::{CaptureSession, DisplayInfo, ScreenCapture};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -22,9 +25,20 @@ use windows::core::Interface;
 
 /// DXGI Desktop Duplication capture backend.
 pub struct DxgiCapture {
+    factory: IDXGIFactory1,
+    targets: Mutex<HashMap<u32, DxgiDisplayTarget>>,
+}
+
+/// The complete adapter/output/device tuple selected during enumeration.
+///
+/// Keeping these COM objects together prevents `start_capture` from
+/// re-resolving an output on a different adapter than the one tested during
+/// enumeration.
+struct DxgiDisplayTarget {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+    capture_supported: bool,
 }
 
 impl DxgiCapture {
@@ -42,43 +56,217 @@ impl DxgiCapture {
                 tracing::debug!("SetProcessDpiAwarenessContext: {} (already set?)", e);
             }
 
-            // Create D3D11 device with BGRA support (needed for Desktop Duplication)
-            let mut device = None;
-            let mut context = None;
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()
+                .map_err(|e| FluxError::Capture(format!("CreateDXGIFactory1 failed: {}", e)))?;
+            let capture = Self {
+                factory,
+                targets: Mutex::new(HashMap::new()),
+            };
 
-            D3D11CreateDevice(
-                None,                          // default adapter
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),            // no software rasterizer
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,                          // default feature levels
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,                          // don't need selected feature level
-                Some(&mut context),
-            )
-            .map_err(|e| FluxError::Capture(format!("D3D11CreateDevice failed: {}", e)))?;
-
-            let device = device.ok_or_else(|| FluxError::Capture("D3D11 device is null".into()))?;
-            let context =
-                context.ok_or_else(|| FluxError::Capture("D3D11 context is null".into()))?;
-
-            // Get the DXGI adapter from the device
-            let dxgi_device: IDXGIDevice = device.cast()
-                .map_err(|e| FluxError::Capture(format!("QueryInterface IDXGIDevice: {}", e)))?;
-            let adapter: IDXGIAdapter = dxgi_device.GetAdapter()
-                .map_err(|e| FluxError::Capture(format!("GetAdapter: {}", e)))?;
-            let adapter: IDXGIAdapter1 = adapter.cast()
-                .map_err(|e| FluxError::Capture(format!("QueryInterface IDXGIAdapter1: {}", e)))?;
-
-            let desc = adapter.GetDesc1()
-                .map_err(|e| FluxError::Capture(format!("GetDesc1: {}", e)))?;
-            let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
-            let adapter_name = String::from_utf16_lossy(&desc.Description[..name_len]);
-            tracing::info!("DXGI capture using adapter: {}", adapter_name);
-
-            Ok(Self { device, context, adapter })
+            // Emit the complete inventory once for each backend instance.
+            // The virtual-display probe creates one instance before plug-in
+            // and the capture loop creates another after plug-in, without
+            // making the 100 ms identity polling loop noisy.
+            let _ = capture.enumerate_displays_internal(true)?;
+            Ok(capture)
         }
+    }
+
+    fn enumerate_displays_internal(&self, diagnostics: bool) -> Result<Vec<DisplayInfo>> {
+        let mut displays = Vec::new();
+        let mut targets = HashMap::new();
+        let mut adapter_index = 0u32;
+        let mut attached_display_count = 0u32;
+
+        unsafe {
+            while let Ok(adapter) = self.factory.EnumAdapters1(adapter_index) {
+                let desc = adapter
+                    .GetDesc1()
+                    .map_err(|e| FluxError::Capture(format!("GetDesc1 failed: {}", e)))?;
+                let adapter_luid =
+                    u64::from(desc.AdapterLuid.LowPart) | ((desc.AdapterLuid.HighPart as i64 as u64) << 32);
+                let adapter_name_len =
+                    desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                let adapter_name =
+                    String::from_utf16_lossy(&desc.Description[..adapter_name_len]);
+
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    if diagnostics {
+                        tracing::info!(
+                            "DXGI Adapter {}: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, software=true; skipped)",
+                            adapter_index,
+                            adapter_name,
+                            adapter_luid,
+                            desc.VendorId,
+                            desc.DeviceId,
+                        );
+                    }
+                    adapter_index += 1;
+                    continue;
+                }
+
+                let mut device = None;
+                let mut context = None;
+                // Create a device explicitly from each adapter. Do not rely
+                // on DXGI's default/hybrid-GPU preference: output reparenting
+                // can place an indirect-display output on a different adapter
+                // than the one selected by D3D11CreateDevice(None, ...).
+                let device_result = D3D11CreateDevice(
+                    &adapter,
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                );
+                if let Err(e) = device_result {
+                    tracing::warn!(
+                        "DXGI Adapter {} ({}): D3D11 device creation failed; outputs will be diagnostic-only: {}",
+                        adapter_index,
+                        adapter_name,
+                        e,
+                    );
+                }
+                let device = device;
+                let context = context;
+
+                if diagnostics {
+                    tracing::info!(
+                        "DXGI Adapter {}: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, VRAM={} MB)",
+                        adapter_index,
+                        adapter_name,
+                        adapter_luid,
+                        desc.VendorId,
+                        desc.DeviceId,
+                        desc.DedicatedVideoMemory / (1024 * 1024),
+                    );
+                }
+
+                let mut output_index = 0u32;
+                while let Ok(output) = adapter.EnumOutputs(output_index) {
+                    let output_desc = output
+                        .GetDesc()
+                        .map_err(|e| FluxError::Capture(format!("GetDesc failed: {}", e)))?;
+                    let name_len =
+                        output_desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+                    let name =
+                        String::from_utf16_lossy(&output_desc.DeviceName[..name_len]);
+                    let rect = output_desc.DesktopCoordinates;
+                    let width = (rect.right - rect.left).max(0) as u32;
+                    let height = (rect.bottom - rect.top).max(0) as u32;
+
+                    let (capture_supported, duplication_error) = match (&device, &context) {
+                        (Some(device), Some(_context)) => match output.cast::<IDXGIOutput1>() {
+                            Ok(output1) => match output1.DuplicateOutput(device) {
+                                Ok(duplication) => {
+                                    // Release the test duplication before
+                                    // storing the output. DXGI permits only a
+                                    // limited number of duplications per
+                                    // output, so never retain this probe.
+                                    drop(duplication);
+                                    (true, None)
+                                }
+                                Err(e) => {
+                                    let error = e.to_string();
+                                    tracing::debug!(
+                                        "DXGI Adapter {} output {} ({}): DuplicateOutput test failed: {}",
+                                        adapter_index,
+                                        output_index,
+                                        name,
+                                        error,
+                                    );
+                                    (false, Some(error))
+                                }
+                            },
+                            Err(e) => {
+                                let error = e.to_string();
+                                tracing::debug!(
+                                    "DXGI Adapter {} output {} ({}): IDXGIOutput1 unavailable: {}",
+                                    adapter_index,
+                                    output_index,
+                                    name,
+                                    error,
+                                );
+                                (false, Some(error))
+                            }
+                        },
+                        _ => (false, Some("D3D11 device unavailable".into())),
+                    };
+
+                    if diagnostics {
+                        match duplication_error.as_deref() {
+                            Some(error) => tracing::info!(
+                                "DXGI Adapter {} Output {}: {} ({}x{}, attached={}, rotation={:?}, desktop=({},{})-({},{}), duplicate_output=false, error={})",
+                                adapter_index,
+                                output_index,
+                                name,
+                                width,
+                                height,
+                                output_desc.AttachedToDesktop.as_bool(),
+                                output_desc.Rotation,
+                                rect.left,
+                                rect.top,
+                                rect.right,
+                                rect.bottom,
+                                error,
+                            ),
+                            None => tracing::info!(
+                                "DXGI Adapter {} Output {}: {} ({}x{}, attached={}, rotation={:?}, desktop=({},{})-({},{}), duplicate_output=true)",
+                                adapter_index,
+                                output_index,
+                                name,
+                                width,
+                                height,
+                                output_desc.AttachedToDesktop.as_bool(),
+                                output_desc.Rotation,
+                                rect.left,
+                                rect.top,
+                                rect.right,
+                                rect.bottom,
+                            ),
+                        }
+                    }
+
+                    if output_desc.AttachedToDesktop.as_bool() {
+                        let display_id = (adapter_index << 16) | output_index;
+                        displays.push(DisplayInfo {
+                            id: display_id,
+                            adapter_luid: Some(adapter_luid),
+                            name,
+                            native_resolution: Resolution::new(width, height),
+                            primary: attached_display_count == 0,
+                            capture_supported,
+                        });
+                        attached_display_count += 1;
+
+                        if let (Some(device), Some(context)) = (device.clone(), context.clone()) {
+                            targets.insert(
+                                display_id,
+                                DxgiDisplayTarget {
+                                    device,
+                                    context,
+                                    output: output.clone(),
+                                    capture_supported,
+                                },
+                            );
+                        }
+                    }
+
+                    output_index += 1;
+                }
+
+                adapter_index += 1;
+            }
+        }
+
+        *self
+            .targets
+            .lock()
+            .map_err(|_| FluxError::Capture("DXGI target cache poisoned".into()))? = targets;
+        Ok(displays)
     }
 }
 
@@ -88,47 +276,7 @@ impl ScreenCapture for DxgiCapture {
     }
 
     fn enumerate_displays(&self) -> Result<Vec<DisplayInfo>> {
-        let mut displays = Vec::new();
-        let mut output_index: u32 = 0;
-
-        unsafe {
-            loop {
-                let output = match self.adapter.EnumOutputs(output_index) {
-                    Ok(o) => o,
-                    Err(_) => break, // DXGI_ERROR_NOT_FOUND — no more outputs
-                };
-
-                let desc = output.GetDesc()
-                    .map_err(|e| FluxError::Capture(format!("GetDesc: {}", e)))?;
-
-                if !desc.AttachedToDesktop.as_bool() {
-                    output_index += 1;
-                    continue;
-                }
-
-                let rect = desc.DesktopCoordinates;
-                let width = (rect.right - rect.left) as u32;
-                let height = (rect.bottom - rect.top) as u32;
-
-                let name_len = desc.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
-                let name = String::from_utf16_lossy(&desc.DeviceName[..name_len]);
-
-                tracing::info!(
-                    "Display {}: {} ({}x{}, primary={})",
-                    output_index, name, width, height, output_index == 0
-                );
-
-                displays.push(DisplayInfo {
-                    id: output_index,
-                    name,
-                    native_resolution: Resolution::new(width, height),
-                    primary: output_index == 0,
-                });
-
-                output_index += 1;
-            }
-        }
-
+        let displays = self.enumerate_displays_internal(false)?;
         if displays.is_empty() {
             return Err(FluxError::Capture("No attached displays found".into()));
         }
@@ -143,17 +291,30 @@ impl ScreenCapture for DxgiCapture {
         framerate: u32,
     ) -> Result<Box<dyn CaptureSession>> {
         let display_id = display_id.unwrap_or(0);
+        let targets = self
+            .targets
+            .lock()
+            .map_err(|_| FluxError::Capture("DXGI target cache poisoned".into()))?;
+        let target = targets
+            .get(&display_id)
+            .ok_or_else(|| FluxError::Capture(format!("DXGI display {} was not enumerated", display_id)))?;
+        if !target.capture_supported {
+            return Err(FluxError::Capture(format!(
+                "DXGI display {} failed the DuplicateOutput capability test",
+                display_id
+            )));
+        }
         tracing::info!(
-            "Starting DXGI capture on display {} at {}@{}fps",
+            "Starting DXGI capture on display {} at {}@{}fps (adapter/output pair from enumeration)",
             display_id,
             resolution,
             framerate
         );
 
         Ok(Box::new(DxgiCaptureSession::new(
-            &self.device,
-            &self.context,
-            &self.adapter,
+            &target.device,
+            &target.context,
+            &target.output,
             display_id,
             resolution,
             framerate,
@@ -333,16 +494,12 @@ impl DxgiCaptureSession {
     fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        adapter: &IDXGIAdapter1,
+        output: &IDXGIOutput,
         display_id: u32,
         requested_resolution: Resolution,
         framerate: u32,
     ) -> Result<Self> {
         unsafe {
-            // Get the output for this display
-            let output: IDXGIOutput = adapter.EnumOutputs(display_id)
-                .map_err(|e| FluxError::Capture(format!("EnumOutputs({}): {}", display_id, e)))?;
-
             // Need IDXGIOutput1 for DuplicateOutput
             let output1: IDXGIOutput1 = output.cast()
                 .map_err(|e| FluxError::Capture(format!("Cast to IDXGIOutput1: {}", e)))?;

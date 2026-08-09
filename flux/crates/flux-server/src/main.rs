@@ -219,14 +219,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into_iter()
                         .find(|display| !before_names.contains(&display.name))
                     {
-                        break display.name;
+                        break display;
                     }
                 }
                 Err(e) => tracing::debug!("waiting for virtual DXGI output: {e}"),
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
-        tracing::info!("Virtual display is available as DXGI output {target}");
+        tracing::info!(
+            "Virtual display is available as DXGI output {} on adapter LUID {:?}",
+            target.name,
+            target.adapter_luid
+        );
         (Some(display), Some(target))
     } else {
         (None, None)
@@ -635,7 +639,7 @@ fn capture_loop(
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
-    target_display_name: Option<String>,
+    target_display: Option<flux_capture::traits::DisplayInfo>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
     // ── Initialize capture ──────────────────────────────────────────
@@ -656,13 +660,18 @@ fn capture_loop(
     };
     tracing::info!("Capture: found {} display(s)", displays.len());
 
-    let primary = if let Some(target_name) = target_display_name.as_deref() {
-        match displays.iter().find(|display| display.name == target_name) {
+    let primary = if let Some(target) = target_display.as_ref() {
+        match displays.iter().find(|display| {
+            display.id == target.id
+                && display.name == target.name
+                && display.adapter_luid == target.adapter_luid
+        }) {
             Some(display) => display,
             None => {
                 tracing::error!(
-                    "Virtual display output {} is no longer present; refusing to capture another display",
-                    target_name
+                    "Virtual display output {} on adapter LUID {:?} is no longer present; refusing to capture another display",
+                    target.name,
+                    target.adapter_luid,
                 );
                 return;
             }

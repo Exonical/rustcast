@@ -38,9 +38,11 @@ impl ScreenCapture for DrmCapture {
         tracing::debug!("Enumerating DRM displays (stub)");
         Ok(vec![DisplayInfo {
             id: 0,
+            adapter_luid: None,
             name: "DRM Output 0".into(),
             native_resolution: Resolution::new(1920, 1080),
             primary: true,
+            capture_supported: true,
         }])
     }
 

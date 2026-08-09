@@ -50,9 +50,11 @@ impl ScreenCapture for PipeWireCapture {
         tracing::debug!("Enumerating PipeWire displays (stub)");
         Ok(vec![DisplayInfo {
             id: STUB_DISPLAY_ID,
+            adapter_luid: None,
             name: "Primary Display".into(),
             native_resolution: Resolution::new(1920, 1080),
             primary: true,
+            capture_supported: true,
         }])
     }
 
