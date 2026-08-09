@@ -321,12 +321,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_port = config.server.signaling_port + 2; // e.g. 8555
     let frame_addr = format!("{}:{}", config.bind_address, frame_port);
     let frame_listener = tokio::net::TcpListener::bind(&frame_addr).await?;
-    let frame_host = if config.bind_address == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        config.bind_address.as_str()
+    let frame_host = config
+        .relay
+        .advertise_host
+        .as_deref()
+        .unwrap_or_else(|| {
+            if config.bind_address == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                config.bind_address.as_str()
+            }
+        });
+    let advertised_frame_addr = match frame_host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) if !frame_host.starts_with('[') => {
+            format!("[{frame_host}]:{frame_port}")
+        }
+        _ => format!("{frame_host}:{frame_port}"),
     };
-    let advertised_frame_addr = format!("{frame_host}:{frame_port}");
     let registration_stop = registration::start(
         &config,
         &platform,

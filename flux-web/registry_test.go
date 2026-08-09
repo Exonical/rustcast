@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -95,5 +96,69 @@ func TestHeartbeatRejectsPathIDMismatch(t *testing.T) {
 	r.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", response.Code)
+	}
+}
+
+func TestRewriteFrameEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		clientIP string
+		want     string
+	}{
+		{
+			name:     "loopback rewritten",
+			endpoint: "127.0.0.1:8556",
+			clientIP: "192.168.1.70",
+			want:     "192.168.1.70:8556",
+		},
+		{
+			name:     "unspecified rewritten",
+			endpoint: "0.0.0.0:8556",
+			clientIP: "192.168.1.70",
+			want:     "192.168.1.70:8556",
+		},
+		{
+			name:     "IPv6 loopback rewritten",
+			endpoint: "[::1]:8556",
+			clientIP: "2001:db8::70",
+			want:     "[2001:db8::70]:8556",
+		},
+		{
+			name:     "IPv6 unspecified rewritten",
+			endpoint: "[::]:8556",
+			clientIP: "fe80::70",
+			want:     "[fe80::70]:8556",
+		},
+		{
+			name:     "routable host left alone",
+			endpoint: "192.168.1.70:8556",
+			clientIP: "192.168.1.71",
+			want:     "192.168.1.70:8556",
+		},
+		{
+			name:     "IPv6 routable host left alone",
+			endpoint: "[2001:db8::70]:8556",
+			clientIP: "2001:db8::71",
+			want:     "[2001:db8::70]:8556",
+		},
+		{
+			name:     "port preserved",
+			endpoint: "127.0.0.1:49152",
+			clientIP: "10.0.0.12",
+			want:     "10.0.0.12:49152",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Request.RemoteAddr = net.JoinHostPort(test.clientIP, "12345")
+			if got := rewriteFrameEndpoint(c, test.endpoint); got != test.want {
+				t.Fatalf("rewriteFrameEndpoint(%q) = %q, want %q", test.endpoint, got, test.want)
+			}
+		})
 	}
 }

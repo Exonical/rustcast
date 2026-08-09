@@ -73,6 +73,11 @@ pub struct RelayConfig {
     /// Base URL of the Flux web relay, for example http://relay:8080.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// Optional host/IP to advertise for the frame endpoint. When unset, the
+    /// relay replaces loopback or unspecified hosts with the sender's source IP.
+    #[serde(default)]
+    pub advertise_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

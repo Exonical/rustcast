@@ -83,6 +83,8 @@ Key settings:
 | `audio` | `codec` | `Opus` | Audio codec |
 | `audio` | `sample_rate` | `48000` | Audio sample rate |
 | `security` | `pin_pairing` | `true` | Require PIN for new clients |
+| `relay` | `base_url` | unset | HTTP(S) URL of the Flux web relay |
+| `relay` | `advertise_host` | unset | Optional host/IP to advertise for the frame endpoint; otherwise the relay rewrites loopback or unspecified hosts using the sender's source IP |
 
 ## Platform Support
 
