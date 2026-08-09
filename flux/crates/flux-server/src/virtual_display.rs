@@ -5,8 +5,9 @@
 //! The driver device is found through its interface GUID
 //! `{5b1a4c37-6f5d-4a41-9c1d-8f2e4b6a7c01}`; the monitor is plugged in with
 //! `IOCTL_FLUXIDD_PLUG_IN` (mode payload) and removed with
-//! `IOCTL_FLUXIDD_PLUG_OUT`. The monitor is automatically plugged out when
-//! the [`VirtualDisplay`] handle is dropped.
+//! `IOCTL_FLUXIDD_PLUG_OUT`. `IOCTL_FLUXIDD_GET_STATUS` returns adapter
+//! initialization state for diagnostics. The monitor is automatically plugged
+//! out when the [`VirtualDisplay`] handle is dropped.
 
 #![cfg(target_os = "windows")]
 
@@ -28,14 +29,29 @@ const GUID_DEVINTERFACE_FLUXIDD: GUID = GUID::from_u128(0x5b1a4c37_6f5d_4a41_9c1
 const fn ctl_code_write(function: u32) -> u32 {
     (0x22 << 16) | (2 << 14) | (function << 2)
 }
+const fn ctl_code_read(function: u32) -> u32 {
+    (0x22 << 16) | (1 << 14) | (function << 2)
+}
 const IOCTL_FLUXIDD_PLUG_IN: u32 = ctl_code_write(0x900);
 const IOCTL_FLUXIDD_PLUG_OUT: u32 = ctl_code_write(0x901);
+const IOCTL_FLUXIDD_GET_STATUS: u32 = ctl_code_read(0x902);
 
 #[repr(C)]
 struct FluxIddMonitorMode {
     width: u32,
     height: u32,
     refresh_hz: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FluxIddStatus {
+    d0_entry_ran: u32,
+    adapter_init_async_status: i32,
+    adapter_init_status: i32,
+    adapter_ready: u32,
+    monitor_plugged_in: u32,
+    monitor_operation_in_progress: u32,
 }
 
 /// An open handle to the FluxIdd driver with the virtual monitor plugged in.
@@ -87,6 +103,23 @@ impl VirtualDisplay {
             )
         };
         if let Err(e) = result {
+            match query_status(device) {
+                Ok(status) => tracing::error!(
+                    "FluxIdd status after plug-in failure: d0_entry_ran={}, \
+                     adapter_init_async_status=0x{:08x}, adapter_init_status=0x{:08x}, \
+                     adapter_ready={}, monitor_plugged_in={}, \
+                     monitor_operation_in_progress={}",
+                    status.d0_entry_ran,
+                    status.adapter_init_async_status as u32,
+                    status.adapter_init_status as u32,
+                    status.adapter_ready,
+                    status.monitor_plugged_in,
+                    status.monitor_operation_in_progress,
+                ),
+                Err(status_error) => {
+                    tracing::error!("FluxIdd status query after plug-in failure failed: {status_error}")
+                }
+            }
             unsafe {
                 let _ = CloseHandle(device);
             }
@@ -103,6 +136,38 @@ impl VirtualDisplay {
         );
         Ok(Self { device })
     }
+}
+
+fn query_status(device: HANDLE) -> Result<FluxIddStatus, String> {
+    let mut status = FluxIddStatus {
+        d0_entry_ran: 0,
+        adapter_init_async_status: 0,
+        adapter_init_status: 0,
+        adapter_ready: 0,
+        monitor_plugged_in: 0,
+        monitor_operation_in_progress: 0,
+    };
+    let mut returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            device,
+            IOCTL_FLUXIDD_GET_STATUS,
+            None,
+            0,
+            Some(&mut status as *mut _ as *mut _),
+            std::mem::size_of::<FluxIddStatus>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .map_err(|e| format!("IOCTL_FLUXIDD_GET_STATUS failed: {e}"))?;
+    if returned as usize != std::mem::size_of::<FluxIddStatus>() {
+        return Err(format!(
+            "IOCTL_FLUXIDD_GET_STATUS returned {returned} bytes, expected {}",
+            std::mem::size_of::<FluxIddStatus>()
+        ));
+    }
+    Ok(status)
 }
 
 impl Drop for VirtualDisplay {

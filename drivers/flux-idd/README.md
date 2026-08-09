@@ -87,6 +87,23 @@ For production distribution the package must be attestation-signed through the
 |---|---|---|
 | `IOCTL_FLUXIDD_PLUG_IN` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_WRITE_DATA)` | `{ width: u32, height: u32, refresh_hz: u32 }` (little-endian, packed) |
 | `IOCTL_FLUXIDD_PLUG_OUT` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_WRITE_DATA)` | none |
+| `IOCTL_FLUXIDD_GET_STATUS` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_READ_DATA)` | none; returns adapter initialization and monitor state |
+
+## Diagnostics
+
+Capture IddCx WPP tracing from an elevated command prompt:
+
+```cmd
+logman create trace IddCx -o IddCx.etl -ets -ow -mode sequential -p {D92BCB52-FA78-406F-A9A5-2037509FADEA} 0x4f4 0xFF
+logman -stop IddCx -ets
+```
+
+For UMDF/WUDFHost failures, inspect Event Viewer at
+`Applications and Services Logs → Microsoft → Windows →
+DriverFrameworks-UserMode → Operational`, provider
+`Microsoft-Windows-DriverFrameworks-UserMode`. Also inspect the
+`Microsoft-Windows-IndirectDisplays-ClassExtension-Events` provider and the
+System log around the failure timestamp.
 
 ## Status
 
