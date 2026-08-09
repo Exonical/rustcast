@@ -8,6 +8,9 @@ pub enum FluxError {
     #[error("screen capture failed: {0}")]
     Capture(String),
 
+    #[error("screen capture session lost: {0}")]
+    CaptureSessionLost(String),
+
     #[error("no suitable capture backend available")]
     NoCaptureBackend,
 

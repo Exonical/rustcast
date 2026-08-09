@@ -698,7 +698,9 @@ impl DxgiCaptureSession {
                     }
                     // DXGI_ERROR_ACCESS_LOST — need to recreate duplication
                     if code == 0x887A0026 {
-                        return Err(FluxError::Capture("Desktop Duplication access lost — display mode changed".into()));
+                        return Err(FluxError::CaptureSessionLost(
+                            "Desktop Duplication access lost — display mode changed".into(),
+                        ));
                     }
                     return Err(FluxError::Capture(format!("AcquireNextFrame: {}", e)));
                 }

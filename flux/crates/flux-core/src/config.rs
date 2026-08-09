@@ -151,6 +151,12 @@ pub struct VideoConfig {
     /// driver): plug in a virtual monitor at this mode before capturing.
     #[serde(default)]
     pub virtual_display: Option<VirtualDisplayConfig>,
+
+    /// Privacy mode: disable physical outputs while a remote viewer is connected.
+    /// A forced process kill can leave panels off until the next server start,
+    /// reboot, or Win+P.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -159,6 +165,21 @@ pub struct VirtualDisplayConfig {
     pub height: u32,
     #[serde(default = "default_refresh_hz")]
     pub refresh_hz: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// Disable physical outputs while one or more remote viewers are connected.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Lock the workstation after restoring the physical topology on disconnect.
+    #[serde(default = "default_lock_on_disconnect")]
+    pub lock_on_disconnect: bool,
+}
+
+fn default_lock_on_disconnect() -> bool {
+    true
 }
 
 fn default_refresh_hz() -> u32 {
@@ -181,6 +202,16 @@ impl Default for VideoConfig {
             max_packet_size: 1400,
             encoder: None,
             virtual_display: None,
+            privacy: PrivacyConfig::default(),
+        }
+    }
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lock_on_disconnect: true,
         }
     }
 }

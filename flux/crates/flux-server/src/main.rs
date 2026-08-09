@@ -21,8 +21,13 @@ mod virtual_display;
 mod tray;
 
 use flux_core::config::FluxConfig;
+use flux_core::error::FluxError;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
+#[cfg(target_os = "windows")]
+type PrivacyController = ccd_display::PrivacyController;
+#[cfg(not(target_os = "windows"))]
+type PrivacyController = ();
 #[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
@@ -68,6 +73,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.save(&args.config)?;
         config
     };
+
+    #[cfg(target_os = "windows")]
+    {
+        let privacy_snapshot_path = config
+            .security
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("privacy_topology.bin");
+        ccd_display::recover_snapshot(&privacy_snapshot_path);
+    }
+    if config.video.privacy.enabled && config.video.virtual_display.is_none() {
+        return Err(
+            "privacy mode requires [video.virtual_display]; refusing to disable the only display"
+                .into(),
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    if config.video.privacy.enabled {
+        return Err("privacy mode is only supported on Windows".into());
+    }
 
     tracing::info!("Starting Flux Server: {}", config.name);
 
@@ -281,6 +307,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "windows"))]
     let virtual_display_target = None;
 
+    #[cfg(target_os = "windows")]
+    let privacy_controller = if config.video.privacy.enabled {
+        let privacy_snapshot_path = config
+            .security
+            .cert_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("privacy_topology.bin");
+        Some(
+            ccd_display::PrivacyController::new(
+                virtual_display_target
+                    .clone()
+                    .ok_or("privacy mode requires a confirmed virtual display output")?,
+                privacy_snapshot_path,
+                config.video.privacy.lock_on_disconnect,
+            )
+            .map_err(|error| format!("initialize privacy mode: {error}"))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "windows"))]
+    let privacy_controller: Option<PrivacyController> = None;
+
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
     // Each message carries the frame's capture timestamp (microseconds since
@@ -356,8 +406,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
                 let input_tx = input_tx.clone();
+                let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
-                    quic_frames::serve(endpoint, h264_tx, idr_tx, bitrate_tx, input_tx).await;
+                    quic_frames::serve(
+                        endpoint,
+                        h264_tx,
+                        idr_tx,
+                        bitrate_tx,
+                        input_tx,
+                        privacy_controller,
+                    )
+                    .await;
                 }))
             }
             Err(e) => {
@@ -371,8 +430,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let frame_privacy_controller = privacy_controller.clone();
     let frame_handle = tokio::spawn(async move {
-        frame_server(frame_listener, h264_tx, idr_tx, bitrate_tx, input_tx).await;
+        frame_server(
+            frame_listener,
+            h264_tx,
+            idr_tx,
+            bitrate_tx,
+            input_tx,
+            frame_privacy_controller,
+        )
+        .await;
     });
 
     // Build the server.
@@ -400,6 +468,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(h) = quic_handle {
         h.abort();
     }
+    #[cfg(target_os = "windows")]
+    if let Some(privacy) = privacy_controller {
+        if let Err(error) = privacy.restore() {
+            tracing::error!("Failed to restore privacy display topology: {error}");
+        }
+    }
     server.shutdown().await;
     if let Some(stop) = registration_stop {
         let _ = stop.send(());
@@ -416,7 +490,10 @@ async fn frame_server(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    privacy_controller: Option<PrivacyController>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &privacy_controller;
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
@@ -442,6 +519,14 @@ async fn frame_server(
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
         let input_tx = input_tx.clone();
+        #[cfg(target_os = "windows")]
+        let privacy_connection = privacy_controller
+            .as_ref()
+            .map(|privacy| privacy.connection());
+        #[cfg(not(target_os = "windows"))]
+        let privacy_connection: Option<()> = None;
+        #[cfg(not(target_os = "windows"))]
+        let _ = &privacy_connection;
 
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -449,7 +534,9 @@ async fn frame_server(
             let mut frames_sent: u64 = 0;
 
             // Spawn reader task to handle upstream commands
-            let reader_handle = tokio::spawn(async move {
+            let mut reader_handle = tokio::spawn(async move {
+                #[cfg(target_os = "windows")]
+                let privacy_connection = privacy_connection;
                 loop {
                     // Read command byte
                     let mut cmd = [0u8; 1];
@@ -513,6 +600,22 @@ async fn frame_server(
                             tracing::info!("Client {} requested bitrate {} kbps", addr, kbps);
                             let _ = bitrate_tx.send(kbps);
                         }
+                        0x04 => {
+                            let mut count_buf = [0u8; 4];
+                            if reader.read_exact(&mut count_buf).await.is_err() {
+                                break;
+                            }
+                            let count = u32::from_be_bytes(count_buf);
+                            tracing::info!("Client {} reported {} viewer(s)", addr, count);
+                            #[cfg(target_os = "windows")]
+                            if let Some(privacy) = privacy_connection.as_ref() {
+                                if let Err(error) = privacy.update(count) {
+                                    tracing::error!(
+                                        "Privacy mode viewer-count update failed: {error}"
+                                    );
+                                }
+                            }
+                        }
                         _ => {
                             tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);
                             // We could break or ignore. If we ignore, we might lose sync if protocol expects strict format.
@@ -523,13 +626,19 @@ async fn frame_server(
             });
 
             loop {
-                let msg = match rx.recv().await {
-                    Ok(d) => d,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Frame client {} lagged by {} frames", addr, n);
-                        continue;
+                let msg = tokio::select! {
+                    result = &mut reader_handle => {
+                        let _ = result;
+                        break;
                     }
-                    Err(_) => break,
+                    result = rx.recv() => match result {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Frame client {} lagged by {} frames", addr, n);
+                            continue;
+                        }
+                        Err(_) => break,
+                    },
                 };
                 let (ts_micros, data) = (msg.0, &msg.1);
 
@@ -714,12 +823,11 @@ fn capture_loop(
     };
     tracing::info!("Capture: found {} display(s)", displays.len());
 
-    let primary = if let Some(target) = target_display.as_ref() {
+    let mut primary = if let Some(target) = target_display.as_ref() {
         match displays.iter().find(|display| {
-            display.name == target.name
-                && display.adapter_luid == target.adapter_luid
+            display.name == target.name && display.adapter_luid == target.adapter_luid
         }) {
-            Some(display) => display,
+            Some(display) => display.clone(),
             None => {
                 tracing::error!(
                     "Virtual display output {} on adapter LUID {:?} is no longer present; refusing to capture another display",
@@ -730,7 +838,11 @@ fn capture_loop(
             }
         }
     } else {
-        displays.iter().find(|d| d.primary).unwrap_or(&displays[0])
+        displays
+            .iter()
+            .find(|d| d.primary)
+            .unwrap_or(&displays[0])
+            .clone()
     };
     if let Ok(mut status) = runtime_status.write() {
         status.display_name = Some(primary.name.clone());
@@ -823,7 +935,59 @@ fn capture_loop(
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("Capture error: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                if !matches!(e, FluxError::CaptureSessionLost(_)) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+                let _ = session.stop();
+                drop(session);
+                loop {
+                    let displays = match capture.enumerate_displays() {
+                        Ok(displays) => displays,
+                        Err(error) => {
+                            tracing::warn!(
+                                "Waiting for target display {} on adapter LUID {:?} after capture loss; display enumeration failed: {}",
+                                primary.name,
+                                primary.adapter_luid,
+                                error
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    let refreshed = displays.into_iter().find(|display| {
+                        display.name == primary.name
+                            && display.adapter_luid == primary.adapter_luid
+                    });
+                    let Some(refreshed) = refreshed else {
+                        tracing::warn!(
+                            "Waiting for target display {} on adapter LUID {:?} after capture loss; refusing to capture another display",
+                            primary.name,
+                            primary.adapter_luid
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    };
+                    match capture.start_capture(
+                        Some(refreshed.id),
+                        refreshed.native_resolution,
+                        target_fps,
+                    ) {
+                        Ok(new_session) => {
+                            session = new_session;
+                            primary = refreshed;
+                            tracing::info!("Capture session recreated after capture loss");
+                            break;
+                        }
+                        Err(restart_error) => {
+                            tracing::warn!(
+                                "Capture session recreation failed: {}; retrying",
+                                restart_error
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                    }
+                }
                 continue;
             }
         };

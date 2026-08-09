@@ -9,11 +9,19 @@
 //!   frame (server→client uni): [8-byte BE capture-ts µs][4-byte BE length][H.264 data]
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
 //!                                | [0x03][4-byte BE target bitrate kbps]
+//!                                | [0x04][4-byte BE viewer count]
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use flux_crypto::CertificateManager;
+
+#[cfg(target_os = "windows")]
+use crate::ccd_display::{PrivacyConnection, PrivacyController};
+#[cfg(not(target_os = "windows"))]
+type PrivacyController = ();
+#[cfg(not(target_os = "windows"))]
+type PrivacyConnection = ();
 
 pub const ALPN: &[u8] = b"flux-frames";
 
@@ -45,6 +53,7 @@ pub async fn serve(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    privacy_controller: Option<PrivacyController>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
         let connection = match incoming.await {
@@ -63,6 +72,7 @@ pub async fn serve(
             idr_tx.clone(),
             bitrate_tx.clone(),
             input_tx.clone(),
+            privacy_controller.clone(),
         ));
     }
 }
@@ -73,7 +83,16 @@ async fn handle_connection(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    privacy_controller: Option<PrivacyController>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &privacy_controller;
+    #[cfg(target_os = "windows")]
+    let privacy_connection = privacy_controller
+        .as_ref()
+        .map(|privacy| privacy.connection());
+    #[cfg(not(target_os = "windows"))]
+    let privacy_connection = None;
     let control_conn = connection.clone();
     let control = tokio::spawn(async move {
         loop {
@@ -84,7 +103,8 @@ async fn handle_connection(
             let idr_tx = idr_tx.clone();
             let bitrate_tx = bitrate_tx.clone();
             let input_tx = input_tx.clone();
-            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx));
+            let privacy_connection = privacy_connection.clone();
+            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx, privacy_connection));
         }
     });
 
@@ -127,7 +147,10 @@ async fn read_commands(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    privacy_connection: Option<PrivacyConnection>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &privacy_connection;
     loop {
         let mut cmd = [0u8; 1];
         if recv.read_exact(&mut cmd).await.is_err() {
@@ -167,6 +190,20 @@ async fn read_commands(
                 let kbps = u32::from_be_bytes(kbps_buf);
                 tracing::info!("QUIC client requested bitrate {} kbps", kbps);
                 let _ = bitrate_tx.send(kbps);
+            }
+            0x04 => {
+                let mut count_buf = [0u8; 4];
+                if recv.read_exact(&mut count_buf).await.is_err() {
+                    return;
+                }
+                let count = u32::from_be_bytes(count_buf);
+                tracing::info!("QUIC client reported {} viewer(s)", count);
+                #[cfg(target_os = "windows")]
+                if let Some(privacy) = privacy_connection.as_ref() {
+                    if let Err(error) = privacy.update(count) {
+                        tracing::error!("Privacy mode viewer-count update failed: {error}");
+                    }
+                }
             }
             other => {
                 tracing::warn!("QUIC unknown command byte: 0x{:02x}", other);
