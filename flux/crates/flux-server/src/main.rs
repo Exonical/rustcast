@@ -14,6 +14,8 @@ mod quic_frames;
 mod registration;
 mod session;
 #[cfg(target_os = "windows")]
+mod ccd_display;
+#[cfg(target_os = "windows")]
 mod virtual_display;
 #[cfg(feature = "tray")]
 mod tray;
@@ -229,6 +231,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(
             "Virtual display is available as DXGI output {} on adapter LUID {:?}",
             target.name,
+            target.adapter_luid
+        );
+        ccd_display::configure_virtual_display(
+            &target,
+            vd.width,
+            vd.height,
+            vd.refresh_hz,
+        )
+        .map_err(|e| format!("configure virtual display topology: {e}"))?;
+
+        let configured_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let target = loop {
+            if std::time::Instant::now() >= configured_deadline {
+                drop(display);
+                return Err(format!(
+                    "virtual display {} did not appear at configured mode {}x{}@{}Hz after CCD apply",
+                    target.name, vd.width, vd.height, vd.refresh_hz
+                )
+                .into());
+            }
+            match capture_probe.enumerate_displays() {
+                Ok(displays) => {
+                    if let Some(display) = displays.into_iter().find(|display| {
+                        display.name == target.name
+                            && display.adapter_luid == target.adapter_luid
+                            && display.native_resolution.width == vd.width
+                            && display.native_resolution.height == vd.height
+                    }) {
+                        break display;
+                    }
+                }
+                Err(e) => tracing::debug!("waiting for configured virtual DXGI output: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        tracing::info!(
+            "Virtual display configured as DXGI output {} at {}x{} on adapter LUID {:?}",
+            target.name,
+            target.native_resolution.width,
+            target.native_resolution.height,
             target.adapter_luid
         );
         (Some(display), Some(target))
@@ -662,8 +705,7 @@ fn capture_loop(
 
     let primary = if let Some(target) = target_display.as_ref() {
         match displays.iter().find(|display| {
-            display.id == target.id
-                && display.name == target.name
+            display.name == target.name
                 && display.adapter_luid == target.adapter_luid
         }) {
             Some(display) => display,
