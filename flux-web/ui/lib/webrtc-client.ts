@@ -43,9 +43,8 @@ export interface KeyboardEvent {
   KeyUp?: { scan_code: number; key_code?: number; modifiers: number };
 }
 
-export interface GamepadEvent {
-  // TODO: Define gamepad event structure
-}
+export type GamepadEvent = Record<string, never>;
+// TODO: Define gamepad event structure
 
 export class WebRTCClient {
   private ws: WebSocket | null = null;
