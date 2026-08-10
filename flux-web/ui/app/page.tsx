@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Toggle from "@radix-ui/react-toggle";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import * as Separator from "@radix-ui/react-separator";
-import { WebRTCClient, type ConnectionState, type CursorMetadata, type WebRTCStats } from "@/lib/webrtc-client";
+import { WebRTCClient, type ConnectionState, type CursorMetadata, type ResolutionStatus, type WebRTCStats } from "@/lib/webrtc-client";
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget } from "@/lib/local-controls";
@@ -176,13 +176,68 @@ type Machine = {
 
 export default function App() {
   const [selectedMachine, setSelectedMachine] = useState<Machine | null>(null);
+  const [selectedResolution, setSelectedResolution] = useState<{ width: number; height: number } | null>(null);
   if (selectedMachine) {
-    return <StreamViewer machine={selectedMachine} onBack={() => setSelectedMachine(null)} />;
+    if (!selectedResolution && selectedMachine.virtual_display) {
+      return <ResolutionPicker machine={selectedMachine} onBack={() => setSelectedMachine(null)} onSelect={setSelectedResolution} />;
+    }
+    return (
+      <StreamViewer
+        machine={selectedMachine}
+        resolution={selectedResolution ?? undefined}
+        onBack={() => {
+          setSelectedMachine(null);
+          setSelectedResolution(null);
+        }}
+      />
+    );
   }
   return <MachinePicker onSelect={setSelectedMachine} />;
 }
 
-function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => void }) {
+const RESOLUTION_OPTIONS = [
+  { width: 2560, height: 1440, ratio: "16:9" },
+  { width: 1920, height: 1200, ratio: "16:10" },
+  { width: 1920, height: 1080, ratio: "16:9" },
+  { width: 1600, height: 900, ratio: "16:9" },
+  { width: 1366, height: 768, ratio: "16:9" },
+  { width: 1280, height: 720, ratio: "16:9" },
+  { width: 2560, height: 1080, ratio: "21:9" },
+];
+
+function ResolutionPicker({ machine, onBack, onSelect }: {
+  machine: Machine;
+  onBack: () => void;
+  onSelect: (resolution: { width: number; height: number }) => void;
+}) {
+  const defaultResolution = RESOLUTION_OPTIONS.find(
+    (option) => option.width === machine.width && option.height === machine.height,
+  ) ?? RESOLUTION_OPTIONS[2];
+  const [selected, setSelected] = useState(defaultResolution);
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-zinc-950 px-4">
+      <section className="glass w-full max-w-lg rounded-3xl p-6 shadow-2xl sm:p-8">
+        <button onClick={onBack} className="mb-6 text-sm text-zinc-400 hover:text-white">← Back</button>
+        <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Connect to {machine.display_name || machine.name}</p>
+        <h1 className="mt-2 text-2xl font-semibold text-white">Choose stream resolution</h1>
+        <p className="mt-2 text-sm leading-6 text-zinc-400">The display briefly reconnects while the sender applies this mode.</p>
+        <div className="mt-6 grid grid-cols-2 gap-3">
+          {RESOLUTION_OPTIONS.map((option) => (
+            <button key={`${option.width}x${option.height}`} onClick={() => setSelected(option)}
+              className={`rounded-2xl border px-4 py-3 text-left transition ${selected.width === option.width && selected.height === option.height ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10 text-white" : "border-zinc-800 text-zinc-300 hover:border-zinc-600"}`}>
+              <span className="block font-medium">{option.width} × {option.height}</span>
+              <span className="text-xs text-zinc-500">{option.ratio}</span>
+            </button>
+          ))}
+        </div>
+        <p className="mt-5 text-xs leading-5 text-zinc-500">2560 × 1080 uses the host-supplied preferred mode; it is not in the driver’s built-in list.</p>
+        <button onClick={() => onSelect({ width: selected.width, height: selected.height })} className="mt-6 w-full rounded-xl bg-[var(--color-accent)] px-4 py-3 text-sm font-semibold text-white hover:brightness-110">Connect</button>
+      </section>
+    </main>
+  );
+}
+
+function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resolution?: { width: number; height: number }; onBack: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const clientRef = useRef<WebRTCClient | null>(null);
@@ -197,6 +252,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [qualityLevel, setQualityLevel] = useState<number | null>(null);
   const [fpsCap, setFpsCap] = useState<number | null>(null);
+  const [resolutionStatus, setResolutionStatus] = useState<ResolutionStatus | null>(null);
   const committedQuality = useRef<number | null>(null);
   const committedFps = useRef<number | null>(null);
   const [cursor, setCursor] = useState<CursorMetadata>({
@@ -274,7 +330,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
 
   // WebRTC client
   useEffect(() => {
-    const client = new WebRTCClient(undefined, machine.id);
+    const client = new WebRTCClient(undefined, machine.id, resolution);
     clientRef.current = client;
     client.onStateChange = (state) => {
       setConnectionState(state);
@@ -295,6 +351,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         bitmap: next.bitmap ?? previous.bitmap,
       }));
     };
+    client.onResolutionStatus = setResolutionStatus;
     client.connect().catch(console.error);
     const container = containerRef.current;
     return () => {
@@ -303,7 +360,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
       client.disconnect();
       clientRef.current = null;
     };
-  }, [machine.id, releaseAllInput]);
+  }, [machine.id, resolution, releaseAllInput]);
 
   useEffect(() => {
     const updateLayout = () => {
@@ -800,6 +857,16 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         )}
 
         {/* Connection overlay */}
+        {resolutionStatus?.state === "transitioning" && (
+          <div className="absolute left-1/2 top-5 z-20 -translate-x-1/2 rounded-xl border border-amber-400/30 bg-zinc-950/90 px-4 py-3 text-center text-sm text-amber-200 shadow-xl">
+            Applying resolution — the display is reconnecting briefly.
+          </div>
+        )}
+        {resolutionStatus?.state === "failed" && (
+          <div className="absolute left-1/2 top-5 z-20 -translate-x-1/2 rounded-xl border border-red-400/30 bg-zinc-950/90 px-4 py-3 text-center text-sm text-red-200 shadow-xl">
+            Resolution change failed{resolutionStatus.error ? `: ${resolutionStatus.error}` : "."}
+          </div>
+        )}
         {connectionState !== "connected" && (
           <div className="absolute inset-0 z-[1] flex items-center justify-center px-4">
             <div className="glass w-full max-w-md rounded-3xl px-6 py-7 text-center shadow-2xl animate-fade-in sm:px-10">

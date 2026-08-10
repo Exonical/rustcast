@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeStatus {
     pub display_name: Option<String>,
+    pub captured_virtual_display: Option<bool>,
     pub encoder_backend: Option<String>,
     pub capture_width: u32,
     pub capture_height: u32,
@@ -129,6 +130,9 @@ pub fn start(
                 current.display_name = snapshot.display_name.clone().unwrap_or_default();
                 if let Some(backend) = &snapshot.encoder_backend {
                     current.encoder_backend = backend.clone();
+                }
+                if let Some(virtual_display) = snapshot.captured_virtual_display {
+                    current.virtual_display = virtual_display;
                 }
                 if snapshot.encode_width != 0 {
                     current.width = snapshot.encode_width;

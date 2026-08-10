@@ -196,7 +196,7 @@ impl Default for VideoConfig {
             codec: VideoCodec::H265,
             max_width: 3840,
             max_height: 2160,
-            max_fps: 48,
+            max_fps: 60,
             bitrate_kbps: 20_000,
             quality_level: 6,
             rate_control: RateControlMode::Vbr,

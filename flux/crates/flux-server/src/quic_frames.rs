@@ -12,6 +12,7 @@
 //!                                | [0x03][4-byte BE target bitrate kbps]
 //!                                | [0x04][4-byte BE viewer count]
 //!                                | [0x05][quality level][FPS cap] (each 0 means automatic)
+//!                                | [0x06][2-byte BE width][2-byte BE height]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,7 @@ pub async fn serve(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
+    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -78,6 +80,7 @@ pub async fn serve(
             idr_tx.clone(),
             bitrate_tx.clone(),
             quality_tx.clone(),
+            resolution_tx.clone(),
             input_tx.clone(),
             privacy_controller.clone(),
         ));
@@ -91,6 +94,7 @@ async fn handle_connection(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
+    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -112,9 +116,18 @@ async fn handle_connection(
             let idr_tx = idr_tx.clone();
             let bitrate_tx = bitrate_tx.clone();
             let quality_tx = quality_tx.clone();
+            let resolution_tx = resolution_tx.clone();
             let input_tx = input_tx.clone();
             let privacy_connection = privacy_connection.clone();
-            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, quality_tx, input_tx, privacy_connection));
+            tokio::spawn(read_commands(
+                recv,
+                idr_tx,
+                bitrate_tx,
+                quality_tx,
+                resolution_tx,
+                input_tx,
+                privacy_connection,
+            ));
         }
     });
 
@@ -190,6 +203,7 @@ async fn read_commands(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
+    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_connection: Option<PrivacyConnection>,
 ) {
@@ -255,6 +269,16 @@ async fn read_commands(
                     return;
                 }
                 let _ = quality_tx.send((levels[0], levels[1]));
+            }
+            0x06 => {
+                let mut dimensions = [0u8; 4];
+                if recv.read_exact(&mut dimensions).await.is_err() {
+                    return;
+                }
+                let _ = resolution_tx.send(crate::ModeRequest {
+                    width: u16::from_be_bytes([dimensions[0], dimensions[1]]) as u32,
+                    height: u16::from_be_bytes([dimensions[2], dimensions[3]]) as u32,
+                });
             }
             other => {
                 tracing::warn!("QUIC unknown command byte: 0x{:02x}", other);

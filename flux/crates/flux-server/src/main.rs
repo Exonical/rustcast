@@ -28,6 +28,10 @@ use flux_crypto::CertificateManager;
 type PrivacyController = ccd_display::PrivacyController;
 #[cfg(not(target_os = "windows"))]
 type PrivacyController = ();
+#[cfg(target_os = "windows")]
+type VirtualDisplayHandle = virtual_display::VirtualDisplay;
+#[cfg(not(target_os = "windows"))]
+type VirtualDisplayHandle = ();
 #[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
@@ -41,6 +45,29 @@ struct Args {
     /// Generate a default configuration file and exit.
     #[clap(long)]
     generate_config: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModeRequest {
+    pub width: u32,
+    pub height: u32,
+}
+
+pub(crate) fn validate_mode_request(request: ModeRequest) -> Result<ModeRequest, &'static str> {
+    if request.width < 640 || request.height < 480 {
+        return Err("resolution is implausibly small");
+    }
+    if request.width > 2560 || request.height > 1440 {
+        return Err("resolution exceeds 2560x1440");
+    }
+    if request.width % 2 != 0 || request.height % 2 != 0 {
+        return Err("resolution dimensions must be even");
+    }
+    Ok(request)
+}
+
+pub(crate) fn mode_change_needed(current: ModeRequest, requested: ModeRequest) -> bool {
+    current.width != requested.width || current.height != requested.height
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -180,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Plug in a virtual monitor for headless hosts before capture starts.
     // Kept alive for the whole server lifetime; dropped (plugged out) on exit.
     #[cfg(target_os = "windows")]
-    let (_virtual_display, virtual_display_target) = if let Some(vd) = config.video.virtual_display {
+    let (virtual_display, virtual_display_target) = if let Some(vd) = config.video.virtual_display {
         let capture_probe = flux_capture::create_capture(None)
             .map_err(|e| format!("initialize capture while probing virtual display: {e}"))?;
         let before = match capture_probe.enumerate_displays() {
@@ -305,6 +332,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None)
     };
     #[cfg(not(target_os = "windows"))]
+    let virtual_display: Option<VirtualDisplayHandle> = None;
+    #[cfg(not(target_os = "windows"))]
     let virtual_display_target = None;
 
     #[cfg(target_os = "windows")]
@@ -350,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bitrate update channel: relay congestion feedback -> capture thread
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
     let (quality_tx, quality_rx) = std::sync::mpsc::channel::<(u8, u8)>();
+    let (resolution_tx, resolution_rx) = std::sync::mpsc::channel::<ModeRequest>();
 
     // Input event channel: Frame server (TCP) -> Capture thread (Input Sink)
     let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
@@ -368,11 +398,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 idr_rx,
                 bitrate_rx,
                 quality_rx,
+                resolution_rx,
                 input_rx,
                 capture_fps,
                 forced_encoder,
                 default_quality_level,
                 virtual_display_target,
+                virtual_display,
                 runtime_status_capture,
             );
         })?;
@@ -417,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
                 let quality_tx = quality_tx.clone();
+                let resolution_tx = resolution_tx.clone();
                 let input_tx = input_tx.clone();
                 let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
@@ -427,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         idr_tx,
                         bitrate_tx,
                         quality_tx,
+                        resolution_tx,
                         input_tx,
                         privacy_controller,
                     )
@@ -454,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             idr_tx,
             bitrate_tx,
             quality_tx,
+            resolution_tx,
             input_tx,
             frame_privacy_controller,
         )
@@ -503,7 +538,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Protocol: [1-byte type][8-byte BE capture-timestamp µs][4-byte BE length][payload].
 /// Type 0x01 is an H.264 access unit; type 0x02 is cursor JSON metadata.
 /// Control commands: 0x01 IDR, 0x02 input, 0x03 bitrate, 0x04 viewer count,
-/// and 0x05 quality/FPS ([quality level, FPS cap], each 0 means automatic).
+/// and 0x05 quality/FPS ([quality level, FPS cap], each 0 means automatic),
+/// and 0x06 resolution ([2-byte BE width, 2-byte BE height], refresh fixed at 60).
 async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
@@ -511,6 +547,7 @@ async fn frame_server(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
+    resolution_tx: std::sync::mpsc::Sender<ModeRequest>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -542,6 +579,7 @@ async fn frame_server(
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
         let quality_tx = quality_tx.clone();
+        let resolution_tx = resolution_tx.clone();
         let input_tx = input_tx.clone();
         #[cfg(target_os = "windows")]
         let privacy_connection = privacy_controller
@@ -646,6 +684,25 @@ async fn frame_server(
                                 break;
                             }
                             let _ = quality_tx.send((level[0], level[1]));
+                        }
+                        0x06 => {
+                            let mut dimensions = [0u8; 4];
+                            if reader.read_exact(&mut dimensions).await.is_err() {
+                                break;
+                            }
+                            let request = ModeRequest {
+                                width: u16::from_be_bytes([dimensions[0], dimensions[1]]) as u32,
+                                height: u16::from_be_bytes([dimensions[2], dimensions[3]]) as u32,
+                            };
+                            if validate_mode_request(request).is_err() {
+                                tracing::warn!(
+                                    "Ignoring invalid resolution request: {}x{}",
+                                    request.width,
+                                    request.height
+                                );
+                            } else {
+                                let _ = resolution_tx.send(request);
+                            }
                         }
                         _ => {
                             tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);
@@ -896,6 +953,102 @@ fn build_encode_session_for(
     (session, backend)
 }
 
+#[cfg(target_os = "windows")]
+fn replug_capture(
+    capture: &dyn flux_capture::traits::ScreenCapture,
+    display: &mut VirtualDisplayHandle,
+    mode: ModeRequest,
+    cursor_sink: flux_capture::traits::CursorUpdateSink,
+    target_fps: u32,
+) -> Result<
+    (
+        flux_capture::traits::DisplayInfo,
+        Box<dyn flux_capture::traits::CaptureSession>,
+    ),
+    String,
+> {
+    let before = capture
+        .enumerate_displays()
+        .map_err(|error| format!("enumerate displays before replug: {error}"))?;
+    tracing::info!(
+        "Resolution transition: unplugging virtual display for requested mode {}x{}@60Hz",
+        mode.width,
+        mode.height
+    );
+    display.unplug()?;
+    let removal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let after_unplug = loop {
+        let displays = capture
+            .enumerate_displays()
+            .map_err(|error| format!("enumerate displays after unplug: {error}"))?;
+        if displays.len() < before.len() {
+            tracing::info!("Resolution transition: virtual output disappeared");
+            break displays;
+        }
+        if std::time::Instant::now() >= removal_deadline {
+            return Err("virtual output did not disappear after unplug".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let replug_baseline: std::collections::HashSet<String> =
+        after_unplug.iter().map(|display| display.name.clone()).collect();
+    display.plug_in_mode(mode.width, mode.height, 60)?;
+    let arrival_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let target = loop {
+        let displays = capture
+            .enumerate_displays()
+            .map_err(|error| format!("enumerate displays after plug-in: {error}"))?;
+        if let Some(target) = displays
+            .into_iter()
+            .find(|display| !replug_baseline.contains(&display.name))
+        {
+            tracing::info!(
+                "Resolution transition: virtual output arrived as {} on adapter LUID {:?}",
+                target.name,
+                target.adapter_luid
+            );
+            break target;
+        }
+        if std::time::Instant::now() >= arrival_deadline {
+            return Err("virtual output did not reappear after plug-in".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    ccd_display::configure_virtual_display(&target, mode.width, mode.height, 60)
+        .map_err(|error| format!("apply CCD mode {}x{}: {error}", mode.width, mode.height))?;
+    let configured_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let target = loop {
+        let displays = capture
+            .enumerate_displays()
+            .map_err(|error| format!("enumerate configured output: {error}"))?;
+        if let Some(target) = displays.into_iter().find(|display| {
+            !replug_baseline.contains(&display.name)
+                && display.native_resolution.width == mode.width
+                && display.native_resolution.height == mode.height
+        }) {
+            tracing::info!(
+                "Resolution transition: CCD apply succeeded for {}x{}",
+                mode.width,
+                mode.height
+            );
+            break target;
+        }
+        if std::time::Instant::now() >= configured_deadline {
+            return Err("virtual output did not settle at requested dimensions".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let session = capture
+        .start_capture(Some(target.id), target.native_resolution, target_fps, Some(cursor_sink))
+        .map_err(|error| format!("restart capture after resolution transition: {error}"))?;
+    tracing::info!(
+        "Resolution transition: capture restarted at {}x{}",
+        target.native_resolution.width,
+        target.native_resolution.height
+    );
+    Ok((target, session))
+}
+
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 #[allow(clippy::too_many_arguments)]
@@ -905,13 +1058,17 @@ fn capture_loop(
     idr_rx: std::sync::mpsc::Receiver<()>,
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
     quality_rx: std::sync::mpsc::Receiver<(u8, u8)>,
+    resolution_rx: std::sync::mpsc::Receiver<ModeRequest>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     default_quality_level: u8,
     target_display: Option<flux_capture::traits::DisplayInfo>,
+    mut virtual_display: Option<VirtualDisplayHandle>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = &virtual_display;
     // ── Initialize capture ──────────────────────────────────────────
     let capture = match flux_capture::create_capture(None) {
         Ok(c) => c,
@@ -953,6 +1110,7 @@ fn capture_loop(
     };
     if let Ok(mut status) = runtime_status.write() {
         status.display_name = Some(primary.name.clone());
+        status.captured_virtual_display = Some(target_display.is_some());
     }
     
     // Initialize input using the selected output's virtual-desktop rectangle.
@@ -1033,7 +1191,7 @@ fn capture_loop(
     let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
     let mut quality_level = default_quality_level.clamp(1, 10);
     let configured_fps = target_fps;
-    let mut fps_cap = configured_fps;
+    let mut fps_cap = configured_fps.min(48);
     let mut last_encoded_at: Option<std::time::Instant> = None;
     let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
     let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
@@ -1052,6 +1210,119 @@ fn capture_loop(
 
     let mut frame_count: u64 = 0;
     loop {
+        if let Ok(request) = resolution_rx.try_recv() {
+            #[cfg(target_os = "windows")]
+            {
+                match validate_mode_request(request) {
+                    Err(error) => tracing::warn!(
+                        "Ignoring invalid resolution request {}x{}: {}",
+                        request.width,
+                        request.height,
+                        error
+                    ),
+                    Ok(request) if virtual_display.is_none() => {
+                        tracing::warn!(
+                            "Ignoring resolution request {}x{} because no virtual display is active",
+                            request.width,
+                            request.height
+                        );
+                    }
+                    Ok(request)
+                        if !mode_change_needed(
+                            ModeRequest {
+                                width: primary.native_resolution.width,
+                                height: primary.native_resolution.height,
+                            },
+                            request,
+                        ) =>
+                    {
+                        tracing::info!(
+                            "Resolution transition: requested mode {}x{} already active; no-op",
+                            request.width,
+                            request.height
+                        );
+                    }
+                    Ok(request) => {
+                        let old_mode = ModeRequest {
+                            width: primary.native_resolution.width,
+                            height: primary.native_resolution.height,
+                        };
+                        tracing::info!(
+                            "Resolution transition: requested {}x{}, current {}x{}",
+                            request.width,
+                            request.height,
+                            old_mode.width,
+                            old_mode.height
+                        );
+                        let _ = session.stop();
+                        drop(session);
+                        encode_session = None;
+                        capture_resolution = flux_core::types::Resolution::new(0, 0);
+                        encode_resolution = flux_core::types::Resolution::new(0, 0);
+                        let transition = replug_capture(
+                            capture.as_ref(),
+                            virtual_display.as_mut().expect("checked above"),
+                            request,
+                            cursor_sink.clone(),
+                            target_fps,
+                        );
+                        match transition {
+                            Ok((target, new_session)) => {
+                                primary = target;
+                                session = new_session;
+                                let _ = input_sink.set_target_rect(primary.desktop_rect);
+                                tracing::info!(
+                                    "Resolution transition succeeded: {}x{}",
+                                    request.width,
+                                    request.height
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    "Resolution transition failed: {}; starting rollback to {}x{}",
+                                    error,
+                                    old_mode.width,
+                                    old_mode.height
+                                );
+                                match replug_capture(
+                                    capture.as_ref(),
+                                    virtual_display.as_mut().expect("checked above"),
+                                    old_mode,
+                                    cursor_sink.clone(),
+                                    target_fps,
+                                ) {
+                                    Ok((target, restored_session)) => {
+                                        primary = target;
+                                        session = restored_session;
+                                        let _ = input_sink.set_target_rect(primary.desktop_rect);
+                                        tracing::warn!(
+                                            "Resolution transition rollback succeeded; continuing at {}x{}",
+                                            old_mode.width,
+                                            old_mode.height
+                                        );
+                                    }
+                                    Err(rollback_error) => {
+                                        tracing::error!(
+                                            "Resolution transition rollback failed: {}",
+                                            rollback_error
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                tracing::warn!(
+                    "Ignoring resolution request {}x{} on a non-Windows capture backend",
+                    request.width,
+                    request.height
+                );
+            }
+        }
         // Check for IDR requests
         if let Ok(_) = idr_rx.try_recv() {
             tracing::info!("Handling IDR request from client");
@@ -1076,7 +1347,7 @@ fn capture_loop(
             }
             let valid_fps = requested_fps <= 144;
             if requested_fps == 0 {
-                fps_cap = configured_fps;
+                fps_cap = configured_fps.min(48);
             } else if valid_fps {
                 fps_cap = u32::from(requested_fps).min(configured_fps);
             } else {
@@ -1418,5 +1689,25 @@ mod quality_tests {
             start + interval + interval.mul_f64(0.95),
             48
         ));
+    }
+}
+
+#[cfg(test)]
+mod mode_request_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_mode_requests() {
+        assert!(validate_mode_request(ModeRequest { width: 2561, height: 1440 }).is_err());
+        assert!(validate_mode_request(ModeRequest { width: 1921, height: 1080 }).is_err());
+        assert!(validate_mode_request(ModeRequest { width: 320, height: 240 }).is_err());
+    }
+
+    #[test]
+    fn accepts_and_preserves_valid_mode_requests() {
+        let request = ModeRequest { width: 2560, height: 1080 };
+        assert_eq!(validate_mode_request(request).unwrap().width, 2560);
+        assert!(!mode_change_needed(request, request));
+        assert!(mode_change_needed(request, ModeRequest { width: 1920, height: 1080 }));
     }
 }

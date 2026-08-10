@@ -60,18 +60,10 @@ func TestMachineRegistryAcquireReleaseLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := r.acquire("machine-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != second || first.viewers != 2 {
-		t.Fatalf("expected shared upstream and two viewers: first=%p second=%p viewers=%d", first, second, first.viewers)
+	if _, err := r.acquire("machine-1"); err != errMachineInUse {
+		t.Fatalf("expected machine-in-use error, got %v", err)
 	}
 	r.release(first)
-	if first.viewers != 1 {
-		t.Fatalf("expected one viewer after first release, got %d", first.viewers)
-	}
-	r.release(second)
 	if first.viewers != 0 || r.machines["machine-1"].upstream != nil {
 		t.Fatal("last release did not tear down upstream")
 	}

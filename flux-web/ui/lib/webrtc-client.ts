@@ -31,6 +31,13 @@ export interface CursorMetadata {
   bitmap: CursorBitmap | null;
 }
 
+export interface ResolutionStatus {
+  state: "transitioning" | "succeeded" | "failed";
+  width?: number;
+  height?: number;
+  error?: string;
+}
+
 interface WSMessage {
   type: string;
   data: unknown;
@@ -73,10 +80,15 @@ export class WebRTCClient {
   onStream: ((stream: MediaStream) => void) | null = null;
   onStats: ((stats: WebRTCStats) => void) | null = null;
   onCursor: ((cursor: CursorMetadata) => void) | null = null;
+  onResolutionStatus: ((status: ResolutionStatus) => void) | null = null;
 
   private signalingUrl: string;
 
-  constructor(signalingUrl?: string, private readonly machineId?: string) {
+  constructor(
+    signalingUrl?: string,
+    private readonly machineId?: string,
+    private readonly resolution?: { width: number; height: number },
+  ) {
     if (signalingUrl) {
       this.signalingUrl = signalingUrl;
     } else {
@@ -131,7 +143,11 @@ export class WebRTCClient {
           await this.pc!.setLocalDescription(offer);
           this.ws!.send(JSON.stringify({
             type: "offer",
-            data: { sd: offer.sdp, ...(this.machineId ? { machine_id: this.machineId } : {}) },
+            data: {
+              sd: offer.sdp,
+              ...(this.machineId ? { machine_id: this.machineId } : {}),
+              ...(this.resolution ?? {}),
+            },
           }));
           resolve();
         } catch (err) {
@@ -156,6 +172,8 @@ export class WebRTCClient {
           }
         } else if (msg.type === "cursor") {
           this.onCursor?.(msg.data as CursorMetadata);
+        } else if (msg.type === "resolution-status") {
+          this.onResolutionStatus?.(msg.data as ResolutionStatus);
         }
       };
 

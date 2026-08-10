@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+var errMachineInUse = &machineError{"machine already in use"}
+
 const machineExpiry = 15 * time.Second
 
 type machineInfo struct {
@@ -173,6 +175,10 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		return nil, err
 	}
 	r.mu.Lock()
+	if m.upstream != nil && m.upstream.viewers > 0 {
+		r.mu.Unlock()
+		return nil, errMachineInUse
+	}
 	if m.upstream == nil {
 		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
