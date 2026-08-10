@@ -434,6 +434,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 
 			next.machine = upstream
 			next.release = func() { registry.release(upstream) }
+			next.writer = writer
 
 			if old := upstream.bindSession(next); old != nil {
 				old.releaseNow()
@@ -444,7 +445,6 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				session.PeerConnection.Close()
 			}
 			session = next
-			next.writer = writer
 			if offerData.Width != 0 || offerData.Height != 0 {
 				if offerData.Width < 640 || offerData.Height < 480 ||
 					offerData.Width > 2560 || offerData.Height > 1440 ||

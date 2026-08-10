@@ -773,7 +773,7 @@ async fn frame_server(
             }
 
             loop {
-                let msg = tokio::select! {
+                let (message_type, msg) = tokio::select! {
                     result = &mut reader_handle => {
                         let _ = result;
                         break;
@@ -798,7 +798,7 @@ async fn frame_server(
                         continue;
                     }
                     result = rx.recv() => match result {
-                        Ok(d) => d,
+                        Ok(d) => (0x01, d),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Frame client {} lagged by {} frames", addr, n);
                             continue;
@@ -806,13 +806,13 @@ async fn frame_server(
                         Err(_) => break,
                     },
                     result = resolution_status_rx.recv() => match result {
-                        Ok(status) => status,
+                        Ok(status) => (0x03, status),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
                 };
                 let mut header = [0u8; 13];
-                header[0] = if msg.0 == 0 { 0x03 } else { 0x01 };
+                header[0] = message_type;
                 header[1..9].copy_from_slice(&msg.0.to_be_bytes());
                 header[9..13].copy_from_slice(&(msg.1.len() as u32).to_be_bytes());
                 if writer.write_all(&header).await.is_err()
@@ -1401,8 +1401,9 @@ fn capture_loop(
                                                 )),
                                             },
                                         );
+                                        let mut retry_delay = std::time::Duration::from_secs(1);
                                         loop {
-                                            std::thread::sleep(std::time::Duration::from_secs(1));
+                                            std::thread::sleep(retry_delay);
                                             match replug_capture(
                                                 capture.as_ref(),
                                                 virtual_display.as_mut().expect("checked above"),
@@ -1423,8 +1424,13 @@ fn capture_loop(
                                                 }
                                                 Err(recovery_error) => {
                                                     tracing::error!(
-                                                        "Resolution transition recovery retry failed: {}; retrying",
-                                                        recovery_error
+                                                        "Resolution transition recovery retry failed: {}; retrying in {:?}",
+                                                        recovery_error,
+                                                        retry_delay
+                                                    );
+                                                    retry_delay = std::cmp::min(
+                                                        retry_delay.saturating_mul(2),
+                                                        std::time::Duration::from_secs(30),
                                                     );
                                                 }
                                             }
