@@ -14,6 +14,14 @@ function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
 }
 
+// Estimate mirror of quality_bpp() in flux/crates/flux-server/src/main.rs.
+// Sender-reported target bitrate is not part of the live viewer state yet.
+const qualityBpp = [0, 0.025, 0.035, 0.05, 0.065, 0.08, 0.1, 0.12, 0.14, 0.16, 0.2];
+
+function qualityMbps(level: number, width: number, height: number, fps: number): number {
+  return (width * height * fps * qualityBpp[level]) / 1_000_000;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -186,6 +194,10 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [pointerLockEnabled, setPointerLockEnabled] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
+  const [qualityLevel, setQualityLevel] = useState<number | null>(null);
+  const [fpsCap, setFpsCap] = useState<number | null>(null);
+  const committedQuality = useRef<number | null>(null);
+  const committedFps = useRef<number | null>(null);
   const [cursor, setCursor] = useState<CursorMetadata>({
     position: null,
     hotspot: [0, 0],
@@ -328,6 +340,22 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const reconnect = useCallback(() => {
     clientRef.current?.connect().catch(console.error);
   }, []);
+
+  const changeQuality = useCallback((value: number) => {
+    setQualityLevel(value === 0 ? null : value);
+  }, []);
+
+  const changeFpsCap = useCallback((value: number) => {
+    setFpsCap(value === 0 ? null : value);
+  }, []);
+
+  const commitControls = useCallback(() => {
+    if (committedQuality.current === qualityLevel && committedFps.current === fpsCap) return;
+    committedQuality.current = qualityLevel;
+    committedFps.current = fpsCap;
+    clientRef.current?.sendQuality(qualityLevel ?? 0, fpsCap ?? 0);
+  }, [fpsCap, qualityLevel]);
+  const displayFps = fpsCap ?? machine.target_fps ?? 48;
 
   const requestPointerLock = useCallback(() => {
     containerRef.current?.requestPointerLock();
@@ -667,6 +695,43 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
             </CtrlTooltip>
 
             <Separator.Root className="w-px h-5 bg-zinc-700 mx-1" orientation="vertical" />
+
+            <div className="hidden items-center gap-2 px-2 text-[11px] text-zinc-400 md:flex" title="Machine-wide setting">
+              <label htmlFor="quality-level">Quality</label>
+              <input
+                id="quality-level"
+                type="range"
+                min="0"
+                max="10"
+                value={qualityLevel ?? 0}
+                onChange={(event) => changeQuality(Number(event.target.value))}
+                onPointerUp={commitControls}
+                onBlur={commitControls}
+                className="w-20 accent-[var(--color-accent)]"
+              />
+              <span className="w-24 text-right">
+                {qualityLevel === null
+                  ? `Auto (${qualityMbps(6, machine.width || 1920, machine.height || 1080, displayFps).toFixed(1)} Mbps)`
+                  : `${qualityLevel} · ${qualityMbps(qualityLevel, machine.width || 1920, machine.height || 1080, displayFps).toFixed(1)} Mbps`}
+              </span>
+            </div>
+            <div className="hidden items-center gap-2 px-2 text-[11px] text-zinc-400 md:flex" title="Machine-wide setting">
+              <label htmlFor="fps-cap">FPS</label>
+              <input
+                id="fps-cap"
+                type="range"
+                min="0"
+                max="144"
+                step="1"
+                value={fpsCap ?? 0}
+                onChange={(event) => changeFpsCap(Number(event.target.value))}
+                onPointerUp={commitControls}
+                onBlur={commitControls}
+                className="w-20 accent-[var(--color-accent)]"
+              />
+              <span className="w-12 text-right">{fpsCap === null ? `Auto (${machine.target_fps || 48})` : fpsCap}</span>
+            </div>
+            <span className="hidden text-[10px] text-zinc-600 lg:inline">machine-wide</span>
 
             <CtrlTooltip label="Fullscreen (Ctrl+Alt+Shift+F)">
               <button onClick={toggleFullscreen} className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors">

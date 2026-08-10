@@ -123,6 +123,10 @@ pub struct VideoConfig {
     /// Target bitrate in kbps.
     pub bitrate_kbps: u32,
 
+    /// Default content quality level (1-10) used for the bitrate target.
+    #[serde(default = "default_quality_level")]
+    pub quality_level: u8,
+
     /// Rate control mode.
     pub rate_control: RateControlMode,
 
@@ -192,9 +196,10 @@ impl Default for VideoConfig {
             codec: VideoCodec::H265,
             max_width: 3840,
             max_height: 2160,
-            max_fps: 60,
+            max_fps: 48,
             bitrate_kbps: 20_000,
-            rate_control: RateControlMode::Cbr,
+            quality_level: 6,
+            rate_control: RateControlMode::Vbr,
             dynamic_range: DynamicRange::Sdr,
             chroma_sampling: ChromaSampling::Yuv420,
             rtp_port: 47998,
@@ -205,6 +210,10 @@ impl Default for VideoConfig {
             privacy: PrivacyConfig::default(),
         }
     }
+}
+
+fn default_quality_level() -> u8 {
+    6
 }
 
 impl Default for PrivacyConfig {

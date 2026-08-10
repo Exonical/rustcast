@@ -172,6 +172,12 @@ export class WebRTCClient {
     }
   }
 
+  sendQuality(level: number, fps: number): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "quality", data: { level: Math.round(level), fps: Math.round(fps) } }));
+    }
+  }
+
   disconnect(): void {
     this.cleanup();
     this.setState("disconnected");

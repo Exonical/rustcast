@@ -468,6 +468,22 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			if !session.machine.send(packet) {
 				log.Printf("[ws] upstream command channel full, dropped input event")
 			}
+		case "quality":
+			if session == nil || session.machine == nil {
+				sendWSError(writer, "No active machine session")
+				continue
+			}
+			var control struct {
+				Level uint8 `json:"level"`
+				FPS   uint8 `json:"fps"`
+			}
+			if err := json.Unmarshal(msg.Data, &control); err != nil || control.Level > 10 || control.FPS > 144 {
+				sendWSError(writer, "Quality must be 0-10 and FPS must be 0-144")
+				continue
+			}
+			if !session.machine.send([]byte{0x05, control.Level, control.FPS}) {
+				log.Printf("[ws] upstream command channel full, dropped quality/FPS control")
+			}
 		default:
 			log.Printf("[ws] unknown message type: %s", msg.Type)
 		}

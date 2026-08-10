@@ -15,6 +15,12 @@ pub struct RuntimeStatus {
     pub capture_height: u32,
     pub encode_width: u32,
     pub encode_height: u32,
+    pub target_bitrate_kbps: u32,
+    pub registration_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+pub struct RegistrationHandle {
+    pub stop: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +36,7 @@ struct Registration {
     width: u32,
     height: u32,
     target_fps: u32,
+    target_bitrate_kbps: u32,
 }
 
 pub fn start(
@@ -37,7 +44,7 @@ pub fn start(
     platform: &PlatformInfo,
     frame_endpoint: String,
     status: Arc<RwLock<RuntimeStatus>>,
-) -> Option<oneshot::Sender<()>> {
+) -> Option<RegistrationHandle> {
     let base_url = config.relay.base_url.clone()?;
     let parsed_base_url = match reqwest::Url::parse(&base_url) {
         Ok(url)
@@ -94,9 +101,14 @@ pub fn start(
             .virtual_display
             .map(|display: VirtualDisplayConfig| display.height)
             .unwrap_or(config.video.max_height),
-        target_fps: config.video.max_fps.min(60),
+        target_fps: config.video.max_fps.min(144),
+        target_bitrate_kbps: 0,
     };
     let (stop_tx, mut stop_rx) = oneshot::channel();
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+    if let Ok(mut snapshot) = status.write() {
+        snapshot.registration_notify = Some(notify_tx.clone());
+    }
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let base_url = parsed_base_url.as_str().trim_end_matches('/').to_string();
@@ -122,6 +134,7 @@ pub fn start(
                     current.width = snapshot.encode_width;
                     current.height = snapshot.encode_height;
                 }
+                current.target_bitrate_kbps = snapshot.target_bitrate_kbps;
             }
             let url = if first {
                 &endpoint
@@ -134,6 +147,7 @@ pub fn start(
             }
             tokio::select! {
                 _ = interval.tick() => {},
+                Some(()) = notify_rx.recv() => {},
                 _ = &mut stop_rx => {
                     let _ = client.post(&deregister).send().await;
                     return;
@@ -141,7 +155,7 @@ pub fn start(
             }
         }
     });
-    Some(stop_tx)
+    Some(RegistrationHandle { stop: stop_tx })
 }
 
 fn config_path(config: &FluxConfig) -> PathBuf {

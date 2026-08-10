@@ -622,7 +622,9 @@ impl AmfSession {
                 encoder.set_property_size(H264_FRAMESIZE, w, h)?;
                 encoder.set_property_rate(H264_FRAMERATE, config.framerate, 1)?;
                 encoder.set_property_int64(H264_PROFILE, H264_PROFILE_HIGH)?;
-                encoder.set_property_int64(H264_QUALITY_PRESET, H264_QUALITY_BALANCED)?;
+                // Quality costs little on VCN and is the cheapest fidelity
+                // improvement for motion-heavy desktop/video content.
+                encoder.set_property_int64(H264_QUALITY_PRESET, H264_QUALITY_QUALITY)?;
                 if let Err(e) = encoder.set_property_bool(H264_LOWLATENCY_MODE, true) {
                     tracing::debug!("AMF: LowLatencyInternal not supported: {}", e);
                 }
@@ -637,8 +639,9 @@ impl AmfSession {
                 encoder.set_property_int64(H264_TARGET_BITRATE, bitrate_bps)?;
                 encoder.set_property_int64(H264_PEAK_BITRATE, bitrate_bps * 3 / 2)?;
 
-                // Single-frame VBV for lowest latency
-                let vbv_size = bitrate_bps / config.framerate as i64;
+                // A three-frame VBV lets complex frames borrow bits from
+                // neighbouring frames while adding only ~50 ms at 60 fps.
+                let vbv_size = bitrate_bps * 3 / config.framerate as i64;
                 encoder.set_property_int64(H264_VBV_BUFFER_SIZE, vbv_size)?;
 
                 // Streaming optimizations
