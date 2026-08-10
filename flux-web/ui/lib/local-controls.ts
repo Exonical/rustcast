@@ -1,4 +1,4 @@
-const LOCAL_CONTROL_SELECTOR = [
+export const LOCAL_CONTROL_SELECTORS = [
   "a",
   "button",
   "input",
@@ -19,7 +19,9 @@ const LOCAL_CONTROL_SELECTOR = [
   "[role='switch']",
   "[role='tab']",
   "[role='textbox']",
-].join(",");
+] as const;
+
+const LOCAL_CONTROL_SELECTOR = LOCAL_CONTROL_SELECTORS.join(",");
 
 export function isLocalControlTarget(target: EventTarget | null): boolean {
   if (!target || typeof (target as Element).closest !== "function") return false;
