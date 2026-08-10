@@ -7,6 +7,7 @@ import * as Separator from "@radix-ui/react-separator";
 import { WebRTCClient, type ConnectionState, type CursorMetadata, type WebRTCStats } from "@/lib/webrtc-client";
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
+import { isLocalControlTarget } from "@/lib/local-controls";
 
 // ── Helper Functions ────────────────────────────────────────────────────────
 
@@ -408,6 +409,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     revealControls();
 
+    if (isLocalControlTarget(e.target)) return;
+
     // Input capture
     if (!clientRef.current || !videoRef.current) return;
     
@@ -427,6 +430,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   }, [getNormalizedCoords, isPointerLocked, queueMove, revealControls]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (isLocalControlTarget(e.target)) return;
     if (!clientRef.current) return;
     e.preventDefault();
     const button = mapMouseButton(e.button);
@@ -441,6 +445,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   }, []);
 
   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (isLocalControlTarget(e.target)) return;
     if (!clientRef.current) return;
     e.preventDefault();
     const button = mapMouseButton(e.button);
@@ -486,7 +491,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     if (!container) return;
     const handleTouchStart = (e: TouchEvent) => {
       revealControls();
-      if (!(e.target instanceof Element) || e.target.closest("button")) return;
+      if (isLocalControlTarget(e.target)) return;
       e.preventDefault();
     };
     container.addEventListener("touchstart", handleTouchStart, { passive: false });
@@ -526,6 +531,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
       (e.ctrlKey || e.metaKey) && ["KeyW", "KeyT", "KeyN", "KeyL"].includes(e.code);
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isLocalControlTarget(e.target)) return;
+
       if (isViewerChord(e)) {
         if (e.code === "KeyR") { e.preventDefault(); reconnect(); return; }
         if (e.code === "KeyS") { e.preventDefault(); setShowStats((visible) => !visible); return; }
@@ -557,6 +564,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (isLocalControlTarget(e.target)) return;
+
       const keyId = e.code || e.key;
       const held = heldKeys.current.get(keyId);
       if (clientRef.current && held) {
@@ -648,7 +657,7 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
         </div>
 
         {/* Top bar */}
-        <div className={`absolute top-0 left-0 right-0 z-10 p-3 sm:p-5 flex flex-wrap items-start justify-between gap-3 transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
+        <div data-local-control className={`absolute top-0 left-0 right-0 z-10 p-3 sm:p-5 flex flex-wrap items-start justify-between gap-3 transition-opacity duration-300 ${showControls ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
           {/* Logo + status */}
           <div className="glass rounded-2xl px-3 py-2.5 sm:px-4 flex min-w-0 items-center gap-2.5 sm:gap-3 animate-fade-in">
             <span className="text-[var(--color-accent)]"><MonitorIcon /></span>
