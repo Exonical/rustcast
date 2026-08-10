@@ -762,6 +762,7 @@ fn encoder_backend_candidates(
 
 /// Bits-per-pixel-per-frame coefficients for quality levels 1 through 10.
 /// Level 3 is the former 0.05 setting; the default level 6 is 0.10.
+/// Keep the UI estimate in `flux-web/ui/app/page.tsx` synchronized with this table.
 fn quality_bpp(level: u8) -> f64 {
     match level.clamp(1, 10) {
         1 => 0.025,
@@ -787,6 +788,23 @@ fn bitrate_kbps_for(
         * fps as f64
         * quality_bpp(level);
     (bps / 1000.0).round().clamp(3_000.0, 50_000.0) as u32
+}
+
+const FRAME_PACING_TOLERANCE: f64 = 0.10;
+
+fn should_encode_frame(
+    last_encoded_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    fps_cap: u32,
+) -> bool {
+    let interval = std::time::Duration::from_secs_f64(1.0 / fps_cap.max(1) as f64);
+    if let Some(last) = *last_encoded_at {
+        if now.duration_since(last) + interval.mul_f64(FRAME_PACING_TOLERANCE) < interval {
+            return false;
+        }
+    }
+    *last_encoded_at = Some(now);
+    true
 }
 
 /// Create an encoder of the given backend and open a session, returning `None`
@@ -1048,17 +1066,24 @@ fn capture_loop(
             new_bitrate = Some(kbps);
         }
         while let Ok((level, requested_fps)) = quality_rx.try_recv() {
+            let valid_level = level <= 10;
             if (1..=10).contains(&level) {
                 quality_level = level;
             } else if level == 0 {
                 quality_level = default_quality_level.clamp(1, 10);
             } else {
-                continue;
+                tracing::warn!("Ignoring out-of-range quality level {}", level);
             }
+            let valid_fps = requested_fps <= 144;
             if requested_fps == 0 {
                 fps_cap = configured_fps;
-            } else {
+            } else if valid_fps {
                 fps_cap = u32::from(requested_fps).min(configured_fps);
+            } else {
+                tracing::warn!("Ignoring out-of-range FPS cap {}", requested_fps);
+            }
+            if !valid_level && !valid_fps {
+                continue;
             }
             if let Some(ref mut enc) = encode_session {
                 let kbps = bitrate_kbps_for(encode_resolution, fps_cap, quality_level);
@@ -1147,14 +1172,10 @@ fn capture_loop(
         };
 
         let t_capture = t0.elapsed();
-        frame_count += 1;
-
-        if let Some(last) = last_encoded_at {
-            if t0.duration_since(last) < std::time::Duration::from_secs_f64(1.0 / fps_cap as f64) {
-                continue;
-            }
+        if !should_encode_frame(&mut last_encoded_at, t0, fps_cap) {
+            continue;
         }
-        last_encoded_at = Some(t0);
+        frame_count += 1;
 
         // (Re)build the encoder once the negotiated capture resolution is
         // known or whenever it changes (e.g. display rotation / mode switch),
@@ -1316,7 +1337,7 @@ fn capture_loop(
             let wall = loop_start.elapsed().as_secs_f64();
             let actual_fps = frame_count as f64 / wall;
             let avg_kbps = if frame_count > 0 {
-                total_encoded_bytes * 8 / frame_count * target_fps as u64 / 1000
+                (total_encoded_bytes as f64 * 8.0 / wall / 1000.0) as u64
             } else { 0 };
             tracing::info!(
                 "Perf: {:.1} fps | capture={:.1}ms encode={:.1}ms | {} frames, ~{} kbps",
@@ -1384,5 +1405,18 @@ mod quality_tests {
     fn fps_cap_reduces_target_linearly() {
         let resolution = flux_core::types::Resolution::new(1920, 1080);
         assert_eq!(bitrate_kbps_for(resolution, 48, 6), 9_953);
+    }
+
+    #[test]
+    fn pacing_accepts_native_interval_and_small_jitter() {
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs_f64(1.0 / 48.0);
+        let mut last = Some(start);
+        assert!(should_encode_frame(&mut last, start + interval, 48));
+        assert!(should_encode_frame(
+            &mut last,
+            start + interval + interval.mul_f64(0.95),
+            48
+        ));
     }
 }

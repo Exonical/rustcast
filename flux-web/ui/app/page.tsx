@@ -14,6 +14,8 @@ function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
 }
 
+// Estimate mirror of quality_bpp() in flux/crates/flux-server/src/main.rs.
+// Sender-reported target bitrate is not part of the live viewer state yet.
 const qualityBpp = [0, 0.025, 0.035, 0.05, 0.065, 0.08, 0.1, 0.12, 0.14, 0.16, 0.2];
 
 function qualityMbps(level: number, width: number, height: number, fps: number): number {
@@ -194,6 +196,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
   const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [qualityLevel, setQualityLevel] = useState<number | null>(null);
   const [fpsCap, setFpsCap] = useState<number | null>(null);
+  const committedQuality = useRef<number | null>(null);
+  const committedFps = useRef<number | null>(null);
   const [cursor, setCursor] = useState<CursorMetadata>({
     position: null,
     hotspot: [0, 0],
@@ -339,13 +343,18 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
 
   const changeQuality = useCallback((value: number) => {
     setQualityLevel(value === 0 ? null : value);
-    clientRef.current?.sendQuality(value, fpsCap ?? 0);
-  }, [fpsCap]);
+  }, []);
 
   const changeFpsCap = useCallback((value: number) => {
     setFpsCap(value === 0 ? null : value);
-    clientRef.current?.sendQuality(qualityLevel ?? 0, value);
-  }, [qualityLevel]);
+  }, []);
+
+  const commitControls = useCallback(() => {
+    if (committedQuality.current === qualityLevel && committedFps.current === fpsCap) return;
+    committedQuality.current = qualityLevel;
+    committedFps.current = fpsCap;
+    clientRef.current?.sendQuality(qualityLevel ?? 0, fpsCap ?? 0);
+  }, [fpsCap, qualityLevel]);
   const displayFps = fpsCap ?? machine.target_fps ?? 48;
 
   const requestPointerLock = useCallback(() => {
@@ -696,6 +705,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
                 max="10"
                 value={qualityLevel ?? 0}
                 onChange={(event) => changeQuality(Number(event.target.value))}
+                onPointerUp={commitControls}
+                onBlur={commitControls}
                 className="w-20 accent-[var(--color-accent)]"
               />
               <span className="w-24 text-right">
@@ -714,6 +725,8 @@ function StreamViewer({ machine, onBack }: { machine: Machine; onBack: () => voi
                 step="1"
                 value={fpsCap ?? 0}
                 onChange={(event) => changeFpsCap(Number(event.target.value))}
+                onPointerUp={commitControls}
+                onBlur={commitControls}
                 className="w-20 accent-[var(--color-accent)]"
               />
               <span className="w-12 text-right">{fpsCap === null ? `Auto (${machine.target_fps || 48})` : fpsCap}</span>
