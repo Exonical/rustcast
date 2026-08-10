@@ -349,12 +349,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bitrate update channel: relay congestion feedback -> capture thread
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
+    let (quality_tx, quality_rx) = std::sync::mpsc::channel::<(u8, u8)>();
 
     // Input event channel: Frame server (TCP) -> Capture thread (Input Sink)
     let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
 
-    let capture_fps = config.video.max_fps.min(60);
+    let capture_fps = config.video.max_fps.min(144);
     let forced_encoder = config.video.encoder;
+    let default_quality_level = config.video.quality_level;
     let runtime_status = Arc::new(std::sync::RwLock::new(registration::RuntimeStatus::default()));
     let runtime_status_capture = runtime_status.clone();
     std::thread::Builder::new()
@@ -365,9 +367,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cursor_tx2,
                 idr_rx,
                 bitrate_rx,
+                quality_rx,
                 input_rx,
                 capture_fps,
                 forced_encoder,
+                default_quality_level,
                 virtual_display_target,
                 runtime_status_capture,
             );
@@ -412,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cursor_rx = cursor_tx.subscribe();
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
+                let quality_tx = quality_tx.clone();
                 let input_tx = input_tx.clone();
                 let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
@@ -421,6 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cursor_rx,
                         idr_tx,
                         bitrate_tx,
+                        quality_tx,
                         input_tx,
                         privacy_controller,
                     )
@@ -447,6 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cursor_rx,
             idr_tx,
             bitrate_tx,
+            quality_tx,
             input_tx,
             frame_privacy_controller,
         )
@@ -485,8 +492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     server.shutdown().await;
-    if let Some(stop) = registration_stop {
-        let _ = stop.send(());
+    if let Some(handle) = registration_stop {
+        let _ = handle.stop.send(());
     }
     tracing::info!("Flux Server stopped.");
     Ok(())
@@ -495,12 +502,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
 /// Protocol: [1-byte type][8-byte BE capture-timestamp µs][4-byte BE length][payload].
 /// Type 0x01 is an H.264 access unit; type 0x02 is cursor JSON metadata.
+/// Control commands: 0x01 IDR, 0x02 input, 0x03 bitrate, 0x04 viewer count,
+/// and 0x05 quality/FPS ([quality level, FPS cap], each 0 means automatic).
 async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
+    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -531,6 +541,7 @@ async fn frame_server(
         let mut cursor_rx = cursor_rx.clone();
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
+        let quality_tx = quality_tx.clone();
         let input_tx = input_tx.clone();
         #[cfg(target_os = "windows")]
         let privacy_connection = privacy_controller
@@ -628,6 +639,13 @@ async fn frame_server(
                                     );
                                 }
                             }
+                        }
+                        0x05 => {
+                            let mut level = [0u8; 2];
+                            if reader.read_exact(&mut level).await.is_err() {
+                                break;
+                            }
+                            let _ = quality_tx.send((level[0], level[1]));
                         }
                         _ => {
                             tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);
@@ -742,11 +760,33 @@ fn encoder_backend_candidates(
     candidates
 }
 
-/// Content-scaled CBR bitrate: ~0.05 bits per pixel per frame suits H.264
-/// desktop streaming (sharp text at moderate motion), clamped to sane bounds.
-fn bitrate_kbps_for(resolution: flux_core::types::Resolution, fps: u32) -> u32 {
-    let bps = resolution.width as u64 * resolution.height as u64 * fps as u64 * 5 / 100;
-    (bps / 1000).clamp(4_000, 40_000) as u32
+/// Bits-per-pixel-per-frame coefficients for quality levels 1 through 10.
+/// Level 3 is the former 0.05 setting; the default level 6 is 0.10.
+fn quality_bpp(level: u8) -> f64 {
+    match level.clamp(1, 10) {
+        1 => 0.025,
+        2 => 0.035,
+        3 => 0.050,
+        4 => 0.065,
+        5 => 0.080,
+        6 => 0.100,
+        7 => 0.120,
+        8 => 0.140,
+        9 => 0.160,
+        _ => 0.200,
+    }
+}
+
+fn bitrate_kbps_for(
+    resolution: flux_core::types::Resolution,
+    fps: u32,
+    level: u8,
+) -> u32 {
+    let bps = resolution.width as f64
+        * resolution.height as f64
+        * fps as f64
+        * quality_bpp(level);
+    (bps / 1000.0).round().clamp(3_000.0, 50_000.0) as u32
 }
 
 /// Create an encoder of the given backend and open a session, returning `None`
@@ -757,6 +797,7 @@ fn bitrate_kbps_for(resolution: flux_core::types::Resolution, fps: u32) -> u32 {
 fn create_encode_session(
     backend: flux_core::types::EncoderBackend,
     mut config: flux_encode::traits::EncodeConfig,
+    quality_level: u8,
 ) -> Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)> {
     let encoder = match flux_encode::create_encoder(Some(backend)) {
         Ok(enc) => {
@@ -782,7 +823,7 @@ fn create_encode_session(
         }
     }
     let resolution = config.resolution;
-    config.bitrate_kbps = bitrate_kbps_for(resolution, config.framerate);
+    config.bitrate_kbps = bitrate_kbps_for(resolution, config.framerate, quality_level);
     match encoder.create_session(config) {
         Ok(s) => {
             tracing::info!("{:?} H.264 encode session started at {}", backend, resolution);
@@ -803,6 +844,7 @@ fn build_encode_session_for(
     target_fps: u32,
     resolution: flux_core::types::Resolution,
     forced_backend: Option<flux_core::types::EncoderBackend>,
+    quality_level: u8,
 ) -> (
     Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)>,
     flux_core::types::EncoderBackend,
@@ -813,7 +855,7 @@ fn build_encode_session_for(
         framerate: target_fps,
         // Placeholder; recomputed per-backend from the fitted resolution.
         bitrate_kbps: 10_000,
-        rate_control: flux_core::types::RateControlMode::Cbr,
+        rate_control: flux_core::types::RateControlMode::Vbr,
         dynamic_range: flux_core::types::DynamicRange::Sdr,
         chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
         // Emit a keyframe every ~2s so a late joiner or any decode desync
@@ -826,7 +868,7 @@ fn build_encode_session_for(
     let mut backend = flux_core::types::EncoderBackend::Software;
     let mut session = None;
     for candidate in encoder_backend_candidates(forced_backend) {
-        session = create_encode_session(candidate, encoder_config.clone());
+        session = create_encode_session(candidate, encoder_config.clone(), quality_level);
         backend = candidate;
         if session.is_some() {
             break;
@@ -844,9 +886,11 @@ fn capture_loop(
     cursor_tx: tokio::sync::watch::Sender<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
+    quality_rx: std::sync::mpsc::Receiver<(u8, u8)>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
+    default_quality_level: u8,
     target_display: Option<flux_capture::traits::DisplayInfo>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
@@ -969,6 +1013,10 @@ fn capture_loop(
     // monitors). Build the encoder from the frame the capture path actually
     // delivers, and rebuild it if the resolution changes mid-stream.
     let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
+    let mut quality_level = default_quality_level.clamp(1, 10);
+    let configured_fps = target_fps;
+    let mut fps_cap = configured_fps;
+    let mut last_encoded_at: Option<std::time::Instant> = None;
     let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
     let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
@@ -998,6 +1046,31 @@ fn capture_loop(
         let mut new_bitrate: Option<u32> = None;
         while let Ok(kbps) = bitrate_rx.try_recv() {
             new_bitrate = Some(kbps);
+        }
+        while let Ok((level, requested_fps)) = quality_rx.try_recv() {
+            if (1..=10).contains(&level) {
+                quality_level = level;
+            } else if level == 0 {
+                quality_level = default_quality_level.clamp(1, 10);
+            } else {
+                continue;
+            }
+            if requested_fps == 0 {
+                fps_cap = configured_fps;
+            } else {
+                fps_cap = u32::from(requested_fps).min(configured_fps);
+            }
+            if let Some(ref mut enc) = encode_session {
+                let kbps = bitrate_kbps_for(encode_resolution, fps_cap, quality_level);
+                if let Err(error) = enc.set_bitrate(kbps) {
+                    tracing::warn!("quality level {} bitrate update failed: {}", quality_level, error);
+                } else if let Ok(mut status) = runtime_status.write() {
+                    status.target_bitrate_kbps = kbps;
+                    if let Some(notify) = status.registration_notify.as_ref() {
+                        let _ = notify.send(());
+                    }
+                }
+            }
         }
         if let (Some(kbps), Some(ref mut enc)) = (new_bitrate, encode_session.as_mut()) {
             match enc.set_bitrate(kbps) {
@@ -1076,11 +1149,23 @@ fn capture_loop(
         let t_capture = t0.elapsed();
         frame_count += 1;
 
+        if let Some(last) = last_encoded_at {
+            if t0.duration_since(last) < std::time::Duration::from_secs_f64(1.0 / fps_cap as f64) {
+                continue;
+            }
+        }
+        last_encoded_at = Some(t0);
+
         // (Re)build the encoder once the negotiated capture resolution is
         // known or whenever it changes (e.g. display rotation / mode switch),
         // so the encoder dimensions always match the frames it receives.
         if capture_resolution != frame.resolution {
-            let (sess, backend) = build_encode_session_for(target_fps, frame.resolution, forced_backend);
+            let (sess, backend) = build_encode_session_for(
+                target_fps,
+                frame.resolution,
+                forced_backend,
+                quality_level,
+            );
             capture_resolution = frame.resolution;
             match sess {
                 Some((s, res)) => {
@@ -1098,6 +1183,11 @@ fn capture_loop(
                 status.encode_width = encode_resolution.width;
                 status.encode_height = encode_resolution.height;
                 status.encoder_backend = Some(format!("{backend:?}"));
+                status.target_bitrate_kbps =
+                    bitrate_kbps_for(encode_resolution, fps_cap, quality_level);
+                if let Some(notify) = status.registration_notify.as_ref() {
+                    let _ = notify.send(());
+                }
             }
             if let Ok(mut dimensions) = cursor_dimensions.write() {
                 dimensions.0 = capture_resolution.width;
@@ -1275,5 +1365,24 @@ impl FluxServer {
     async fn shutdown(self) {
         tracing::info!("Shutting down all sessions...");
         self.session_manager.shutdown_all().await;
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn quality_levels_map_to_expected_1080p60_targets() {
+        let resolution = flux_core::types::Resolution::new(1920, 1080);
+        assert_eq!(bitrate_kbps_for(resolution, 60, 3), 6_221);
+        assert_eq!(bitrate_kbps_for(resolution, 60, 6), 12_442);
+        assert_eq!(bitrate_kbps_for(resolution, 60, 10), 24_883);
+    }
+
+    #[test]
+    fn fps_cap_reduces_target_linearly() {
+        let resolution = flux_core::types::Resolution::new(1920, 1080);
+        assert_eq!(bitrate_kbps_for(resolution, 48, 6), 9_953);
     }
 }

@@ -11,6 +11,7 @@
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
 //!                                | [0x03][4-byte BE target bitrate kbps]
 //!                                | [0x04][4-byte BE viewer count]
+//!                                | [0x05][quality level][FPS cap] (each 0 means automatic)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,7 @@ pub async fn serve(
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
+    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -75,6 +77,7 @@ pub async fn serve(
             cursor_rx,
             idr_tx.clone(),
             bitrate_tx.clone(),
+            quality_tx.clone(),
             input_tx.clone(),
             privacy_controller.clone(),
         ));
@@ -87,6 +90,7 @@ async fn handle_connection(
     mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
+    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -107,9 +111,10 @@ async fn handle_connection(
             };
             let idr_tx = idr_tx.clone();
             let bitrate_tx = bitrate_tx.clone();
+            let quality_tx = quality_tx.clone();
             let input_tx = input_tx.clone();
             let privacy_connection = privacy_connection.clone();
-            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, input_tx, privacy_connection));
+            tokio::spawn(read_commands(recv, idr_tx, bitrate_tx, quality_tx, input_tx, privacy_connection));
         }
     });
 
@@ -184,6 +189,7 @@ async fn read_commands(
     mut recv: quinn::RecvStream,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
+    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_connection: Option<PrivacyConnection>,
 ) {
@@ -242,6 +248,13 @@ async fn read_commands(
                         tracing::error!("Privacy mode viewer-count update failed: {error}");
                     }
                 }
+            }
+            0x05 => {
+                let mut levels = [0u8; 2];
+                if recv.read_exact(&mut levels).await.is_err() {
+                    return;
+                }
+                let _ = quality_tx.send((levels[0], levels[1]));
             }
             other => {
                 tracing::warn!("QUIC unknown command byte: 0x{:02x}", other);

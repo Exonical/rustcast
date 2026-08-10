@@ -24,6 +24,7 @@ type machineInfo struct {
 	Width          uint32    `json:"width,omitempty"`
 	Height         uint32    `json:"height,omitempty"`
 	TargetFPS      uint32    `json:"target_fps,omitempty"`
+	TargetBitrate  uint32    `json:"target_bitrate_kbps,omitempty"`
 	LastSeen       time.Time `json:"last_seen"`
 	Status         string    `json:"status"`
 	UpstreamStatus string    `json:"upstream_status"`
@@ -41,6 +42,7 @@ type machineRegistration struct {
 	Width          uint32 `json:"width"`
 	Height         uint32 `json:"height"`
 	TargetFPS      uint32 `json:"target_fps"`
+	TargetBitrate  uint32 `json:"target_bitrate_kbps"`
 }
 
 type machineRecord struct {
@@ -96,6 +98,9 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		UpstreamStatus: upstreamStatus,
 	}
 	m.static = static
+	if m.upstream != nil && input.TargetBitrate != 0 {
+		m.upstream.abr.setSenderTarget(input.TargetBitrate)
+	}
 	return m
 }
 
@@ -172,6 +177,9 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
 		})
+		if m.TargetBitrate != 0 {
+			m.upstream.abr.setSenderTarget(m.TargetBitrate)
+		}
 		go m.upstream.run()
 	}
 	m.upstream.viewers++

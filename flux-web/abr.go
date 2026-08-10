@@ -22,8 +22,9 @@ type abrState struct {
 	sampleStart   time.Time // start of current measurement window
 	measuredKbps  uint32    // last measured incoming bitrate
 
-	targetKbps  uint32 // 0 = never adjusted (encoder default)
-	ceilingKbps uint32 // highest bitrate ever seen flowing cleanly
+	targetKbps       uint32 // 0 = never adjusted (encoder default)
+	ceilingKbps      uint32 // sender-reported requested bitrate ceiling
+	senderTargetKbps uint32
 
 	lastDecrease time.Time
 	lastIncrease time.Time
@@ -54,9 +55,19 @@ func (a *abrState) countFrameBytes(n int) {
 		a.measuredKbps = uint32(float64(a.bytesReceived*8) / elapsed.Seconds() / 1000)
 		a.bytesReceived = 0
 		a.sampleStart = now
-		if a.measuredKbps > a.ceilingKbps {
-			a.ceilingKbps = a.measuredKbps
-		}
+	}
+}
+
+// setSenderTarget updates capacity from the sender's requested bitrate.
+// Measured output is intentionally not used as capacity: an idle desktop can
+// emit almost no bytes while still supporting the full requested bitrate.
+func (a *abrState) setSenderTarget(kbps uint32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ceilingKbps = kbps
+	if a.senderTargetKbps != kbps {
+		a.senderTargetKbps = kbps
+		a.targetKbps = kbps
 	}
 }
 
@@ -73,9 +84,6 @@ func (a *abrState) onReceiverReport(fractionLost float64) {
 			return
 		}
 		base := a.targetKbps
-		if base == 0 {
-			base = a.measuredKbps
-		}
 		if base == 0 {
 			return // nothing measured yet
 		}
