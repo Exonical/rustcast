@@ -75,6 +75,11 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         .allowlist_item("DISPLAYCONFIG_.*")
         .derive_default(true)
         .layout_tests(false)
+        // Generate bindings that are valid in this crate's Rust 2024 edition.
+        // In particular, this enables `unsafe extern` blocks for imported
+        // IddCx symbols without requiring a newer bindgen dependency.
+        .rust_target(bindgen::RustTarget::Stable_1_82)
+        .rust_edition(bindgen::RustEdition::Edition2024)
         // The IddCx headers are C++-only (forward struct references in
         // function signatures), so parse them as C++.
         .clang_arg("-x")
