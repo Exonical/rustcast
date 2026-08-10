@@ -38,6 +38,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let out_path = out_dir.join("iddcx_bindings.rs");
+    // Bindgen 0.71 requires a Rust target new enough for Edition 2024.
+    // Stable_1_82 is the newest named target in that release, so construct
+    // the minimum compatible target explicitly and surface construction
+    // failures instead of panicking in the build script.
+    let rust_target = bindgen::RustTarget::stable(85, 0)
+        .map_err(|error| format!("invalid bindgen Rust target for Edition 2024: {error}"))?;
     fs::write(
         out_dir.join("iddcx_version.rs"),
         format!(
@@ -78,7 +84,7 @@ fn generate_iddcx_bindings(config: &wdk_build::Config) -> Result<(), Box<dyn std
         // Generate bindings that are valid in this crate's Rust 2024 edition.
         // In particular, this enables `unsafe extern` blocks for imported
         // IddCx symbols without requiring a newer bindgen dependency.
-        .rust_target(bindgen::RustTarget::Stable_1_82)
+        .rust_target(rust_target)
         .rust_edition(bindgen::RustEdition::Edition2024)
         // The IddCx headers are C++-only (forward struct references in
         // function signatures), so parse them as C++.
