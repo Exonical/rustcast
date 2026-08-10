@@ -332,6 +332,12 @@ impl DxgiCapture {
                             adapter_luid: Some(adapter_luid),
                             name,
                             native_resolution: Resolution::new(width, height),
+                            desktop_rect: flux_core::types::DesktopRect {
+                                left: rect.left,
+                                top: rect.top,
+                                width: (rect.right - rect.left).max(0) as u32,
+                                height: (rect.bottom - rect.top).max(0) as u32,
+                            },
                             primary: attached_display_count == 0,
                             capture_supported,
                         });

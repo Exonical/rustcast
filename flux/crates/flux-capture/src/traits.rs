@@ -1,7 +1,7 @@
 use flux_core::cursor::CursorMetadata;
 use flux_core::error::Result;
 use flux_core::frame::CapturedFrame;
-use flux_core::types::Resolution;
+use flux_core::types::{DesktopRect, Resolution};
 use std::sync::Arc;
 
 pub type CursorUpdateSink = Arc<dyn Fn(CursorMetadata) + Send + Sync>;
@@ -38,6 +38,9 @@ pub struct DisplayInfo {
 
     /// Native resolution.
     pub native_resolution: Resolution,
+
+    /// Output rectangle in virtual-desktop coordinates.
+    pub desktop_rect: DesktopRect,
 
     /// Whether this is the primary display.
     pub primary: bool,

@@ -53,6 +53,12 @@ impl ScreenCapture for PipeWireCapture {
             adapter_luid: None,
             name: "Primary Display".into(),
             native_resolution: Resolution::new(1920, 1080),
+            desktop_rect: flux_core::types::DesktopRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
             primary: true,
             capture_supported: true,
         }])
