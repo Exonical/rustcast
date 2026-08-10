@@ -68,12 +68,16 @@ type Session struct {
 	release        func()
 	releaseOnce    sync.Once
 	cursorDone     chan struct{}
+	writer         *wsWriter
 }
 
 type wsWriter struct {
 	mu sync.Mutex
 	ws *websocket.Conn
 }
+
+const signalingIdleTimeout = 45 * time.Second
+const signalingPingInterval = 15 * time.Second
 
 func (w *wsWriter) write(messageType int, payload []byte) error {
 	w.mu.Lock()
@@ -353,6 +357,30 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 	}
 	defer ws.Close()
 	writer := &wsWriter{ws: ws}
+	_ = ws.SetReadDeadline(time.Now().Add(signalingIdleTimeout))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(signalingIdleTimeout))
+	})
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(signalingPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := ws.WriteControl(
+					websocket.PingMessage,
+					nil,
+					time.Now().Add(5*time.Second),
+				); err != nil {
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
 
 	log.Printf("[ws] client connected: %s", c.ClientIP())
 	var session *Session
@@ -416,6 +444,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				session.PeerConnection.Close()
 			}
 			session = next
+			next.writer = writer
 			if offerData.Width != 0 || offerData.Height != 0 {
 				if offerData.Width < 640 || offerData.Height < 480 ||
 					offerData.Width > 2560 || offerData.Height > 1440 ||

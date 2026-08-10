@@ -26,6 +26,7 @@ type machineInfo struct {
 	Width          uint32    `json:"width,omitempty"`
 	Height         uint32    `json:"height,omitempty"`
 	TargetFPS      uint32    `json:"target_fps,omitempty"`
+	DefaultFPS     uint32    `json:"default_fps,omitempty"`
 	TargetBitrate  uint32    `json:"target_bitrate_kbps,omitempty"`
 	LastSeen       time.Time `json:"last_seen"`
 	Status         string    `json:"status"`
@@ -44,6 +45,7 @@ type machineRegistration struct {
 	Width          uint32 `json:"width"`
 	Height         uint32 `json:"height"`
 	TargetFPS      uint32 `json:"target_fps"`
+	DefaultFPS     uint32 `json:"default_fps"`
 	TargetBitrate  uint32 `json:"target_bitrate_kbps"`
 }
 
@@ -96,7 +98,7 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		DisplayName: input.DisplayName,
 		OS:          input.OS, GPUVendor: input.GPUVendor, EncoderBackend: input.EncoderBackend,
 		VirtualDisplay: input.VirtualDisplay, Width: input.Width, Height: input.Height,
-		TargetFPS: input.TargetFPS, LastSeen: now, Status: "online",
+		TargetFPS: input.TargetFPS, DefaultFPS: input.DefaultFPS, LastSeen: now, Status: "online",
 		UpstreamStatus: upstreamStatus,
 	}
 	m.static = static

@@ -120,6 +120,10 @@ pub struct VideoConfig {
     /// Maximum framerate.
     pub max_fps: u32,
 
+    /// Initial and automatic in-session framerate cap.
+    #[serde(default = "default_fps_cap")]
+    pub default_fps_cap: u32,
+
     /// Target bitrate in kbps.
     pub bitrate_kbps: u32,
 
@@ -190,6 +194,10 @@ fn default_refresh_hz() -> u32 {
     60
 }
 
+fn default_fps_cap() -> u32 {
+    48
+}
+
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
@@ -197,6 +205,7 @@ impl Default for VideoConfig {
             max_width: 3840,
             max_height: 2160,
             max_fps: 60,
+            default_fps_cap: 48,
             bitrate_kbps: 20_000,
             quality_level: 6,
             rate_control: RateControlMode::Vbr,

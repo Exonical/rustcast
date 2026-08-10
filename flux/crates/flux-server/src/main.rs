@@ -53,6 +53,30 @@ pub(crate) struct ModeRequest {
     pub height: u32,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ResolutionStatus {
+    pub state: &'static str,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+type ResolutionStatusMessage = Arc<(u64, Vec<u8>)>;
+
+fn publish_resolution_status(
+    tx: &tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
+    status: ResolutionStatus,
+) {
+    if let Ok(payload) = serde_json::to_vec(&status) {
+        let _ = tx.send(Arc::new((0, payload)));
+    }
+}
+
 pub(crate) fn validate_mode_request(request: ModeRequest) -> Result<ModeRequest, &'static str> {
     if request.width < 640 || request.height < 480 {
         return Err("resolution is implausibly small");
@@ -68,6 +92,10 @@ pub(crate) fn validate_mode_request(request: ModeRequest) -> Result<ModeRequest,
 
 pub(crate) fn mode_change_needed(current: ModeRequest, requested: ModeRequest) -> bool {
     current.width != requested.width || current.height != requested.height
+}
+
+fn effective_default_fps_cap(configured: u32, requested_default: u32) -> u32 {
+    requested_default.min(configured)
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -380,6 +408,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel::<u32>();
     let (quality_tx, quality_rx) = std::sync::mpsc::channel::<(u8, u8)>();
     let (resolution_tx, resolution_rx) = std::sync::mpsc::channel::<ModeRequest>();
+    let (resolution_status_tx, _) =
+        tokio::sync::broadcast::channel::<ResolutionStatusMessage>(8);
 
     // Input event channel: Frame server (TCP) -> Capture thread (Input Sink)
     let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
@@ -389,6 +419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_quality_level = config.video.quality_level;
     let runtime_status = Arc::new(std::sync::RwLock::new(registration::RuntimeStatus::default()));
     let runtime_status_capture = runtime_status.clone();
+    let resolution_status_tx_capture = resolution_status_tx.clone();
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
@@ -401,10 +432,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolution_rx,
                 input_rx,
                 capture_fps,
+                config.video.default_fps_cap,
                 forced_encoder,
                 default_quality_level,
                 virtual_display_target,
                 virtual_display,
+                resolution_status_tx_capture,
                 runtime_status_capture,
             );
         })?;
@@ -450,6 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bitrate_tx = bitrate_tx.clone();
                 let quality_tx = quality_tx.clone();
                 let resolution_tx = resolution_tx.clone();
+                let resolution_status_tx = resolution_status_tx.clone();
                 let input_tx = input_tx.clone();
                 let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
@@ -461,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bitrate_tx,
                         quality_tx,
                         resolution_tx,
+                        resolution_status_tx,
                         input_tx,
                         privacy_controller,
                     )
@@ -489,6 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bitrate_tx,
             quality_tx,
             resolution_tx,
+            resolution_status_tx,
             input_tx,
             frame_privacy_controller,
         )
@@ -548,6 +584,7 @@ async fn frame_server(
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<ModeRequest>,
+    resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -580,6 +617,7 @@ async fn frame_server(
         let bitrate_tx = bitrate_tx.clone();
         let quality_tx = quality_tx.clone();
         let resolution_tx = resolution_tx.clone();
+        let mut resolution_status_rx = resolution_status_tx.subscribe();
         let input_tx = input_tx.clone();
         #[cfg(target_os = "windows")]
         let privacy_connection = privacy_controller
@@ -767,9 +805,14 @@ async fn frame_server(
                         }
                         Err(_) => break,
                     },
+                    result = resolution_status_rx.recv() => match result {
+                        Ok(status) => status,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
                 };
                 let mut header = [0u8; 13];
-                header[0] = 0x01;
+                header[0] = if msg.0 == 0 { 0x03 } else { 0x01 };
                 header[1..9].copy_from_slice(&msg.0.to_be_bytes());
                 header[9..13].copy_from_slice(&(msg.1.len() as u32).to_be_bytes());
                 if writer.write_all(&header).await.is_err()
@@ -1061,10 +1104,12 @@ fn capture_loop(
     resolution_rx: std::sync::mpsc::Receiver<ModeRequest>,
     input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
     target_fps: u32,
+    default_fps_cap: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     default_quality_level: u8,
     target_display: Option<flux_capture::traits::DisplayInfo>,
     mut virtual_display: Option<VirtualDisplayHandle>,
+    resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -1191,7 +1236,8 @@ fn capture_loop(
     let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
     let mut quality_level = default_quality_level.clamp(1, 10);
     let configured_fps = target_fps;
-    let mut fps_cap = configured_fps.min(48);
+    let default_fps_cap = effective_default_fps_cap(configured_fps, default_fps_cap);
+    let mut fps_cap = default_fps_cap;
     let mut last_encoded_at: Option<std::time::Instant> = None;
     let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
     let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
@@ -1241,6 +1287,17 @@ fn capture_loop(
                             request.width,
                             request.height
                         );
+                        publish_resolution_status(
+                            &resolution_status_tx,
+                            ResolutionStatus {
+                                state: "succeeded",
+                                width: request.width,
+                                height: request.height,
+                                previous_width: None,
+                                previous_height: None,
+                                error: None,
+                            },
+                        );
                     }
                     Ok(request) => {
                         let old_mode = ModeRequest {
@@ -1276,6 +1333,17 @@ fn capture_loop(
                                     request.width,
                                     request.height
                                 );
+                                publish_resolution_status(
+                                    &resolution_status_tx,
+                                    ResolutionStatus {
+                                        state: "succeeded",
+                                        width: request.width,
+                                        height: request.height,
+                                        previous_width: Some(old_mode.width),
+                                        previous_height: Some(old_mode.height),
+                                        error: None,
+                                    },
+                                );
                             }
                             Err(error) => {
                                 tracing::error!(
@@ -1300,13 +1368,67 @@ fn capture_loop(
                                             old_mode.width,
                                             old_mode.height
                                         );
+                                        publish_resolution_status(
+                                            &resolution_status_tx,
+                                            ResolutionStatus {
+                                                state: "failed",
+                                                width: request.width,
+                                                height: request.height,
+                                                previous_width: Some(old_mode.width),
+                                                previous_height: Some(old_mode.height),
+                                                error: Some(format!(
+                                                    "requested mode did not apply; still streaming at {}x{}",
+                                                    old_mode.width, old_mode.height
+                                                )),
+                                            },
+                                        );
                                     }
                                     Err(rollback_error) => {
                                         tracing::error!(
                                             "Resolution transition rollback failed: {}",
                                             rollback_error
                                         );
-                                        return;
+                                        publish_resolution_status(
+                                            &resolution_status_tx,
+                                            ResolutionStatus {
+                                                state: "failed",
+                                                width: request.width,
+                                                height: request.height,
+                                                previous_width: Some(old_mode.width),
+                                                previous_height: Some(old_mode.height),
+                                                error: Some(format!(
+                                                    "transition and rollback failed: {rollback_error}"
+                                                )),
+                                            },
+                                        );
+                                        loop {
+                                            std::thread::sleep(std::time::Duration::from_secs(1));
+                                            match replug_capture(
+                                                capture.as_ref(),
+                                                virtual_display.as_mut().expect("checked above"),
+                                                old_mode,
+                                                cursor_sink.clone(),
+                                                target_fps,
+                                            ) {
+                                                Ok((target, restored_session)) => {
+                                                    primary = target;
+                                                    session = restored_session;
+                                                    let _ = input_sink.set_target_rect(primary.desktop_rect);
+                                                    tracing::warn!(
+                                                        "Resolution transition recovery succeeded; continuing at {}x{}",
+                                                        old_mode.width,
+                                                        old_mode.height
+                                                    );
+                                                    break;
+                                                }
+                                                Err(recovery_error) => {
+                                                    tracing::error!(
+                                                        "Resolution transition recovery retry failed: {}; retrying",
+                                                        recovery_error
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1347,7 +1469,7 @@ fn capture_loop(
             }
             let valid_fps = requested_fps <= 144;
             if requested_fps == 0 {
-                fps_cap = configured_fps.min(48);
+                fps_cap = default_fps_cap;
             } else if valid_fps {
                 fps_cap = u32::from(requested_fps).min(configured_fps);
             } else {
@@ -1709,5 +1831,11 @@ mod mode_request_tests {
         assert_eq!(validate_mode_request(request).unwrap().width, 2560);
         assert!(!mode_change_needed(request, request));
         assert!(mode_change_needed(request, ModeRequest { width: 1920, height: 1080 }));
+    }
+
+    #[test]
+    fn default_fps_cap_is_used_for_startup_and_auto() {
+        assert_eq!(effective_default_fps_cap(60, 48), 48);
+        assert_eq!(effective_default_fps_cap(30, 48), 30);
     }
 }

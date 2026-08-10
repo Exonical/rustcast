@@ -172,6 +172,7 @@ type Machine = {
   width?: number;
   height?: number;
   target_fps?: number;
+  default_fps?: number;
 };
 
 export default function App() {
@@ -184,7 +185,13 @@ export default function App() {
     return (
       <StreamViewer
         machine={selectedMachine}
-        resolution={selectedResolution ?? undefined}
+        resolution={
+          selectedResolution &&
+          (selectedResolution.width !== selectedMachine.width ||
+            selectedResolution.height !== selectedMachine.height)
+            ? selectedResolution
+            : undefined
+        }
         onBack={() => {
           setSelectedMachine(null);
           setSelectedResolution(null);
@@ -212,7 +219,7 @@ function ResolutionPicker({ machine, onBack, onSelect }: {
 }) {
   const defaultResolution = RESOLUTION_OPTIONS.find(
     (option) => option.width === machine.width && option.height === machine.height,
-  ) ?? RESOLUTION_OPTIONS[2];
+  ) ?? RESOLUTION_OPTIONS.find((option) => option.width === 1920 && option.height === 1080)!;
   const [selected, setSelected] = useState(defaultResolution);
   return (
     <main className="flex min-h-screen items-center justify-center bg-zinc-950 px-4">
@@ -413,7 +420,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     committedFps.current = fpsCap;
     clientRef.current?.sendQuality(qualityLevel ?? 0, fpsCap ?? 0);
   }, [fpsCap, qualityLevel]);
-  const displayFps = fpsCap ?? machine.target_fps ?? 48;
+  const displayFps = fpsCap ?? machine.default_fps ?? 48;
 
   const requestPointerLock = useCallback(() => {
     containerRef.current?.requestPointerLock();
@@ -795,7 +802,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
                 onBlur={commitControls}
                 className="w-20 accent-[var(--color-accent)]"
               />
-              <span className="w-12 text-right">{fpsCap === null ? `Auto (${machine.target_fps || 48})` : fpsCap}</span>
+              <span className="w-12 text-right">{fpsCap === null ? `Auto (${machine.default_fps || 48})` : fpsCap}</span>
             </div>
             <span className="hidden text-[10px] text-zinc-600 lg:inline">machine-wide</span>
 

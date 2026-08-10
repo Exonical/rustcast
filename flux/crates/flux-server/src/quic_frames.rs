@@ -7,7 +7,8 @@
 //!
 //! Stream formats:
 //!   frame (server→client uni): [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload]
-//!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata
+//!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata,
+//!     type 0x03 = resolution transition status JSON
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
 //!                                | [0x03][4-byte BE target bitrate kbps]
 //!                                | [0x04][4-byte BE viewer count]
@@ -58,6 +59,7 @@ pub async fn serve(
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
+    resolution_status_tx: tokio::sync::broadcast::Sender<crate::ResolutionStatusMessage>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -81,6 +83,7 @@ pub async fn serve(
             bitrate_tx.clone(),
             quality_tx.clone(),
             resolution_tx.clone(),
+            resolution_status_tx.subscribe(),
             input_tx.clone(),
             privacy_controller.clone(),
         ));
@@ -95,6 +98,7 @@ async fn handle_connection(
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
+    mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::ResolutionStatusMessage>,
     input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -163,6 +167,16 @@ async fn handle_connection(
                     continue;
                 };
                 if !send_message(&connection, 0x02, cursor.0, payload).await {
+                    break;
+                }
+            }
+            result = resolution_status_rx.recv() => {
+                let status = match result {
+                    Ok(status) => status,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                if !send_message(&connection, 0x03, status.0, status.1.clone()).await {
                     break;
                 }
             }
