@@ -6,7 +6,8 @@
 [package]
 name = "flux-idd"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 description = "Flux virtual display: a Rust Indirect Display Driver (IddCx/UMDF) for headless GPU-backed monitors"
 publish = false
