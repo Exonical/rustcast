@@ -67,6 +67,15 @@ pub struct Resolution {
     pub height: u32,
 }
 
+/// A display rectangle in virtual-desktop coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DesktopRect {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 impl Resolution {
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }

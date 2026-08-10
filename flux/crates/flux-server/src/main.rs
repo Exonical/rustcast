@@ -893,12 +893,9 @@ fn capture_loop(
         status.display_name = Some(primary.name.clone());
     }
     
-    // Initialize Input Sink (needs primary display resolution for absolute mouse positioning)
-    let input_sink = match flux_input::InputSink::new(
-        primary.native_resolution.width,
-        primary.native_resolution.height,
-    ) {
-        Ok(sink) => sink,
+    // Initialize input using the selected output's virtual-desktop rectangle.
+    let input_sink = match flux_input::InputSink::new(primary.desktop_rect) {
+        Ok(sink) => Arc::new(sink),
         Err(e) => {
             tracing::error!("Failed to initialize input sink: {}", e);
             return;
@@ -942,10 +939,11 @@ fn capture_loop(
 
     // Spawn a dedicated thread for input handling to ensure low latency
     // and avoid blocking the capture loop.
+    let input_sink_thread = input_sink.clone();
     std::thread::spawn(move || {
         tracing::info!("Input dispatch thread started");
         while let Ok(event) = input_rx.recv() {
-            if let Err(e) = input_sink.handle_event(&event) {
+            if let Err(e) = input_sink_thread.handle_event(&event) {
                 tracing::warn!("Input injection error: {}", e);
             }
         }
@@ -1055,6 +1053,9 @@ fn capture_loop(
                     ) {
                         Ok(new_session) => {
                             session = new_session;
+                            if let Err(error) = input_sink.set_target_rect(refreshed.desktop_rect) {
+                                tracing::warn!("Failed to update input target rectangle: {}", error);
+                            }
                             primary = refreshed;
                             tracing::info!("Capture session recreated after capture loss");
                             break;
