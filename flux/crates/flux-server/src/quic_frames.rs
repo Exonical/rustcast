@@ -60,7 +60,7 @@ pub async fn serve(
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     resolution_status_tx: tokio::sync::broadcast::Sender<crate::ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
@@ -99,7 +99,7 @@ async fn handle_connection(
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -218,7 +218,7 @@ async fn read_commands(
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
-    input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_connection: Option<PrivacyConnection>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -249,7 +249,7 @@ async fn read_commands(
                 }
                 match serde_json::from_slice::<flux_input::InputEvent>(&payload) {
                     Ok(event) => {
-                        let _ = input_tx.send(event);
+                        let _ = input_tx.send((std::time::Instant::now(), event));
                     }
                     Err(e) => tracing::warn!("QUIC input event parse error: {}", e),
                 }

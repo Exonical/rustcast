@@ -15,6 +15,11 @@ export interface WebRTCStats {
   packetsLost: number;
   jitter: number;
   bitrate: number;
+  mediaRttMs: number | null;
+  controlRttMs: number | null;
+  jitterBufferMs: number | null;
+  decodeMs: number | null;
+  framesDropped: number;
 }
 
 export interface CursorBitmap {
@@ -75,6 +80,12 @@ export class WebRTCClient {
   private lastBytesReceived = 0;
   private lastStatsTimestamp = 0;
   private statsInterval: ReturnType<typeof setInterval> | null = null;
+  private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private controlRttMs: number | null = null;
+  private lastJitterBufferDelay = 0;
+  private lastJitterBufferEmitted = 0;
+  private lastTotalDecodeTime = 0;
+  private lastFramesDecoded = 0;
 
   onStateChange: ((state: ConnectionState) => void) | null = null;
   onStream: ((stream: MediaStream) => void) | null = null;
@@ -111,6 +122,14 @@ export class WebRTCClient {
     this.pc.addTransceiver("video", { direction: "recvonly" });
 
     this.pc.ontrack = (e) => {
+      // Remote desktop wants the smallest viable playout buffer: tolerate an
+      // occasional dropped frame over a smoothness buffer. Chrome otherwise
+      // sizes the jitter buffer for smoothness.
+      const receiver = e.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
+      try {
+        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 40;
+        receiver.playoutDelayHint = 0.04;
+      } catch { /* hint only */ }
       if (e.streams?.[0]) this.onStream?.(e.streams[0]);
     };
 
@@ -120,6 +139,7 @@ export class WebRTCClient {
       if (state === "connected" || state === "completed") {
         this.setState("connected");
         this.startStatsPolling();
+        this.startControlPing();
       } else if (state === "failed") {
         this.setState("failed");
       } else if (state === "disconnected") {
@@ -174,6 +194,9 @@ export class WebRTCClient {
           this.onCursor?.(msg.data as CursorMetadata);
         } else if (msg.type === "resolution-status") {
           this.onResolutionStatus?.(msg.data as ResolutionStatus);
+        } else if (msg.type === "latency-pong") {
+          const sentAt = (msg.data as { t?: number })?.t;
+          if (typeof sentAt === "number") this.controlRttMs = performance.now() - sentAt;
         }
       };
 
@@ -203,6 +226,8 @@ export class WebRTCClient {
 
   private cleanup(): void {
     if (this.statsInterval) { clearInterval(this.statsInterval); this.statsInterval = null; }
+    if (this.pingInterval) { clearInterval(this.pingInterval); this.pingInterval = null; }
+    this.controlRttMs = null;
     if (this.pc) { this.pc.close(); this.pc = null; }
     if (this.ws) { this.ws.close(); this.ws = null; }
   }
@@ -211,12 +236,29 @@ export class WebRTCClient {
     this.onStateChange?.(state);
   }
 
+  // Measures control-path RTT on the same WebSocket that carries input, so it
+  // reflects what a keystroke actually experiences rather than the media path.
+  private startControlPing(): void {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+    this.pingInterval = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: "latency-ping", data: { t: performance.now() } }));
+      }
+    }, 1000);
+  }
+
   private startStatsPolling(): void {
     if (this.statsInterval) clearInterval(this.statsInterval);
     this.statsInterval = setInterval(async () => {
       if (!this.pc) return;
       try {
         const stats = await this.pc.getStats();
+        let mediaRttMs: number | null = null;
+        stats.forEach((report) => {
+          if (report.type === "candidate-pair" && report.state === "succeeded" && report.currentRoundTripTime != null) {
+            mediaRttMs = report.currentRoundTripTime * 1000;
+          }
+        });
         stats.forEach((report) => {
           if (report.type === "inbound-rtp" && report.kind === "video") {
             const now = report.timestamp;
@@ -225,6 +267,21 @@ export class WebRTCClient {
             const bitrate = timeDelta > 0 ? Math.round((bytesDelta * 8) / (timeDelta / 1000) / 1000) : 0;
             this.lastBytesReceived = report.bytesReceived || 0;
             this.lastStatsTimestamp = now;
+
+            // jitterBufferDelay/decode time are cumulative totals; the useful
+            // figure is the per-frame average over this sampling window.
+            const bufferDelta = (report.jitterBufferDelay || 0) - this.lastJitterBufferDelay;
+            const emittedDelta = (report.jitterBufferEmittedCount || 0) - this.lastJitterBufferEmitted;
+            const jitterBufferMs = emittedDelta > 0 ? (bufferDelta / emittedDelta) * 1000 : null;
+            this.lastJitterBufferDelay = report.jitterBufferDelay || 0;
+            this.lastJitterBufferEmitted = report.jitterBufferEmittedCount || 0;
+
+            const decodeDelta = (report.totalDecodeTime || 0) - this.lastTotalDecodeTime;
+            const decodedDelta = (report.framesDecoded || 0) - this.lastFramesDecoded;
+            const decodeMs = decodedDelta > 0 ? (decodeDelta / decodedDelta) * 1000 : null;
+            this.lastTotalDecodeTime = report.totalDecodeTime || 0;
+            this.lastFramesDecoded = report.framesDecoded || 0;
+
             this.onStats?.({
               fps: report.framesPerSecond || 0,
               width: report.frameWidth || 0,
@@ -233,6 +290,11 @@ export class WebRTCClient {
               packetsLost: report.packetsLost || 0,
               jitter: report.jitter || 0,
               bitrate,
+              mediaRttMs,
+              controlRttMs: this.controlRttMs,
+              jitterBufferMs,
+              decodeMs,
+              framesDropped: report.framesDropped || 0,
             });
           }
         });
