@@ -39,6 +39,12 @@ pub const H264_TARGET_BITRATE: &str = "TargetBitrate";
 pub const H264_PEAK_BITRATE: &str = "PeakBitrate";
 /// VBV buffer size in bits (amf_int64).
 pub const H264_VBV_BUFFER_SIZE: &str = "VBVBufferSize";
+/// Maximum access-unit size in bytes (amf_int64). Runtime support varies.
+pub const H264_MAX_AU_SIZE: &str = "MaxAUSize";
+/// Minimum quantizer (amf_int64). Runtime support varies.
+pub const H264_MIN_QP: &str = "MinQP";
+/// Maximum quantizer (amf_int64). Runtime support varies.
+pub const H264_MAX_QP: &str = "MaxQP";
 /// Enable filler data (amf_bool).
 pub const H264_FILLER_DATA: &str = "FillerDataEnable";
 /// Force IDR on next frame (amf_bool).

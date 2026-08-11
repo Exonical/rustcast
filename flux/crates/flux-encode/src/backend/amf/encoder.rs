@@ -9,8 +9,10 @@
 //!   6. Per frame: AllocSurface/CreateSurfaceFromDX11Native → SubmitInput → QueryOutput
 //!   7. Drain + Terminate on shutdown
 
+use std::fmt;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use flux_core::error::{FluxError, Result};
 use flux_core::frame::{CapturedFrame, EncodedPacket, GpuFrameHandle};
@@ -240,7 +242,44 @@ struct AmfComponent {
 
 unsafe impl Send for AmfComponent {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyStatus {
+    Supported,
+    Unsupported,
+    Accepted,
+    Rejected,
+    NotApplicable,
+}
+
+impl fmt::Display for PropertyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::NotApplicable => "n/a",
+        };
+        f.write_str(label)
+    }
+}
+
 impl AmfComponent {
+    fn has_property(&self, name: &str) -> bool {
+        let wide_name = to_wide(name);
+        unsafe { ((*(*self.ptr).vtbl).HasProperty)(self.ptr, wide_name.as_ptr()) }
+    }
+
+    fn property_support_status(&self, name: &str) -> PropertyStatus {
+        if self.has_property(name) {
+            tracing::info!("AMF: {} supported by runtime", name);
+            PropertyStatus::Supported
+        } else {
+            tracing::info!("AMF: {} unsupported by runtime", name);
+            PropertyStatus::Unsupported
+        }
+    }
+
     fn set_property_int64(&self, name: &str, value: i64) -> Result<()> {
         let wide_name = to_wide(name);
         let variant = AMFVariantStruct::from_int64(value);
@@ -250,12 +289,46 @@ impl AmfComponent {
         }
     }
 
+    fn set_optional_int64(&self, name: &str, value: i64) -> PropertyStatus {
+        if !self.has_property(name) {
+            tracing::info!("AMF: SetProperty({}) unsupported", name);
+            return PropertyStatus::Unsupported;
+        }
+        match self.set_property_int64(name, value) {
+            Ok(()) => {
+                tracing::info!("AMF: SetProperty({}) = {} accepted", name, value);
+                PropertyStatus::Accepted
+            }
+            Err(e) => {
+                tracing::warn!("AMF: SetProperty({}) = {} rejected: {}", name, value, e);
+                PropertyStatus::Rejected
+            }
+        }
+    }
+
     fn set_property_bool(&self, name: &str, value: bool) -> Result<()> {
         let wide_name = to_wide(name);
         let variant = AMFVariantStruct::from_bool(value);
         unsafe {
             let result = ((*(*self.ptr).vtbl).SetProperty)(self.ptr, wide_name.as_ptr(), variant);
             check_amf(result, &format!("SetProperty({})", name))
+        }
+    }
+
+    fn set_optional_bool(&self, name: &str, value: bool) -> PropertyStatus {
+        if !self.has_property(name) {
+            tracing::info!("AMF: SetProperty({}) unsupported", name);
+            return PropertyStatus::Unsupported;
+        }
+        match self.set_property_bool(name, value) {
+            Ok(()) => {
+                tracing::info!("AMF: SetProperty({}) = {} accepted", name, value);
+                PropertyStatus::Accepted
+            }
+            Err(e) => {
+                tracing::warn!("AMF: SetProperty({}) = {} rejected: {}", name, value, e);
+                PropertyStatus::Rejected
+            }
         }
     }
 
@@ -323,6 +396,12 @@ fn amf_data_set_pts(data: *mut AMFDataObj, pts: i64) {
     }
 }
 
+fn amf_data_set_duration(data: *mut AMFDataObj, duration: i64) {
+    unsafe {
+        ((*(*data).vtbl).SetDuration)(data, duration);
+    }
+}
+
 fn amf_data_set_property_int64(data: *mut AMFDataObj, name: &str, value: i64) -> Result<()> {
     let wide_name = to_wide(name);
     let variant = AMFVariantStruct::from_int64(value);
@@ -379,6 +458,86 @@ fn amf_data_release(data: *mut AMFDataObj) {
         unsafe {
             ((*(*data).vtbl).Release)(data);
         }
+    }
+}
+
+const AMF_TIMEBASE_PER_SECOND: u64 = 10_000_000;
+const H264_MAX_AU_TENTHS_OF_A_SECOND: u64 = 10;
+
+/// Return the configured frame duration in AMF's 100 ns timebase.
+fn frame_duration_100ns(framerate: u32) -> i64 {
+    (AMF_TIMEBASE_PER_SECOND / u64::from(framerate.max(1))).max(1) as i64
+}
+
+/// Keep the VBV formula identical between session setup and bitrate updates.
+fn vbv_buffer_size(bitrate_bps: i64, framerate: u32, frame_count: u64) -> i64 {
+    let frames = frame_count.max(1);
+    (bitrate_bps.max(0) as u64)
+        .saturating_mul(frames)
+        .checked_div(u64::from(framerate.max(1)))
+        .unwrap_or(0)
+        .max(1)
+        .min(i64::MAX as u64) as i64
+}
+
+/// Cap one access unit at roughly one tenth of a second of target bitrate.
+///
+/// This is deliberately derived from bitrate: at 10 Mbps it is 125,000 bytes,
+/// small enough to keep a forced IDR from monopolizing the stream while still
+/// allowing a complex desktop keyframe to encode. AMF support is queried at
+/// runtime because MaxAUSize is not present on every driver.
+fn max_au_size_bytes(bitrate_bps: i64) -> i64 {
+    (bitrate_bps.max(0) as u64)
+        .checked_div(8 * H264_MAX_AU_TENTHS_OF_A_SECOND)
+        .unwrap_or(0)
+        .max(1)
+        .min(i64::MAX as u64) as i64
+}
+
+/// Convert capture timing into AMF's 100 ns PTS units.
+///
+/// Capture timestamps are monotonic and may include idle gaps, so use their
+/// elapsed time when available. A frame-count-derived duration is retained as
+/// the fallback for a missing or backwards timestamp.
+fn pts_from_frame_timing(
+    frame_index: u64,
+    timestamp: Instant,
+    first_timestamp: Option<Instant>,
+    frame_duration: i64,
+) -> (i64, Instant) {
+    let origin = first_timestamp.unwrap_or(timestamp);
+    let fallback = frame_index
+        .saturating_sub(1)
+        .saturating_mul(frame_duration.max(1) as u64)
+        .min(i64::MAX as u64) as i64;
+    let pts = timestamp
+        .checked_duration_since(origin)
+        .map(|elapsed| {
+            (elapsed.as_nanos() / 100) // AMF uses 100 ns units.
+                .min(i64::MAX as u128) as i64
+        })
+        .unwrap_or(fallback);
+    (pts, origin)
+}
+
+fn clamp_monotonic_pts(pts: i64, previous_pts: i64) -> i64 {
+    pts.max(previous_pts)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IdrTrigger {
+    ForcedRequest,
+    PeriodicSafetyNet,
+    EncoderRebuild,
+}
+
+impl fmt::Display for IdrTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ForcedRequest => "forced-request",
+            Self::PeriodicSafetyNet => "periodic-safety-net",
+            Self::EncoderRebuild => "encoder-rebuild",
+        })
     }
 }
 
@@ -483,7 +642,11 @@ impl VideoEncoder for AmfEncoder {
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
-        Ok(Box::new(AmfSession::new(self.factory, config)?))
+        Ok(Box::new(AmfSession::new(
+            self.factory,
+            self.runtime_version,
+            config,
+        )?))
     }
 }
 
@@ -548,7 +711,11 @@ pub struct AmfSession {
     d3d11_device: ID3D11Device,
     config: EncodeConfig,
     frame_index: u64,
-    idr_requested: bool,
+    pending_idr_trigger: Option<IdrTrigger>,
+    active_idr_trigger: Option<IdrTrigger>,
+    first_capture_timestamp: Option<Instant>,
+    frame_duration_100ns: i64,
+    last_pts_amf: i64,
     surface_format: AMF_SURFACE_FORMAT,
     /// Force an IDR every this many frames (workaround: AMF ignores H264_IDR_PERIOD)
     idr_interval: u64,
@@ -557,7 +724,11 @@ pub struct AmfSession {
 }
 
 impl AmfSession {
-    fn new(factory: *mut AMFFactoryObj, config: EncodeConfig) -> Result<Self> {
+    fn new(
+        factory: *mut AMFFactoryObj,
+        runtime_version: u64,
+        config: EncodeConfig,
+    ) -> Result<Self> {
         tracing::info!(
             "Creating AMF session: {} {}@{}fps {}kbps",
             config.codec,
@@ -614,6 +785,14 @@ impl AmfSession {
         let w = config.resolution.width as i32;
         let h = config.resolution.height as i32;
         let bitrate_bps = (config.bitrate_kbps as i64) * 1000;
+        let frame_duration = frame_duration_100ns(config.framerate);
+        let hrd_status;
+        let filler_status;
+        let max_au_status;
+        let min_qp_status;
+        let max_qp_status;
+        let vbaq_status;
+        let preanalysis_status;
 
         match config.codec {
             VideoCodec::H264 => {
@@ -641,25 +820,27 @@ impl AmfSession {
 
                 // A three-frame VBV lets complex frames borrow bits from
                 // neighbouring frames while adding only ~50 ms at 60 fps.
-                let vbv_size = bitrate_bps * 3 / config.framerate as i64;
+                let vbv_size = vbv_buffer_size(bitrate_bps, config.framerate, 3);
                 encoder.set_property_int64(H264_VBV_BUFFER_SIZE, vbv_size)?;
 
                 // Streaming optimizations
-                encoder.set_property_bool(H264_FILLER_DATA, false)?;
+                filler_status = encoder.set_optional_bool(H264_FILLER_DATA, false);
                 // IDR_PERIOD must be 0 to allow per-frame ForcePictureType
-                encoder.set_property_int64(H264_IDR_PERIOD, 0)?; 
-                encoder.set_property_int64(H264_B_PIC_PATTERN, 0)?; 
+                encoder.set_property_int64(H264_IDR_PERIOD, 0)?;
+                encoder.set_property_int64(H264_B_PIC_PATTERN, 0)?;
                 encoder.set_property_int64(H264_HEADER_INSERTION_MODE, HEADER_INSERTION_IDR)?;
-                encoder.set_property_bool(H264_ENFORCE_HRD, true)?;
+                hrd_status = encoder.set_optional_bool(H264_ENFORCE_HRD, true);
+                // Bound the expensive case directly. These properties are
+                // absent from some AMF runtimes, so rejection is non-fatal.
+                max_au_status =
+                    encoder.set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bytes(bitrate_bps));
+                min_qp_status = encoder.property_support_status(H264_MIN_QP);
+                max_qp_status = encoder.property_support_status(H264_MAX_QP);
                 // Adaptive quantization: spend bits where the eye notices
                 // (text, edges) for better perceived quality per bit. Not
                 // supported on all drivers, so failures are non-fatal.
-                if let Err(e) = encoder.set_property_bool(H264_VBAQ, true) {
-                    tracing::debug!("AMF: EnableVBAQ not supported: {}", e);
-                }
-                if let Err(e) = encoder.set_property_bool(H264_PREENCODE, true) {
-                    tracing::debug!("AMF: RateControlPreanalysisEnable not supported: {}", e);
-                }
+                vbaq_status = encoder.set_optional_bool(H264_VBAQ, true);
+                preanalysis_status = encoder.set_optional_bool(H264_PREENCODE, true);
             }
             VideoCodec::H265 => {
                 encoder.set_property_int64(HEVC_USAGE, HEVC_USAGE_ULTRA_LOW_LATENCY)?;
@@ -687,18 +868,20 @@ impl AmfSession {
                 encoder.set_property_int64(HEVC_TARGET_BITRATE, bitrate_bps)?;
                 encoder.set_property_int64(HEVC_PEAK_BITRATE, bitrate_bps * 3 / 2)?;
 
-                let vbv_size = bitrate_bps / config.framerate as i64;
+                let vbv_size = vbv_buffer_size(bitrate_bps, config.framerate, 1);
                 encoder.set_property_int64(HEVC_VBV_BUFFER_SIZE, vbv_size)?;
 
-                encoder.set_property_bool(HEVC_FILLER_DATA, false)?;
+                filler_status = encoder.set_optional_bool(HEVC_FILLER_DATA, false);
+                max_au_status = PropertyStatus::NotApplicable;
+                min_qp_status = PropertyStatus::NotApplicable;
+                max_qp_status = PropertyStatus::NotApplicable;
                 
                 // Picture control
                 encoder.set_property_int64(HEVC_GOP_SIZE, config.framerate as i64)?;
                 encoder.set_property_int64(HEVC_MAX_NUM_REFRAMES, config.max_ref_frames as i64)?;
-                encoder.set_property_bool(HEVC_ENFORCE_HRD, true)?;
-                if let Err(e) = encoder.set_property_bool(HEVC_VBAQ, true) {
-                    tracing::debug!("AMF: HevcEnableVBAQ not supported: {}", e);
-                }
+                hrd_status = encoder.set_optional_bool(HEVC_ENFORCE_HRD, true);
+                vbaq_status = encoder.set_optional_bool(HEVC_VBAQ, true);
+                preanalysis_status = PropertyStatus::NotApplicable;
             }
             VideoCodec::Av1 => {
                 encoder.set_property_int64(AV1_USAGE, AV1_USAGE_ULTRA_LOW_LATENCY)?;
@@ -717,20 +900,51 @@ impl AmfSession {
                 encoder.set_property_int64(AV1_TARGET_BITRATE, bitrate_bps)?;
                 encoder.set_property_int64(AV1_PEAK_BITRATE, bitrate_bps * 3 / 2)?;
                 
-                encoder.set_property_int64(AV1_VBV_BUFFER_SIZE, bitrate_bps / config.framerate as i64)?;
-                encoder.set_property_bool(AV1_FILLER_DATA, false)?;
-                encoder.set_property_bool(AV1_ENFORCE_HRD, true)?;
+                encoder.set_property_int64(
+                    AV1_VBV_BUFFER_SIZE,
+                    vbv_buffer_size(bitrate_bps, config.framerate, 1),
+                )?;
+                filler_status = encoder.set_optional_bool(AV1_FILLER_DATA, false);
+                hrd_status = encoder.set_optional_bool(AV1_ENFORCE_HRD, true);
+                max_au_status = PropertyStatus::NotApplicable;
+                min_qp_status = PropertyStatus::NotApplicable;
+                max_qp_status = PropertyStatus::NotApplicable;
+                vbaq_status = PropertyStatus::NotApplicable;
+                preanalysis_status = PropertyStatus::NotApplicable;
             }
         }
 
         // 5. Initialize the encoder
         encoder.init(surface_format, w, h)?;
-        tracing::info!("AMF encoder initialized: {} {:?}", config.codec, surface_format);
+        tracing::info!(
+            "AMF effective config: backend=AMF runtime={}.{}.{}.{} codec={} resolution={} framerate={} target_bps={} peak_bps={} vbv_bits={} hrd={} filler={} MaxAUSize={} MinQP={} MaxQP={} VBAQ={} preanalysis={}",
+            amf_get_major(runtime_version),
+            amf_get_minor(runtime_version),
+            amf_get_subminor(runtime_version),
+            amf_get_build(runtime_version),
+            config.codec,
+            config.resolution,
+            config.framerate.max(1),
+            bitrate_bps,
+            bitrate_bps * 3 / 2,
+            vbv_buffer_size(
+                bitrate_bps,
+                config.framerate,
+                if config.codec == VideoCodec::H264 { 3 } else { 1 },
+            ),
+            hrd_status,
+            filler_status,
+            max_au_status,
+            min_qp_status,
+            max_qp_status,
+            vbaq_status,
+            preanalysis_status,
+        );
 
         // AMF's IDR_PERIOD property is unreliable on many driver versions.
         // Safety-net IDR every 10 minutes. Real IDR requests come from
         // new client connections via request_idr().
-        let idr_interval = config.framerate as u64 * 600;
+        let idr_interval = u64::from(config.framerate.max(1)).saturating_mul(600);
 
         Ok(Self {
             context,
@@ -738,7 +952,11 @@ impl AmfSession {
             d3d11_device,
             config,
             frame_index: 0,
-            idr_requested: false,
+            pending_idr_trigger: None,
+            active_idr_trigger: None,
+            first_capture_timestamp: None,
+            frame_duration_100ns: frame_duration,
+            last_pts_amf: 0,
             surface_format,
             idr_interval,
             cached_shared_texture: None,
@@ -774,7 +992,7 @@ impl AmfSession {
     }
 
     /// Extract bitstream from an AMFBuffer output.
-    fn extract_output(&self, data: *mut AMFDataObj) -> EncodedPacket {
+    fn extract_output(&mut self, data: *mut AMFDataObj) -> EncodedPacket {
         let size = amf_buffer_get_size(data);
         let native = amf_buffer_get_native(data);
 
@@ -795,6 +1013,18 @@ impl AmfSession {
             Ok(t) => t == OUTPUT_DATA_TYPE_IDR,
             Err(_) => contains_idr_nalu(&bitstream, self.config.codec),
         };
+        if is_keyframe {
+            let trigger = self
+                .active_idr_trigger
+                .take()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            tracing::info!(
+                "AMF IDR produced: {} bytes trigger={}",
+                bitstream.len(),
+                trigger
+            );
+        }
 
         EncodedPacket {
             frame_index: self.frame_index,
@@ -805,7 +1035,7 @@ impl AmfSession {
     }
 
     /// Poll encoder output, collecting all available packets.
-    fn drain_output(&self) -> Vec<EncodedPacket> {
+    fn drain_output(&mut self) -> Vec<EncodedPacket> {
         let mut packets = Vec::new();
         loop {
             let (result, data) = self.encoder.query_output();
@@ -826,11 +1056,13 @@ impl EncodeSession for AmfSession {
 
         // Periodic IDR: force keyframe every idr_interval frames
         if self.frame_index % self.idr_interval == 1 {
-            self.idr_requested = true;
+            if self.pending_idr_trigger.is_none() {
+                self.pending_idr_trigger = Some(IdrTrigger::PeriodicSafetyNet);
+            }
         }
 
-        let is_idr = self.idr_requested;
-        self.idr_requested = false;
+        self.active_idr_trigger = self.pending_idr_trigger.take();
+        let is_idr = self.active_idr_trigger.is_some();
 
         // Acquire an input surface
         let surface = if let Some(GpuFrameHandle::DxgiSharedTexture(ref dxgi)) = frame.gpu_handle {
@@ -861,9 +1093,18 @@ impl EncodeSession for AmfSession {
             });
         };
 
-        // Set PTS
-        let pts_amf = self.frame_index as i64 * 10_000; // 100ns units
+        // Set capture-timed PTS and duration. AMF uses 100 ns units.
+        let (raw_pts_amf, first_timestamp) = pts_from_frame_timing(
+            self.frame_index,
+            frame.timestamp,
+            self.first_capture_timestamp,
+            self.frame_duration_100ns,
+        );
+        self.first_capture_timestamp = Some(first_timestamp);
+        let pts_amf = clamp_monotonic_pts(raw_pts_amf, self.last_pts_amf);
+        self.last_pts_amf = pts_amf;
         amf_data_set_pts(surface, pts_amf);
+        amf_data_set_duration(surface, self.frame_duration_100ns);
 
         // Force IDR if requested (IDR_PERIOD=0 is set in init for LOW_LATENCY mode)
         if is_idr {
@@ -913,7 +1154,12 @@ impl EncodeSession for AmfSession {
 
     fn request_idr(&mut self) {
         tracing::debug!("AMF: IDR frame requested for next encode");
-        self.idr_requested = true;
+        self.pending_idr_trigger = Some(IdrTrigger::ForcedRequest);
+    }
+
+    fn request_idr_for_rebuild(&mut self) {
+        tracing::debug!("AMF: IDR frame requested for encoder rebuild");
+        self.pending_idr_trigger = Some(IdrTrigger::EncoderRebuild);
     }
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
@@ -949,14 +1195,28 @@ impl EncodeSession for AmfSession {
             VideoCodec::H264 => {
                 self.encoder.set_property_int64(H264_TARGET_BITRATE, bitrate_bps)?;
                 self.encoder.set_property_int64(H264_PEAK_BITRATE, peak_bps)?;
+                self.encoder.set_property_int64(
+                    H264_VBV_BUFFER_SIZE,
+                    vbv_buffer_size(bitrate_bps, self.config.framerate, 3),
+                )?;
+                self.encoder
+                    .set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bytes(bitrate_bps));
             }
             VideoCodec::H265 => {
                 self.encoder.set_property_int64(HEVC_TARGET_BITRATE, bitrate_bps)?;
                 self.encoder.set_property_int64(HEVC_PEAK_BITRATE, peak_bps)?;
+                self.encoder.set_property_int64(
+                    HEVC_VBV_BUFFER_SIZE,
+                    vbv_buffer_size(bitrate_bps, self.config.framerate, 1),
+                )?;
             }
             VideoCodec::Av1 => {
                 self.encoder.set_property_int64(AV1_TARGET_BITRATE, bitrate_bps)?;
                 self.encoder.set_property_int64(AV1_PEAK_BITRATE, peak_bps)?;
+                self.encoder.set_property_int64(
+                    AV1_VBV_BUFFER_SIZE,
+                    vbv_buffer_size(bitrate_bps, self.config.framerate, 1),
+                )?;
             }
         }
 
@@ -981,6 +1241,7 @@ fn surface_format_name(f: AMF_SURFACE_FORMAT) -> &'static str {
 mod tests {
     use super::*;
     use crate::traits::VideoEncoder;
+    use std::time::Duration;
 
     #[test]
     fn test_amf_availability() {
@@ -1033,5 +1294,47 @@ mod tests {
         assert_eq!(surface_format_name(AMF_SURFACE_BGRA), "BGRA");
         assert_eq!(surface_format_name(AMF_SURFACE_RGBA), "RGBA");
         assert_eq!(surface_format_name(9999), "unknown");
+    }
+
+    #[test]
+    fn max_au_size_is_one_tenth_second_of_target_bitrate() {
+        assert_eq!(max_au_size_bytes(10_000_000), 125_000);
+        assert_eq!(max_au_size_bytes(6_827_000), 85_337);
+        assert_eq!(max_au_size_bytes(0), 1);
+    }
+
+    #[test]
+    fn vbv_buffer_recomputes_from_bitrate_and_frame_rate() {
+        assert_eq!(vbv_buffer_size(10_000_000, 60, 3), 500_000);
+        assert_eq!(vbv_buffer_size(6_827_000, 60, 3), 341_350);
+        assert_eq!(vbv_buffer_size(10_000_000, 0, 1), 10_000_000);
+    }
+
+    #[test]
+    fn pts_uses_capture_timing_and_falls_back_to_frame_duration() {
+        let origin = Instant::now();
+        let frame_duration = frame_duration_100ns(60);
+
+        let (first_pts, first_origin) =
+            pts_from_frame_timing(1, origin, None, frame_duration);
+        assert_eq!(first_pts, 0);
+        assert_eq!(first_origin, origin);
+
+        let (timed_pts, _) = pts_from_frame_timing(
+            2,
+            origin + Duration::from_millis(100),
+            Some(origin),
+            frame_duration,
+        );
+        assert_eq!(timed_pts, 1_000_000);
+
+        let (fallback_pts, _) = pts_from_frame_timing(
+            3,
+            origin - Duration::from_millis(1),
+            Some(origin),
+            frame_duration,
+        );
+        assert_eq!(fallback_pts, frame_duration * 2);
+        assert_eq!(clamp_monotonic_pts(1, frame_duration), frame_duration);
     }
 }

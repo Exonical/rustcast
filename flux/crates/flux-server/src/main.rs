@@ -1651,7 +1651,7 @@ fn capture_loop(
                 encode_resolution.width, encode_resolution.height, target_fps, backend
             );
             if let Some(ref mut enc) = encode_session {
-                enc.request_idr();
+                enc.request_idr_for_rebuild();
             }
 
             // If the encoder had to be opened below the capture size (e.g.
