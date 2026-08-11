@@ -6,7 +6,7 @@
 
 use flux_core::cursor::{CursorBitmap, CursorMetadata};
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::CapturedFrame;
+use flux_core::frame::{CapturedFrame, GpuDeviceHandle};
 use flux_core::types::{PixelFormat, Resolution};
 
 use crate::cursor::{convert_dxgi_pointer_shape, scale_cursor_bitmap};
@@ -982,6 +982,10 @@ impl CaptureSession for DxgiCaptureSession {
             return Ok(None);
         }
         self.acquire_frame(0)
+    }
+
+    fn gpu_device(&self) -> Option<GpuDeviceHandle> {
+        Some(GpuDeviceHandle::from_d3d11(self.device.clone()))
     }
 
     fn stop(&mut self) -> Result<()> {

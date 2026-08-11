@@ -1,6 +1,6 @@
 use flux_core::cursor::CursorMetadata;
 use flux_core::error::Result;
-use flux_core::frame::CapturedFrame;
+use flux_core::frame::{CapturedFrame, GpuDeviceHandle};
 use flux_core::types::{DesktopRect, Resolution};
 use std::sync::Arc;
 
@@ -56,6 +56,12 @@ pub trait CaptureSession: Send {
 
     /// Non-blocking try: returns `Ok(None)` if no frame is ready yet.
     fn try_next_frame(&mut self) -> Result<Option<CapturedFrame>>;
+
+    /// Return the GPU device associated with this capture session, when the
+    /// backend can provide one for zero-copy encoding.
+    fn gpu_device(&self) -> Option<GpuDeviceHandle> {
+        None
+    }
 
     /// Signal the capture backend to stop. The session becomes invalid after this call.
     fn stop(&mut self) -> Result<()>;
