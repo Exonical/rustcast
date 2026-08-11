@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            flux/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('flux/Cargo.lock', 'flux/rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libgtk-3-dev libxdo-dev libva-dev \
+            libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev \
+            libpostproc-dev libswscale-dev libswresample-dev \
+            libdrm-dev libpipewire-0.3-dev libspa-0.2-dev
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Rust checks and JUnit
+        run: ./ci/run.sh rust
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-rust
+          path: target/junit/rust.xml
+
+  windows-check:
+    name: Windows cross-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-14 lld libclang-dev
+          cargo install cargo-xwin --locked
+          rustup target add x86_64-pc-windows-msvc
+          sudo ln -sf /usr/lib/llvm-14/bin/llvm-lib /usr/local/bin/llvm-lib
+      - name: Windows check
+        run: ./ci/run.sh windows
+
+  go:
+    name: Go relay
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('flux-web/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Go checks and JUnit
+        run: ./ci/run.sh go
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-go
+          path: target/junit/go.xml
+
+  ui:
+    name: Browser UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: flux-web/ui/pnpm-lock.yaml
+      - name: UI checks and JUnit
+        run: ./ci/run.sh ui
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-ui
+          path: target/junit/ui.xml
