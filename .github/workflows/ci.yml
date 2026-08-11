@@ -13,8 +13,8 @@ jobs:
     name: Rust workspace
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -22,7 +22,7 @@ jobs:
             flux/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('flux/Cargo.lock', 'flux/rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
@@ -41,7 +41,7 @@ jobs:
         run: ./ci/run.sh rust
       - name: Upload JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-rust
           path: target/junit/rust.xml
@@ -50,8 +50,8 @@ jobs:
     name: Windows cross-check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
       - name: Install dependencies
@@ -83,23 +83,23 @@ jobs:
     name: Go relay
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('flux-web/go.sum') }}
           restore-keys: ${{ runner.os }}-go-
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.5'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
       - name: Go checks and JUnit
         run: ./ci/run.sh go
       - name: Upload JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-go
           path: target/junit/go.xml
@@ -108,11 +108,11 @@ jobs:
     name: Browser UI
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 9.15.1
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -121,7 +121,7 @@ jobs:
         run: ./ci/run.sh ui
       - name: Upload JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: junit-ui
           path: target/junit/ui.xml
