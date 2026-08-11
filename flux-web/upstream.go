@@ -67,6 +67,7 @@ const (
 	idrReasonStaleQueue   idrReason = "stale-queue-discard"
 	idrReasonAbandoned    idrReason = "abandoned-packets"
 	idrReasonRequeueDrop  idrReason = "requeue-drop"
+	idrReasonAwaitingIDR  idrReason = "awaiting-idr"
 )
 
 // idrStats counts keyframe requests by origin, including the ones the gate
@@ -105,6 +106,7 @@ func (s *idrStats) drain() string {
 		idrReasonStaleQueue,
 		idrReasonAbandoned,
 		idrReasonRequeueDrop,
+		idrReasonAwaitingIDR,
 	} {
 		granted, suppressed := s.granted[reason], s.suppressed[reason]
 		if granted == 0 && suppressed == 0 {
@@ -277,11 +279,16 @@ func commitSequenceNumber(next *uint16, writeSucceeded bool) {
 
 func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool) {
 	dropped := false
+	currentIsIDR := isIDRFrame(current.data)
 	for {
 		select {
 		case newer := <-ch:
-			current = newer
 			dropped = true
+			newerIsIDR := isIDRFrame(newer.data)
+			if newerIsIDR || !currentIsIDR {
+				current = newer
+				currentIsIDR = newerIsIDR
+			}
 		default:
 			return current, dropped
 		}
@@ -360,6 +367,14 @@ func (u *machineUpstream) requestIDR(reason idrReason) bool {
 	granted := u.sendIDRRequest()
 	u.idrStats.record(reason, granted)
 	return granted
+}
+
+func (u *machineUpstream) skipFrameUntilIDR(session *Session, idr bool) bool {
+	if !session.needsIDR || idr {
+		return false
+	}
+	u.requestIDR(idrReasonAwaitingIDR)
+	return true
 }
 
 func (u *machineUpstream) sendIDRRequest() bool {
@@ -737,7 +752,7 @@ func (u *machineUpstream) framePusher() {
 			// New session: skip P-frames until the next live IDR arrives.
 			// P-frames can't be decoded without their preceding frames.
 			if sess.needsIDR {
-				if !idr {
+				if u.skipFrameUntilIDR(sess, idr) {
 					continue
 				}
 				if sess.hasStarted {

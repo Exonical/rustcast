@@ -385,13 +385,18 @@ func logBandwidthEstimate(session *Session) {
 			return
 		case <-ticker.C:
 			stats := session.bwe.GetStats()
+			delayTarget := intStat(stats, "delayTargetBitrate")
+			lossTarget := intStat(stats, "lossTargetBitrate")
+			gccTarget := min(delayTarget, lossTarget)
 			var abrTarget uint32
 			if machine := session.getMachine(); machine != nil {
 				abrTarget = machine.abr.targetBitrateKbps()
 			}
-			log.Printf("[bwe] gcc=%d kbps abr=%d kbps loss=%.1f%% delay=%.1fms (threshold %.1fms) usage=%v state=%v",
-				session.bwe.GetTargetBitrate()/1000,
+			log.Printf("[bwe] gcc=%d kbps abr=%d kbps loss-target=%d kbps delay-target=%d kbps loss=%.1f%% delay=%.1fms (threshold %.1fms) usage=%v state=%v",
+				gccTarget/1000,
 				abrTarget,
+				lossTarget/1000,
+				delayTarget/1000,
 				floatStat(stats, "averageLoss")*100,
 				floatStat(stats, "delayEstimate"),
 				floatStat(stats, "delayThreshold"),
@@ -404,6 +409,11 @@ func logBandwidthEstimate(session *Session) {
 
 func floatStat(stats map[string]any, key string) float64 {
 	value, _ := stats[key].(float64)
+	return value
+}
+
+func intStat(stats map[string]any, key string) int {
+	value, _ := stats[key].(int)
 	return value
 }
 
