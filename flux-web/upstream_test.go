@@ -104,6 +104,53 @@ func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
 	}
 }
 
+func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	u := newMachineUpstream("", "", nil)
+	u.idrGate = newIDRRequestGate(func() time.Time { return now })
+
+	for range 6 {
+		u.requestIDR()
+	}
+	if got := len(u.commandChan); got != 1 {
+		t.Fatalf("burst queued %d IDR requests, want exactly 1", got)
+	}
+	if got := <-u.commandChan; len(got) != 1 || got[0] != 0x01 {
+		t.Fatalf("burst queued command %#v, want IDR command", got)
+	}
+
+	now = now.Add(idrRequestInterval)
+	if !u.requestIDR() {
+		t.Fatal("request at the next gate window was rejected")
+	}
+	if got := len(u.commandChan); got != 1 {
+		t.Fatalf("second gate window queued %d IDR requests, want 1", got)
+	}
+	if got := <-u.commandChan; len(got) != 1 || got[0] != 0x01 {
+		t.Fatalf("next-window queued command %#v, want IDR command", got)
+	}
+}
+
+func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	u := newMachineUpstream("", "", nil)
+	u.idrGate = newIDRRequestGate(func() time.Time { return now })
+	session := &Session{}
+
+	if !u.requestIDR() {
+		t.Fatal("regular IDR request was rejected")
+	}
+	if !u.requestInitialIDR(session) {
+		t.Fatal("initial session IDR request was delayed by the shared gate")
+	}
+	if u.requestInitialIDR(session) {
+		t.Fatal("initial-session exemption was reused")
+	}
+	if got := len(u.commandChan); got != 2 {
+		t.Fatalf("queued %d IDR requests, want regular plus one initial request", got)
+	}
+}
+
 func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) {
 	next := uint16(65534)
 	var emitted []uint16

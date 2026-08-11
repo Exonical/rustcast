@@ -23,23 +23,23 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id             string
-	addr           string
-	frameChan      chan frameMsg
-	cursorChan     chan cursorMsg
-	commandChan    chan []byte
-	abr            *abrState
-	stopChan       chan struct{}
-	stopOnce       sync.Once
-	viewers        int // Protected by machineRegistry.mu.
-	viewerCount    atomic.Uint32
-	mu             sync.Mutex
-	session        *Session
-	lastCursor     *cursorMsg
-	conn           net.Conn
-	cancel         context.CancelFunc
-	status         func(string)
-	lastIDRRequest time.Time
+	id          string
+	addr        string
+	frameChan   chan frameMsg
+	cursorChan  chan cursorMsg
+	commandChan chan []byte
+	abr         *abrState
+	stopChan    chan struct{}
+	stopOnce    sync.Once
+	viewers     int // Protected by machineRegistry.mu.
+	viewerCount atomic.Uint32
+	mu          sync.Mutex
+	session     *Session
+	lastCursor  *cursorMsg
+	conn        net.Conn
+	cancel      context.CancelFunc
+	status      func(string)
+	idrGate     idrRequestGate
 }
 
 const (
@@ -47,8 +47,33 @@ const (
 	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
 	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
 	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
-	pacingIDRInterval    = 500 * time.Millisecond
+	idrRequestInterval   = 2 * time.Second
 )
+
+// idrRequestGate bounds the feedback-loop gain: regardless of how many
+// independent drop/PLI paths observe corruption, they can produce at most one
+// upstream keyframe request during the interval. The two-second window is
+// deliberately longer than the cost of a large keyframe at the target rate;
+// shortening it makes recovery feedback generate another keyframe before the
+// previous one has drained.
+type idrRequestGate struct {
+	interval time.Duration
+	now      func() time.Time
+	last     time.Time
+}
+
+func newIDRRequestGate(now func() time.Time) idrRequestGate {
+	return idrRequestGate{interval: idrRequestInterval, now: now}
+}
+
+func (g *idrRequestGate) allow() bool {
+	now := g.now()
+	if !g.last.IsZero() && now.Sub(g.last) < g.interval {
+		return false
+	}
+	g.last = now
+	return true
+}
 
 func pacingSchedule(
 	packetSizes []int,
@@ -127,6 +152,7 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 		commandChan: make(chan []byte, 100),
 		stopChan:    make(chan struct{}),
 		status:      status,
+		idrGate:     newIDRRequestGate(time.Now),
 	}
 	u.abr = &abrState{commandChan: u.commandChan}
 	return u
@@ -165,11 +191,35 @@ func (u *machineUpstream) send(cmd []byte) bool {
 func (u *machineUpstream) requestIDR() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if !u.lastIDRRequest.IsZero() && time.Since(u.lastIDRRequest) < pacingIDRInterval {
+	if !u.idrGate.allow() {
 		return false
 	}
-	u.lastIDRRequest = time.Now()
-	return u.send([]byte{0x01})
+	if u.send([]byte{0x01}) {
+		return true
+	}
+	u.idrGate.last = time.Time{}
+	return false
+}
+
+// requestInitialIDR sends exactly one immediate request for this session. A
+// new session cannot display anything until its first IDR, so it is exempt
+// from the two-second feedback gate; the per-session flag prevents an already
+// running session from reusing that exemption.
+func (u *machineUpstream) requestInitialIDR(session *Session) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if session.initialIDRRequested {
+		return false
+	}
+	if !u.send([]byte{0x01}) {
+		return false
+	}
+	session.initialIDRRequested = true
+	// Opening the gate window here too: the initial keyframe is the most
+	// expensive one, so a drop observed while it drains must not immediately
+	// ask for another.
+	u.idrGate.last = u.idrGate.now()
+	return true
 }
 
 func (u *machineUpstream) sendCursor(msg cursorMsg) {
@@ -502,8 +552,17 @@ func (u *machineUpstream) framePusher() {
 				if !idr {
 					continue
 				}
-				log.Printf("[webrtc:%s] live IDR arrived (%d bytes), starting stream for new session", u.id, len(msg.data))
+				if sess.hasStarted {
+					log.Printf("[webrtc:%s] recovery IDR arrived (%d bytes), resuming stream", u.id, len(msg.data))
+				} else {
+					log.Printf("[webrtc:%s] initial IDR arrived (%d bytes), starting stream", u.id, len(msg.data))
+				}
 				sess.needsIDR = false
+			} else if idr {
+				log.Printf("[webrtc:%s] IDR sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
+			}
+			if idr {
+				sess.hasStarted = true
 			}
 			// Duration = capture-time gap since the previous sent sample. The
 			// server timestamp resets on reconnect, so guard against going
@@ -511,7 +570,7 @@ func (u *machineUpstream) framePusher() {
 			frameDuration := captureFrameDuration(lastTs, msg.tsMicros, haveLastTs)
 			lastTs, haveLastTs = msg.tsMicros, true
 			// Log first few frames and IDRs for diagnostics.
-			if sampleCount <= 5 || idr {
+			if sampleCount <= 5 && !idr {
 				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
 			curTicks, remainder := consumeRTPDuration(frameDuration, sess.rtpRemainder)
