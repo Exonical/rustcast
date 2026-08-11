@@ -47,6 +47,7 @@ const (
 	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
 	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
 	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
+	maxPacingMultiplier  = 4                     // cap frame-size floor at 4x target
 	idrRequestInterval   = 2 * time.Second
 )
 
@@ -90,9 +91,16 @@ func pacingSchedule(
 	}
 	targetBitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
 	frameBitsPerSecond := float64(frameBits) / frameDuration.Seconds()
-	bitsPerSecond := targetBitsPerSecond
-	if bitsPerSecond < frameBitsPerSecond {
-		bitsPerSecond = frameBitsPerSecond
+	bitsPerSecond := frameBitsPerSecond
+	if targetKbps > 0 {
+		bitsPerSecond = targetBitsPerSecond
+		if bitsPerSecond < frameBitsPerSecond {
+			bitsPerSecond = frameBitsPerSecond
+		}
+		maxBitsPerSecond := float64(targetKbps) * 1000 * maxPacingMultiplier
+		if bitsPerSecond > maxBitsPerSecond {
+			bitsPerSecond = maxBitsPerSecond
+		}
 	}
 	var elapsedSeconds float64
 	for i, size := range packetSizes {
@@ -104,7 +112,12 @@ func pacingSchedule(
 
 func assignSequenceNumber(packet *rtp.Packet, next *uint16) {
 	packet.Header.SequenceNumber = *next
-	*next = *next + 1
+}
+
+func commitSequenceNumber(next *uint16, writeSucceeded bool) {
+	if writeSucceeded {
+		*next = *next + 1
+	}
 }
 
 func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool) {
@@ -593,14 +606,22 @@ func (u *machineUpstream) framePusher() {
 					}
 				}
 				msg = *next
+				droppedQueued := false
 				select {
 				case u.frameChan <- msg:
 				default:
 					select {
 					case <-u.frameChan:
+						droppedQueued = true
 					default:
 					}
 					u.frameChan <- msg
+				}
+				if droppedQueued {
+					sess.needsIDR = true
+					if u.requestIDR() {
+						log.Printf("[webrtc:%s] dropped queued frame while requeueing newer frame; requesting IDR", u.id)
+					}
 				}
 			}
 		}
@@ -654,9 +675,11 @@ func (u *machineUpstream) writePacedPackets(
 			}
 		}
 		assignSequenceNumber(packet, &sess.nextSequenceNumber)
-		if err := sess.VideoTrack.WriteRTP(packet); err != nil {
+		err := sess.VideoTrack.WriteRTP(packet)
+		if err != nil {
 			log.Printf("[webrtc:%s] write RTP packet error: %v", u.id, err)
 		}
+		commitSequenceNumber(&sess.nextSequenceNumber, err == nil)
 	}
 	return nil, len(packets)
 }

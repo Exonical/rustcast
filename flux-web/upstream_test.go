@@ -86,11 +86,11 @@ func TestPacingScheduleUsesFrameRateFloor(t *testing.T) {
 	}
 }
 
-func TestPacingScheduleLargeFrameFitsFrameInterval(t *testing.T) {
+func TestPacingScheduleLargeFrameIsBoundedByTargetMultiple(t *testing.T) {
 	packetSizes := []int{10_000, 10_000}
 	schedule := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
-	if schedule[len(schedule)-1] > 16*time.Millisecond {
-		t.Fatalf("large frame's final packet starts at %s, beyond 16ms frame interval", schedule[len(schedule)-1])
+	if got, want := schedule[len(schedule)-1], 200*time.Millisecond; got != want {
+		t.Fatalf("large frame's final packet starts at %s, want %s", got, want)
 	}
 }
 
@@ -158,6 +158,7 @@ func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) 
 		packet := &rtp.Packet{}
 		assignSequenceNumber(packet, &next)
 		emitted = append(emitted, packet.Header.SequenceNumber)
+		commitSequenceNumber(&next, true)
 	}
 	// The remainder of this frame is abandoned. The next frame starts with
 	// the next emitted sequence number rather than the packetizer's counter.
@@ -165,12 +166,34 @@ func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) 
 		packet := &rtp.Packet{}
 		assignSequenceNumber(packet, &next)
 		emitted = append(emitted, packet.Header.SequenceNumber)
+		commitSequenceNumber(&next, true)
 	}
 	want := []uint16{65534, 65535, 0, 1, 2}
 	for i := range want {
 		if emitted[i] != want[i] {
 			t.Fatalf("emitted sequence[%d] = %d, want %d", i, emitted[i], want[i])
 		}
+	}
+}
+
+func TestSequenceNumberDoesNotAdvanceOnWriteError(t *testing.T) {
+	next := uint16(41)
+	packet := &rtp.Packet{}
+	assignSequenceNumber(packet, &next)
+	if packet.Header.SequenceNumber != next {
+		t.Fatalf("assigned sequence = %d, want %d", packet.Header.SequenceNumber, next)
+	}
+	if next != 41 {
+		t.Fatalf("sequence advanced before write: %d", next)
+	}
+
+	commitSequenceNumber(&next, false)
+	if next != 41 {
+		t.Fatalf("failed write sequence = %d, want 41", next)
+	}
+	commitSequenceNumber(&next, true)
+	if next != 42 {
+		t.Fatalf("successful write sequence = %d, want 42", next)
 	}
 }
 
