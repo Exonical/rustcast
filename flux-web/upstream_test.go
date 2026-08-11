@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -91,6 +92,32 @@ func TestPacingScheduleLargeFrameIsBoundedByTargetMultiple(t *testing.T) {
 	schedule := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
 	if got, want := schedule[len(schedule)-1], 200*time.Millisecond; got != want {
 		t.Fatalf("large frame's final packet starts at %s, want %s", got, want)
+	}
+}
+
+func TestPacingScheduleIDRUsesEmissionTargetAfterLongGap(t *testing.T) {
+	schedule := pacingScheduleForFrame([]int{50_000, 30_000}, 2_100, time.Second, true)
+	if got, want := schedule[1], 40*time.Millisecond; got != want {
+		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
+	}
+	if got, want := schedule[1]+30_000*8*time.Second/time.Duration(pacingIDRMaxRate), 64*time.Millisecond; got != want {
+		t.Fatalf("IDR emission time = %s, want %s", got, want)
+	}
+}
+
+func TestPacingScheduleIDRRespectsAbsoluteRateCeiling(t *testing.T) {
+	schedule := pacingScheduleForFrame([]int{1_000_000, 1}, 1_000, time.Second, true)
+	if got, want := schedule[1], 800*time.Millisecond; got != want {
+		t.Fatalf("large IDR final packet starts at %s, want %s", got, want)
+	}
+}
+
+func TestPacingScheduleNonIDRMatchesExistingBehavior(t *testing.T) {
+	packetSizes := []int{1200, 800, 400}
+	want := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
+	got := pacingScheduleForFrame(packetSizes, 100, 16*time.Millisecond, false)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("non-IDR schedule changed: got %v, want %v", got, want)
 	}
 }
 
