@@ -63,17 +63,19 @@ func initUDPMux() error {
 
 // Session wraps a single WebRTC peer connection + video track.
 type Session struct {
-	PeerConnection     *webrtc.PeerConnection
-	VideoTrack         *webrtc.TrackLocalStaticRTP
-	Packetizer         rtp.Packetizer
-	rtpRemainder       float64
-	nextSequenceNumber uint16
-	needsIDR           bool // true until the first IDR is sent to this session
-	machine            *machineUpstream
-	release            func()
-	releaseOnce        sync.Once
-	cursorDone         chan struct{}
-	writer             *wsWriter
+	PeerConnection      *webrtc.PeerConnection
+	VideoTrack          *webrtc.TrackLocalStaticRTP
+	Packetizer          rtp.Packetizer
+	rtpRemainder        float64
+	nextSequenceNumber  uint16
+	needsIDR            bool // true until the first IDR is sent to this session
+	initialIDRRequested bool
+	hasStarted          bool
+	machine             *machineUpstream
+	release             func()
+	releaseOnce         sync.Once
+	cursorDone          chan struct{}
+	writer              *wsWriter
 }
 
 type wsWriter struct {
@@ -305,9 +307,8 @@ func rttFromReport(report rtcp.ReceptionReport, arrival time.Time) time.Duration
 }
 
 // forwardKeyframeRequests reads incoming RTCP on the video sender and turns
-// PLI/FIR feedback into upstream IDR requests, rate-limited to one per 250ms.
+// PLI/FIR feedback into requests through the upstream's shared IDR gate.
 func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
-	var lastIDR time.Time
 	for {
 		packets, _, err := sender.ReadRTCP()
 		if err != nil {
@@ -324,15 +325,13 @@ func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
 			}
 			switch pkt.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-				if time.Since(lastIDR) < 250*time.Millisecond || session.machine == nil {
+				if session.machine == nil {
 					continue
 				}
-				lastIDR = time.Now()
-				if !session.machine.send([]byte{0x01}) {
-					log.Printf("[webrtc] upstream command channel full, dropped IDR request")
-				} else {
-					log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
+				if !session.machine.requestIDR() {
+					continue
 				}
+				log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
 			}
 		}
 	}
@@ -530,10 +529,10 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				continue
 			}
 
-			if !upstream.send([]byte{0x01}) {
+			if !upstream.requestInitialIDR(next) {
 				log.Printf("[ws] upstream command channel full, dropped IDR request")
 			} else {
-				log.Printf("[ws] requested IDR from upstream")
+				log.Printf("[ws] requested initial IDR from upstream")
 			}
 			answerData, _ := json.Marshal(map[string]string{"sd": answerSDP})
 			resp, _ := json.Marshal(WSMessage{Type: "answer", Data: answerData})
