@@ -7,13 +7,11 @@ import (
 	"time"
 )
 
-// abrState adapts the upstream encoder bitrate for one machine to what its viewer's link actually
-// sustains. It watches RTCP receiver reports from the browser: sustained loss
-// means the WiFi link is saturated, so the encoder target is cut (multiplicative
-// decrease); after a clean period it is raised back gradually (additive
-// increase) toward the highest rate ever observed working. Targets are sent
-// upstream as command 0x03 [4-byte BE kbps], which flux-server applies live
-// via the encoder's set_bitrate.
+// abrState tracks the upstream encoder bitrate target for one machine. GCC's
+// transport-wide congestion estimate drives the target; RTCP receiver reports
+// and RTT samples remain here for diagnostics. Targets are sent upstream as
+// command 0x03 [4-byte BE kbps], which flux-server applies live via the
+// encoder's set_bitrate.
 type abrState struct {
 	mu          sync.Mutex
 	commandChan chan []byte
@@ -22,33 +20,30 @@ type abrState struct {
 	sampleStart   time.Time // start of current measurement window
 	measuredKbps  uint32    // last measured incoming bitrate
 
-	targetKbps       uint32 // 0 = never adjusted (encoder default)
-	ceilingKbps      uint32 // sender-reported requested bitrate ceiling
-	senderTargetKbps uint32
-
-	lastDecrease time.Time
-	lastIncrease time.Time
-	cleanSince   time.Time
+	targetKbps  uint32 // 0 = never adjusted (encoder default)
+	ceilingKbps uint32 // sender-reported requested bitrate ceiling
 
 	baseRTT       time.Duration // lowest RTT in the trailing window: the path's uninflated floor
 	smoothedRTT   time.Duration // EWMA of recent RTT samples
 	windowMinRTT  time.Duration // lowest RTT in the window currently being collected
 	windowStarted time.Time
+	lastGCCUpdate time.Time
+	lossNotable   bool
+	rttInflated   bool
 }
 
 const (
-	abrMinKbps          = 1500
-	abrLossThreshold    = 0.05 // fraction lost that triggers a decrease
-	abrCleanThreshold   = 0.01 // fraction lost considered "clean"
-	abrDecreaseFactor   = 0.7
-	abrIncreaseFactor   = 1.15
-	abrDecreaseCooldown = 2 * time.Second
-	abrIncreaseCooldown = 5 * time.Second
-	abrCleanBeforeRaise = 5 * time.Second
+	abrMinKbps       = 1500
+	abrLossThreshold = 0.05 // fraction lost worth recording in the relay log
 
-	abrRTTInflation  = 75 * time.Millisecond // queue delay above baseline that triggers a decrease
+	abrRTTInflation  = 75 * time.Millisecond // queue delay above baseline worth recording
 	abrRTTAlpha      = 0.125                 // EWMA weight for new RTT samples
 	abrRTTBaseWindow = 30 * time.Second      // baseline is re-estimated over this trailing window
+
+	abrGCCInitialBitrateBps = 5_000_000
+	abrGCCMaxBitrateBps     = 50_000_000
+	abrGCCMinChange         = 0.10
+	abrGCCUpdateInterval    = 500 * time.Millisecond
 )
 
 // countFrameBytes records incoming video bytes for bitrate measurement.
@@ -74,10 +69,12 @@ func (a *abrState) setSenderTarget(kbps uint32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.ceilingKbps = kbps
-	if a.senderTargetKbps != kbps {
-		a.senderTargetKbps = kbps
-		a.targetKbps = kbps
+	if kbps == 0 || a.targetKbps <= kbps {
+		return
 	}
+	a.targetKbps = kbps
+	log.Printf("[abr] sender ceiling lowered → clamping encoder bitrate to %d kbps", kbps)
+	a.sendBitrateCommand(kbps)
 }
 
 func (a *abrState) targetBitrateKbps() uint32 {
@@ -86,11 +83,8 @@ func (a *abrState) targetBitrateKbps() uint32 {
 	return a.targetKbps
 }
 
-// onRTTSample feeds a round-trip-time measurement derived from RTCP
-// receiver reports. Rising RTT means packets are queueing (bufferbloat) —
-// the link is saturating even though nothing is being lost yet — so the
-// bitrate is cut before loss appears. Inflation is measured against a
-// baseline re-estimated over a trailing window.
+// onRTTSample records a round-trip-time measurement derived from RTCP receiver
+// reports. GCC owns bitrate changes; these samples remain for diagnostics.
 func (a *abrState) onRTTSample(rtt time.Duration) {
 	if rtt <= 0 {
 		return
@@ -122,86 +116,78 @@ func (a *abrState) onRTTSample(rtt time.Duration) {
 	} else {
 		a.smoothedRTT = time.Duration((1-abrRTTAlpha)*float64(a.smoothedRTT) + abrRTTAlpha*float64(rtt))
 	}
-	if a.smoothedRTT-a.baseRTT <= abrRTTInflation {
+	inflated := a.smoothedRTT-a.baseRTT > abrRTTInflation
+	if inflated == a.rttInflated {
 		return
 	}
-	a.cleanSince = time.Time{}
-	if now.Sub(a.lastDecrease) < abrDecreaseCooldown {
-		return
+	a.rttInflated = inflated
+	if inflated {
+		log.Printf("[abr] RTT %.0fms (baseline %.0fms) → queue inflation observed; GCC owns bitrate",
+			float64(a.smoothedRTT)/float64(time.Millisecond),
+			float64(a.baseRTT)/float64(time.Millisecond))
+	} else {
+		log.Printf("[abr] RTT queue inflation cleared; GCC owns bitrate")
 	}
-	base := a.targetKbps
-	if base == 0 {
-		return
-	}
-	target := uint32(float64(base) * abrDecreaseFactor)
-	if target < abrMinKbps {
-		target = abrMinKbps
-	}
-	if target == a.targetKbps {
-		return
-	}
-	a.targetKbps = target
-	a.lastDecrease = now
-	log.Printf("[abr] RTT %.0fms (baseline %.0fms) → lowering encoder bitrate to %d kbps",
-		float64(a.smoothedRTT)/float64(time.Millisecond),
-		float64(a.baseRTT)/float64(time.Millisecond), target)
-	a.sendBitrateCommand(target)
 }
 
-// onReceiverReport reacts to loss feedback from the viewer.
-// fractionLost is the RFC 3550 fraction (0..255 scaled to 0..1).
+// onReceiverReport records loss feedback from the viewer. GCC owns bitrate
+// changes; this remains so relay logs can distinguish loss from queueing.
 func (a *abrState) onReceiverReport(fractionLost float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	now := time.Now()
-
-	if fractionLost > abrLossThreshold {
-		a.cleanSince = time.Time{}
-		if now.Sub(a.lastDecrease) < abrDecreaseCooldown {
-			return
-		}
-		base := a.targetKbps
-		if base == 0 {
-			return // nothing measured yet
-		}
-		target := uint32(float64(base) * abrDecreaseFactor)
-		if target < abrMinKbps {
-			target = abrMinKbps
-		}
-		if target == a.targetKbps {
-			return
-		}
-		a.targetKbps = target
-		a.lastDecrease = now
-		log.Printf("[abr] loss %.1f%% → lowering encoder bitrate to %d kbps", fractionLost*100, target)
-		a.sendBitrateCommand(target)
+	notable := fractionLost > abrLossThreshold
+	if notable == a.lossNotable {
 		return
 	}
-
-	if fractionLost <= abrCleanThreshold {
-		if a.cleanSince.IsZero() {
-			a.cleanSince = now
-		}
-		// Only raise if we previously lowered, the link has been clean,
-		// and RTT is not sitting above its baseline (queues still draining).
-		if a.smoothedRTT-a.baseRTT > abrRTTInflation {
-			return
-		}
-		if a.targetKbps == 0 ||
-			a.targetKbps >= a.ceilingKbps ||
-			now.Sub(a.cleanSince) < abrCleanBeforeRaise ||
-			now.Sub(a.lastIncrease) < abrIncreaseCooldown {
-			return
-		}
-		target := uint32(float64(a.targetKbps) * abrIncreaseFactor)
-		if target > a.ceilingKbps {
-			target = a.ceilingKbps
-		}
-		a.targetKbps = target
-		a.lastIncrease = now
-		log.Printf("[abr] link clean → raising encoder bitrate to %d kbps", target)
-		a.sendBitrateCommand(target)
+	a.lossNotable = notable
+	if notable {
+		log.Printf("[abr] loss %.1f%% observed; GCC owns bitrate", fractionLost*100)
+	} else {
+		log.Printf("[abr] loss cleared; GCC owns bitrate")
 	}
+}
+
+// onEstimate applies a material GCC estimate to the encoder target.
+func (a *abrState) onEstimate(kbps uint32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if kbps == 0 {
+		return
+	}
+	if kbps < abrMinKbps {
+		kbps = abrMinKbps
+	}
+	if a.ceilingKbps != 0 && kbps > a.ceilingKbps {
+		kbps = a.ceilingKbps
+	}
+	now := time.Now()
+	if !a.lastGCCUpdate.IsZero() && now.Sub(a.lastGCCUpdate) < abrGCCUpdateInterval {
+		return
+	}
+	if a.targetKbps != 0 && !gccEstimateIsMaterial(a.targetKbps, kbps, a.ceilingKbps) {
+		return
+	}
+	a.targetKbps = kbps
+	a.lastGCCUpdate = now
+	log.Printf("[abr] GCC estimate → encoder bitrate %d kbps", kbps)
+	a.sendBitrateCommand(kbps)
+}
+
+func gccEstimateIsMaterial(current, next, ceiling uint32) bool {
+	if current == next {
+		return false
+	}
+	if next == abrMinKbps || ceiling != 0 && next == ceiling {
+		return true
+	}
+	if current == 0 {
+		return true
+	}
+	delta := current - next
+	if next > current {
+		delta = next - current
+	}
+	return float64(delta)/float64(current) >= abrGCCMinChange
 }
 
 func (a *abrState) sendBitrateCommand(kbps uint32) {
