@@ -244,6 +244,7 @@ unsafe impl Send for AmfComponent {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PropertyStatus {
+    Supported,
     Unsupported,
     Accepted,
     Rejected,
@@ -253,6 +254,7 @@ enum PropertyStatus {
 impl fmt::Display for PropertyStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
+            Self::Supported => "supported",
             Self::Unsupported => "unsupported",
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
@@ -266,6 +268,16 @@ impl AmfComponent {
     fn has_property(&self, name: &str) -> bool {
         let wide_name = to_wide(name);
         unsafe { ((*(*self.ptr).vtbl).HasProperty)(self.ptr, wide_name.as_ptr()) }
+    }
+
+    fn property_support_status(&self, name: &str) -> PropertyStatus {
+        if self.has_property(name) {
+            tracing::info!("AMF: {} supported by runtime", name);
+            PropertyStatus::Supported
+        } else {
+            tracing::info!("AMF: {} unsupported by runtime", name);
+            PropertyStatus::Unsupported
+        }
     }
 
     fn set_property_int64(&self, name: &str, value: i64) -> Result<()> {
@@ -451,8 +463,6 @@ fn amf_data_release(data: *mut AMFDataObj) {
 
 const AMF_TIMEBASE_PER_SECOND: u64 = 10_000_000;
 const H264_MAX_AU_TENTHS_OF_A_SECOND: u64 = 10;
-const H264_MIN_QP_VALUE: i64 = 20;
-const H264_MAX_QP_VALUE: i64 = 51;
 
 /// Return the configured frame duration in AMF's 100 ns timebase.
 fn frame_duration_100ns(framerate: u32) -> i64 {
@@ -824,8 +834,8 @@ impl AmfSession {
                 // absent from some AMF runtimes, so rejection is non-fatal.
                 max_au_status =
                     encoder.set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bytes(bitrate_bps));
-                min_qp_status = encoder.set_optional_int64(H264_MIN_QP, H264_MIN_QP_VALUE);
-                max_qp_status = encoder.set_optional_int64(H264_MAX_QP, H264_MAX_QP_VALUE);
+                min_qp_status = encoder.property_support_status(H264_MIN_QP);
+                max_qp_status = encoder.property_support_status(H264_MAX_QP);
                 // Adaptive quantization: spend bits where the eye notices
                 // (text, edges) for better perceived quality per bit. Not
                 // supported on all drivers, so failures are non-fatal.
