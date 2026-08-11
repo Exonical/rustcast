@@ -23,22 +23,23 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id          string
-	addr        string
-	frameChan   chan frameMsg
-	cursorChan  chan cursorMsg
-	commandChan chan []byte
-	abr         *abrState
-	stopChan    chan struct{}
-	stopOnce    sync.Once
-	viewers     int // Protected by machineRegistry.mu.
-	viewerCount atomic.Uint32
-	mu          sync.Mutex
-	session     *Session
-	lastCursor  *cursorMsg
-	conn        net.Conn
-	cancel      context.CancelFunc
-	status      func(string)
+	id             string
+	addr           string
+	frameChan      chan frameMsg
+	cursorChan     chan cursorMsg
+	commandChan    chan []byte
+	abr            *abrState
+	stopChan       chan struct{}
+	stopOnce       sync.Once
+	viewers        int // Protected by machineRegistry.mu.
+	viewerCount    atomic.Uint32
+	mu             sync.Mutex
+	session        *Session
+	lastCursor     *cursorMsg
+	conn           net.Conn
+	cancel         context.CancelFunc
+	status         func(string)
+	lastIDRRequest time.Time
 }
 
 const (
@@ -63,11 +64,10 @@ func pacingSchedule(packetSizes []int, targetKbps uint32) []time.Duration {
 	return schedule
 }
 
-func abandonedPacketCount(sent, total int) int {
-	if sent >= total {
-		return 0
-	}
-	return total - sent
+func consumeRTPDuration(duration time.Duration, remainder float64) (uint32, float64) {
+	total := duration.Seconds()*90000 + remainder
+	ticks := uint32(total)
+	return ticks, total - float64(ticks)
 }
 
 func captureFrameDuration(lastTs, currentTs uint64, haveLastTs bool) time.Duration {
@@ -129,6 +129,16 @@ func (u *machineUpstream) send(cmd []byte) bool {
 	default:
 		return false
 	}
+}
+
+func (u *machineUpstream) requestIDR() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.lastIDRRequest.IsZero() && time.Since(u.lastIDRRequest) < pacingIDRInterval {
+		return false
+	}
+	u.lastIDRRequest = time.Now()
+	return u.send([]byte{0x01})
 }
 
 func (u *machineUpstream) sendCursor(msg cursorMsg) {
@@ -305,6 +315,7 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 				case <-u.frameChan:
 				default:
 				}
+				u.requestIDR()
 				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
 			}
 		case 0x02:
@@ -410,6 +421,7 @@ func (u *machineUpstream) connectQUIC() error {
 				case <-u.frameChan:
 				default:
 				}
+				u.requestIDR()
 				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
 			}
 		case 0x02:
@@ -434,7 +446,6 @@ func (u *machineUpstream) framePusher() {
 	var sampleCount uint64
 	var lastTs uint64
 	var haveLastTs bool
-	var lastPacingIDR time.Time
 	for {
 		select {
 		case <-u.stopChan:
@@ -459,14 +470,13 @@ func (u *machineUpstream) framePusher() {
 			// server timestamp resets on reconnect, so guard against going
 			// backwards and fall back to the nominal duration.
 			frameDuration := captureFrameDuration(lastTs, msg.tsMicros, haveLastTs)
+			lastTs, haveLastTs = msg.tsMicros, true
 			// Log first few frames and IDRs for diagnostics.
 			if sampleCount <= 5 || idr {
 				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
-			tickF := frameDuration.Seconds() * 90000
-			curTotal := tickF + sess.rtpRemainder
-			curTicks := uint32(curTotal)
-			sess.rtpRemainder = curTotal - float64(curTicks)
+			curTicks, remainder := consumeRTPDuration(frameDuration, sess.rtpRemainder)
+			sess.rtpRemainder = remainder
 			packets := sess.Packetizer.Packetize(msg.data, curTicks)
 			packetSizes := make([]int, len(packets))
 			for i, packet := range packets {
@@ -475,13 +485,11 @@ func (u *machineUpstream) framePusher() {
 			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps())
 			next, sent := u.writePacedPackets(sess, packets, schedule)
 			if next != nil {
-				remaining := abandonedPacketCount(sent, len(packets))
+				remaining := len(packets) - sent
 				if remaining > 0 {
 					sess.needsIDR = true
-					if time.Since(lastPacingIDR) >= pacingIDRInterval {
-						lastPacingIDR = time.Now()
+					if u.requestIDR() {
 						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
-						_ = u.send([]byte{0x01})
 					}
 				}
 				msg = *next
@@ -494,8 +502,6 @@ func (u *machineUpstream) framePusher() {
 					}
 					u.frameChan <- msg
 				}
-			} else if sent == len(packets) {
-				lastTs, haveLastTs = msg.tsMicros, true
 			}
 		}
 	}

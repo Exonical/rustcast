@@ -32,9 +32,11 @@ pub const ALPN: &[u8] = b"flux-frames";
 const FRAME_RESET_BACKLOG_THRESHOLD: usize = 3;
 const FRAME_RESET_IDR_COOLDOWN: Duration = Duration::from_millis(500);
 
+// A single newer frame is not enough reason to reset a stream, but discarded
+// intermediate frames still warrant a rate-limited IDR request.
 #[derive(Debug, Default)]
 struct FrameResetPolicy {
-    last_reset: Option<Instant>,
+    last_recovery: Option<Instant>,
 }
 
 impl FrameResetPolicy {
@@ -43,12 +45,23 @@ impl FrameResetPolicy {
             return false;
         }
         if self
-            .last_reset
+            .last_recovery
             .is_some_and(|last| now.duration_since(last) < FRAME_RESET_IDR_COOLDOWN)
         {
             return false;
         }
-        self.last_reset = Some(now);
+        self.last_recovery = Some(now);
+        true
+    }
+
+    fn should_request_idr(&mut self, now: Instant) -> bool {
+        if self
+            .last_recovery
+            .is_some_and(|last| now.duration_since(last) < FRAME_RESET_IDR_COOLDOWN)
+        {
+            return false;
+        }
+        self.last_recovery = Some(now);
         true
     }
 }
@@ -202,7 +215,19 @@ async fn handle_connection(
             .await
             {
                 FrameSendResult::Complete => {}
-                FrameSendResult::Superseded(frame) => pending_frame = Some(frame),
+                FrameSendResult::Superseded {
+                    frame,
+                    needs_recovery,
+                    recovery_requested,
+                } => {
+                    if needs_recovery
+                        && !recovery_requested
+                        && reset_policy.should_request_idr(Instant::now())
+                    {
+                        let _ = frame_idr_tx.send(());
+                    }
+                    pending_frame = Some(frame);
+                }
                 FrameSendResult::Disconnected => break,
             }
             continue;
@@ -226,7 +251,19 @@ async fn handle_connection(
                     &frame_idr_tx,
                 ).await {
                     FrameSendResult::Complete => {}
-                    FrameSendResult::Superseded(frame) => pending_frame = Some(frame),
+                    FrameSendResult::Superseded {
+                        frame,
+                        needs_recovery,
+                        recovery_requested,
+                    } => {
+                        if needs_recovery
+                            && !recovery_requested
+                            && reset_policy.should_request_idr(Instant::now())
+                        {
+                            let _ = frame_idr_tx.send(());
+                        }
+                        pending_frame = Some(frame);
+                    }
                     FrameSendResult::Disconnected => break,
                 }
             }
@@ -286,7 +323,11 @@ async fn send_message(
 
 enum FrameSendResult {
     Complete,
-    Superseded(Arc<(u64, Vec<u8>)>),
+    Superseded {
+        frame: Arc<(u64, Vec<u8>)>,
+        needs_recovery: bool,
+        recovery_requested: bool,
+    },
     Disconnected,
 }
 
@@ -317,29 +358,41 @@ async fn send_frame_message(
     let is_idr = is_idr_frame(&payload);
     let mut pending = None;
     let mut backlog = 0;
+    let mut dropped_frames = false;
     let mut offset = 0;
     while offset < payload.len() {
-        let end = (offset + 16 * 1024).min(payload.len());
         if is_idr {
-            if stream.write_all(&payload[offset..end]).await.is_err() {
-                tracing::info!("QUIC frame write failed; client disconnected");
-                return FrameSendResult::Disconnected;
+            match stream.write(&payload[offset..]).await {
+                Ok(0) => return FrameSendResult::Disconnected,
+                Ok(written) => {
+                    offset += written;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::info!("QUIC frame write failed; client disconnected");
+                    return FrameSendResult::Disconnected;
+                }
             }
-            offset = end;
-            continue;
         }
 
         let mut reset = false;
-        let write_result = {
-            let write = stream.write_all(&payload[offset..end]);
+        let mut write_completed = false;
+        {
+            let write = stream.write(&payload[offset..]);
             tokio::pin!(write);
             tokio::select! {
                 result = &mut write => {
-                    if result.is_err() {
-                        tracing::info!("QUIC frame write failed; client disconnected");
-                        return FrameSendResult::Disconnected;
+                    match result {
+                        Ok(0) => return FrameSendResult::Disconnected,
+                        Ok(written) => {
+                            offset += written;
+                            write_completed = true;
+                        }
+                        Err(_) => {
+                            tracing::info!("QUIC frame write failed; client disconnected");
+                            return FrameSendResult::Disconnected;
+                        }
                     }
-                    None
                 }
                 result = rx.recv() => {
                     match result {
@@ -351,9 +404,11 @@ async fn send_frame_message(
                                     Ok(frame) => {
                                         pending = Some(frame);
                                         backlog += 1;
+                                        dropped_frames = true;
                                     }
                                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
                                         backlog += n as usize;
+                                        dropped_frames = true;
                                     }
                                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
@@ -367,15 +422,18 @@ async fn send_frame_message(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             backlog += n as usize;
+                            dropped_frames = true;
+                            if reset_policy.should_request_idr(Instant::now()) {
+                                let _ = idr_tx.send(());
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return FrameSendResult::Disconnected;
                         }
                     }
-                    Some(())
                 }
             }
-        };
+        }
         if reset {
             let _ = stream.reset(quinn::VarInt::from_u32(0));
             let _ = idr_tx.send(());
@@ -383,15 +441,23 @@ async fn send_frame_message(
                 "resetting stale QUIC P-frame after {} newer frames queued",
                 backlog
             );
-            return FrameSendResult::Superseded(pending.expect("pending frame"));
+            return FrameSendResult::Superseded {
+                frame: pending.expect("pending frame"),
+                needs_recovery: true,
+                recovery_requested: true,
+            };
         }
-        if write_result.is_none() {
-            offset = end;
+        if write_completed {
+            continue;
         }
     }
 
     let _ = stream.finish();
-    pending.map_or(FrameSendResult::Complete, FrameSendResult::Superseded)
+    pending.map_or(FrameSendResult::Complete, |frame| FrameSendResult::Superseded {
+        frame,
+        needs_recovery: dropped_frames,
+        recovery_requested: false,
+    })
 }
 
 async fn read_commands(
@@ -515,6 +581,15 @@ mod tests {
             false,
             now + FRAME_RESET_IDR_COOLDOWN
         ));
+    }
+
+    #[test]
+    fn recovery_requests_share_the_reset_rate_limit() {
+        let now = Instant::now();
+        let mut policy = FrameResetPolicy::default();
+        assert!(policy.should_request_idr(now));
+        assert!(!policy.should_request_idr(now));
+        assert!(policy.should_request_idr(now + FRAME_RESET_IDR_COOLDOWN));
     }
 
     #[test]

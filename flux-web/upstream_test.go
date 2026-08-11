@@ -84,11 +84,17 @@ func TestPacingScheduleWithoutTargetDoesNotAddDelay(t *testing.T) {
 	}
 }
 
-func TestAbandonedPacketCountTracksSupersededRemainder(t *testing.T) {
-	if got := abandonedPacketCount(3, 10); got != 7 {
-		t.Fatalf("abandonedPacketCount(3, 10) = %d, want 7", got)
-	}
-	if got := abandonedPacketCount(10, 10); got != 0 {
-		t.Fatalf("completed frame has %d abandoned packets", got)
+func TestAbandonedFrameDoesNotOveradvanceRTPClock(t *testing.T) {
+	firstTicks, remainder := consumeRTPDuration(16*time.Millisecond, 0)
+	secondTicks, remainder := consumeRTPDuration(16*time.Millisecond, remainder)
+	combinedTicks, combinedRemainder := consumeRTPDuration(32*time.Millisecond, 0)
+	if firstTicks+secondTicks != combinedTicks || remainder != combinedRemainder {
+		t.Fatalf(
+			"abandoned-frame timeline = (%d, %v), direct timeline = (%d, %v)",
+			firstTicks+secondTicks,
+			remainder,
+			combinedTicks,
+			combinedRemainder,
+		)
 	}
 }
