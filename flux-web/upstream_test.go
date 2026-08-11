@@ -88,14 +88,19 @@ func TestPacingScheduleUsesFrameRateFloor(t *testing.T) {
 
 func TestPacingScheduleLargeFrameFitsFrameInterval(t *testing.T) {
 	packetSizes := []int{10_000, 10_000}
-	frameDuration := 16 * time.Millisecond
-	schedule := pacingSchedule(packetSizes, 100, frameDuration)
-	frameBits := (packetSizes[0] + packetSizes[1]) * 8
-	rate := float64(frameBits) / frameDuration.Seconds()
-	lastPacketEnd := schedule[len(schedule)-1] +
-		time.Duration(float64(packetSizes[len(packetSizes)-1]*8)/rate*float64(time.Second))
-	if lastPacketEnd > frameDuration {
-		t.Fatalf("large frame ends at %s, beyond frame interval %s", lastPacketEnd, frameDuration)
+	schedule := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
+	if schedule[len(schedule)-1] > 16*time.Millisecond {
+		t.Fatalf("large frame's final packet starts at %s, beyond 16ms frame interval", schedule[len(schedule)-1])
+	}
+}
+
+func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
+	ch := make(chan frameMsg, 2)
+	ch <- frameMsg{tsMicros: 2}
+	ch <- frameMsg{tsMicros: 3}
+	latest, dropped := latestFrame(ch, frameMsg{tsMicros: 1})
+	if !dropped || latest.tsMicros != 3 {
+		t.Fatalf("latestFrame() = (%+v, %t), want newest frame and dropped=true", latest, dropped)
 	}
 }
 

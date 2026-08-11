@@ -82,13 +82,15 @@ func assignSequenceNumber(packet *rtp.Packet, next *uint16) {
 	*next = *next + 1
 }
 
-func latestFrame(ch <-chan frameMsg, current frameMsg) frameMsg {
+func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool) {
+	dropped := false
 	for {
 		select {
 		case newer := <-ch:
 			current = newer
+			dropped = true
 		default:
-			return current
+			return current, dropped
 		}
 	}
 }
@@ -480,11 +482,18 @@ func (u *machineUpstream) framePusher() {
 		case <-u.stopChan:
 			return
 		case msg := <-u.frameChan:
-			msg = latestFrame(u.frameChan, msg)
+			var dropped bool
+			msg, dropped = latestFrame(u.frameChan, msg)
 			idr := isIDRFrame(msg.data)
 			sess := u.currentSession()
 			if sess == nil || sess.VideoTrack == nil {
 				continue
+			}
+			if dropped {
+				sess.needsIDR = true
+				if u.requestIDR() {
+					log.Printf("[webrtc:%s] discarded queued frames for newer frame; requesting IDR", u.id)
+				}
 			}
 			sampleCount++
 			// New session: skip P-frames until the next live IDR arrives.
@@ -579,7 +588,7 @@ func (u *machineUpstream) writePacedPackets(
 						default:
 						}
 					}
-					latest := latestFrame(u.frameChan, next)
+					latest, _ := latestFrame(u.frameChan, next)
 					return &latest, i
 				case <-timer.C:
 				}
