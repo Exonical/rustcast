@@ -279,6 +279,64 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
     status
 }
 
+fn prefer_discrete_render_adapter(adapter: idd::IDDCX_ADAPTER) {
+    let available = unsafe { idd::idd_cx_adapter_set_render_adapter_available() };
+    if !available {
+        wdk::println!(
+            "[FluxIdd] Render adapter preference skipped: IddCxAdapterSetRenderAdapter unavailable"
+        );
+        return;
+    }
+
+    let candidates = match swapchain::choose_render_adapter() {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            wdk::println!(
+                "[FluxIdd] Render adapter preference skipped: DXGI enumeration failed: {}",
+                error
+            );
+            return;
+        }
+    };
+    if candidates.len() <= 1 {
+        wdk::println!(
+            "[FluxIdd] Render adapter preference skipped: found {} usable hardware adapter(s); need at least 2",
+            candidates.len()
+        );
+        return;
+    }
+
+    let preferred = &candidates[0];
+    swapchain::log_render_adapter(preferred);
+    let preferred_luid = idd::LUID {
+        LowPart: preferred.luid.LowPart,
+        HighPart: preferred.luid.HighPart,
+    };
+    let args = idd::IDARG_IN_ADAPTERSETRENDERADAPTER {
+        PreferredRenderAdapter: preferred_luid,
+    };
+    wdk::println!(
+        "[FluxIdd] Render adapter preference attempted: {} (LUID=0x{:016X})",
+        preferred.name,
+        preferred.luid_value()
+    );
+    let status = unsafe { idd::IddCxAdapterSetRenderAdapter(adapter, &args) };
+    if status >= 0 {
+        wdk::println!(
+            "[FluxIdd] Render adapter preference succeeded: requested {} (LUID=0x{:016X})",
+            preferred.name,
+            preferred.luid_value()
+        );
+    } else {
+        wdk::println!(
+            "[FluxIdd] Render adapter preference failed: requested {} (LUID=0x{:016X}), status=0x{:08X}; continuing with Windows default",
+            preferred.name,
+            preferred.luid_value(),
+            status as u32
+        );
+    }
+}
+
 pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTATUS {
     let (adapter, old_preferred) = {
         let mut state = STATE.lock().unwrap();
@@ -495,6 +553,14 @@ extern "C" fn evt_adapter_init_finished(
     if init_status >= 0 {
         state.adapter = adapter;
     }
+    let adapter_ready = state.adapter_ready;
+    drop(state);
+    if adapter_ready {
+        // Adapter init is complete here and monitors are only added later by
+        // the plug-in IOCTL. This call performs no wait, so it does not
+        // reintroduce the callback deadlock fixed in the adapter lifecycle.
+        prefer_discrete_render_adapter(adapter);
+    }
     // Monitor is plugged in on IOCTL request, not at adapter init.
     STATUS_SUCCESS
 }
@@ -595,6 +661,12 @@ extern "C" fn evt_monitor_assign_swapchain(
     in_args: *const idd::IDARG_IN_SETSWAPCHAIN,
 ) -> NTSTATUS {
     let in_args = unsafe { &*in_args };
+    let render_adapter_luid = u64::from(in_args.RenderAdapterLuid.LowPart)
+        | ((in_args.RenderAdapterLuid.HighPart as i64 as u64) << 32);
+    wdk::println!(
+        "[FluxIdd] Swap-chain assigned RenderAdapterLuid=0x{:016X}",
+        render_adapter_luid
+    );
     let previous_processor = {
         let mut state = STATE.lock().unwrap();
         state.processor.take()

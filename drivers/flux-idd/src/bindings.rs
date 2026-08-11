@@ -35,6 +35,19 @@ macro_rules! iddcx_call {
     };
 }
 
+macro_rules! iddcx_function_available {
+    ($pfn:ident @ $idx:ident) => {{
+        unsafe {
+            (*(&raw const IddFunctions))
+                .as_ptr()
+                .add($idx as usize)
+                .cast::<$pfn>()
+                .read()
+                .is_some()
+        }
+    }};
+}
+
 iddcx_call!(IddCxDeviceInitConfig: PFN_IDDCXDEVICEINITCONFIG @ _IDDFUNCENUM_IddCxDeviceInitConfigTableIndex(
     device_init: *mut WDFDEVICE_INIT,
     config: *const IDD_CX_CLIENT_CONFIG,
@@ -46,6 +59,22 @@ iddcx_call!(IddCxAdapterInitAsync: PFN_IDDCXADAPTERINITASYNC @ _IDDFUNCENUM_IddC
     in_args: *const IDARG_IN_ADAPTER_INIT,
     out_args: *mut IDARG_OUT_ADAPTER_INIT,
 ));
+iddcx_call!(IddCxAdapterSetRenderAdapter: PFN_IDDCXADAPTERSETRENDERADAPTER @ _IDDFUNCENUM_IddCxAdapterSetRenderAdapterTableIndex(
+    adapter: IDDCX_ADAPTER,
+    in_args: *const IDARG_IN_ADAPTERSETRENDERADAPTER,
+));
+
+/// Rust equivalent of the IddCx `IDD_IS_FUNCTION_AVAILABLE` macro.
+///
+/// The macro is defined in the WDK header and is not emitted by bindgen. It
+/// checks the function table entry so a 1.4-built driver can run on older
+/// IddCx versions without dereferencing an unavailable entry point.
+pub unsafe fn idd_cx_adapter_set_render_adapter_available() -> bool {
+    iddcx_function_available!(
+        PFN_IDDCXADAPTERSETRENDERADAPTER @
+        _IDDFUNCENUM_IddCxAdapterSetRenderAdapterTableIndex
+    )
+}
 iddcx_call!(IddCxMonitorCreate: PFN_IDDCXMONITORCREATE @ _IDDFUNCENUM_IddCxMonitorCreateTableIndex(
     adapter: IDDCX_ADAPTER,
     in_args: *const IDARG_IN_MONITORCREATE,
