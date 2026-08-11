@@ -7,21 +7,95 @@ use core::ffi::c_void;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use windows::core::Interface;
 use windows::Win32::Foundation::{HANDLE, HMODULE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
+    ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIAdapter1, IDXGIDevice, IDXGIFactory5,
+    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIDevice, IDXGIFactory5,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
+use windows::core::Interface;
 
 use crate::bindings as idd;
 
 const E_PENDING: i32 = 0x8000000Au32 as i32;
+
+pub struct RenderAdapterCandidate {
+    pub index: u32,
+    pub luid: LUID,
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub dedicated_video_memory: u64,
+}
+
+impl RenderAdapterCandidate {
+    pub fn luid_value(&self) -> u64 {
+        u64::from(self.luid.LowPart) | ((self.luid.HighPart as i64 as u64) << 32)
+    }
+
+    pub fn vram_mb(&self) -> u64 {
+        self.dedicated_video_memory / (1024 * 1024)
+    }
+}
+
+/// Enumerate hardware adapters and choose the one with the most dedicated VRAM.
+///
+/// Software adapters are excluded. The caller deliberately decides whether a
+/// single remaining adapter is enough to override Windows' default preference.
+pub fn choose_render_adapter() -> windows::core::Result<Vec<RenderAdapterCandidate>> {
+    unsafe {
+        let factory: IDXGIFactory5 = CreateDXGIFactory2(Default::default())?;
+        let mut candidates = Vec::new();
+        let mut adapter_index = 0u32;
+
+        loop {
+            let adapter = match factory.EnumAdapters1(adapter_index) {
+                Ok(adapter) => adapter,
+                Err(error) if error.code().0 == 0x887A0002u32 as i32 => break,
+                Err(error) => return Err(error),
+            };
+            let desc = adapter.GetDesc1()?;
+            let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+            let name = String::from_utf16_lossy(&desc.Description[..name_len]);
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                wdk::println!(
+                    "[FluxIdd] DXGI Adapter {}: {} skipped (software adapter)",
+                    adapter_index,
+                    name
+                );
+            } else {
+                candidates.push(RenderAdapterCandidate {
+                    index: adapter_index,
+                    luid: desc.AdapterLuid,
+                    name,
+                    vendor_id: desc.VendorId,
+                    device_id: desc.DeviceId,
+                    dedicated_video_memory: desc.DedicatedVideoMemory as u64,
+                });
+            }
+            adapter_index += 1;
+        }
+
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.dedicated_video_memory));
+        Ok(candidates)
+    }
+}
+
+pub fn log_render_adapter(candidate: &RenderAdapterCandidate) {
+    wdk::println!(
+        "[FluxIdd] DXGI Adapter {}: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, VRAM={} MB)",
+        candidate.index,
+        candidate.name,
+        candidate.luid_value(),
+        candidate.vendor_id,
+        candidate.device_id,
+        candidate.vram_mb(),
+    );
+}
 
 struct D3DDevice {
     #[allow(dead_code)]
