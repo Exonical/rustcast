@@ -35,6 +35,22 @@ macro_rules! iddcx_call {
     };
 }
 
+macro_rules! iddcx_call_void {
+    ($name:ident: $pfn:ident @ $idx:ident ( $($arg:ident : $ty:ty),* $(,)? )) => {
+        pub unsafe fn $name($($arg: $ty),*) {
+            unsafe {
+                let f = (*(&raw const IddFunctions))
+                    .as_ptr()
+                    .add($idx as usize)
+                    .cast::<$pfn>()
+                    .read()
+                    .expect(concat!(stringify!($name), " missing from IddCx function table"));
+                f(IddDriverGlobals, $($arg),*);
+            }
+        }
+    };
+}
+
 macro_rules! iddcx_function_available {
     ($pfn:ident @ $idx:ident) => {{
         unsafe {
@@ -59,7 +75,7 @@ iddcx_call!(IddCxAdapterInitAsync: PFN_IDDCXADAPTERINITASYNC @ _IDDFUNCENUM_IddC
     in_args: *const IDARG_IN_ADAPTER_INIT,
     out_args: *mut IDARG_OUT_ADAPTER_INIT,
 ));
-iddcx_call!(IddCxAdapterSetRenderAdapter: PFN_IDDCXADAPTERSETRENDERADAPTER @ _IDDFUNCENUM_IddCxAdapterSetRenderAdapterTableIndex(
+iddcx_call_void!(IddCxAdapterSetRenderAdapter: PFN_IDDCXADAPTERSETRENDERADAPTER @ _IDDFUNCENUM_IddCxAdapterSetRenderAdapterTableIndex(
     adapter: IDDCX_ADAPTER,
     in_args: *const IDARG_IN_ADAPTERSETRENDERADAPTER,
 ));

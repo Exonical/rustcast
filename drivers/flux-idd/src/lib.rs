@@ -320,21 +320,16 @@ fn prefer_discrete_render_adapter(adapter: idd::IDDCX_ADAPTER) {
         preferred.name,
         preferred.luid_value()
     );
-    let status = unsafe { idd::IddCxAdapterSetRenderAdapter(adapter, &args) };
-    if status >= 0 {
-        wdk::println!(
-            "[FluxIdd] Render adapter preference succeeded: requested {} (LUID=0x{:016X})",
-            preferred.name,
-            preferred.luid_value()
-        );
-    } else {
-        wdk::println!(
-            "[FluxIdd] Render adapter preference failed: requested {} (LUID=0x{:016X}), status=0x{:08X}; continuing with Windows default",
-            preferred.name,
-            preferred.luid_value(),
-            status as u32
-        );
-    }
+    // IddCxAdapterSetRenderAdapter has a VOID ABI, so the API provides no
+    // status to inspect. Returning from the call is the only driver-visible
+    // indication that the request was accepted; Windows reports the actual
+    // choice later through RenderAdapterLuid.
+    unsafe { idd::IddCxAdapterSetRenderAdapter(adapter, &args) };
+    wdk::println!(
+        "[FluxIdd] Render adapter preference call returned: requested {} (LUID=0x{:016X}); awaiting Windows assignment",
+        preferred.name,
+        preferred.luid_value()
+    );
 }
 
 pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTATUS {
