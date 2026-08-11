@@ -529,9 +529,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				continue
 			}
 
-			if !upstream.requestInitialIDR(next) {
-				log.Printf("[ws] upstream command channel full, dropped IDR request")
-			} else {
+			if upstream.requestInitialIDR(next) {
 				log.Printf("[ws] requested initial IDR from upstream")
 			}
 			answerData, _ := json.Marshal(map[string]string{"sd": answerSDP})

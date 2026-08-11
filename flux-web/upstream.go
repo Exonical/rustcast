@@ -215,6 +215,10 @@ func (u *machineUpstream) requestInitialIDR(session *Session) bool {
 		return false
 	}
 	session.initialIDRRequested = true
+	// Opening the gate window here too: the initial keyframe is the most
+	// expensive one, so a drop observed while it drains must not immediately
+	// ask for another.
+	u.idrGate.last = u.idrGate.now()
 	return true
 }
 
