@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/quic-go/quic-go"
 )
@@ -156,6 +157,17 @@ func (u *machineUpstream) clearSession(session *Session) {
 	u.mu.Unlock()
 }
 
+func (u *machineUpstream) sendResolutionStatus(data []byte) {
+	sess := u.currentSession()
+	if sess == nil || sess.writer == nil || !json.Valid(data) {
+		return
+	}
+	resp, err := json.Marshal(WSMessage{Type: "resolution-status", Data: data})
+	if err == nil {
+		_ = sess.writer.write(websocket.TextMessage, resp)
+	}
+}
+
 func (u *machineUpstream) connectFrameServer() {
 	for {
 		select {
@@ -278,6 +290,8 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 				continue
 			}
 			u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
+		case 0x03:
+			u.sendResolutionStatus(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -379,6 +393,8 @@ func (u *machineUpstream) connectQUIC() error {
 			if json.Valid(data) {
 				u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
 			}
+		case 0x03:
+			u.sendResolutionStatus(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}

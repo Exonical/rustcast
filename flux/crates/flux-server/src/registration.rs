@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeStatus {
     pub display_name: Option<String>,
+    pub captured_virtual_display: Option<bool>,
     pub encoder_backend: Option<String>,
     pub capture_width: u32,
     pub capture_height: u32,
@@ -36,6 +37,7 @@ struct Registration {
     width: u32,
     height: u32,
     target_fps: u32,
+    default_fps: u32,
     target_bitrate_kbps: u32,
 }
 
@@ -102,6 +104,7 @@ pub fn start(
             .map(|display: VirtualDisplayConfig| display.height)
             .unwrap_or(config.video.max_height),
         target_fps: config.video.max_fps.min(144),
+        default_fps: config.video.default_fps_cap.min(config.video.max_fps).min(144),
         target_bitrate_kbps: 0,
     };
     let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -129,6 +132,9 @@ pub fn start(
                 current.display_name = snapshot.display_name.clone().unwrap_or_default();
                 if let Some(backend) = &snapshot.encoder_backend {
                     current.encoder_backend = backend.clone();
+                }
+                if let Some(virtual_display) = snapshot.captured_virtual_display {
+                    current.virtual_display = virtual_display;
                 }
                 if snapshot.encode_width != 0 {
                     current.width = snapshot.encode_width;

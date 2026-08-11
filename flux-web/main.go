@@ -68,12 +68,16 @@ type Session struct {
 	release        func()
 	releaseOnce    sync.Once
 	cursorDone     chan struct{}
+	writer         *wsWriter
 }
 
 type wsWriter struct {
 	mu sync.Mutex
 	ws *websocket.Conn
 }
+
+const signalingIdleTimeout = 45 * time.Second
+const signalingPingInterval = 15 * time.Second
 
 func (w *wsWriter) write(messageType int, payload []byte) error {
 	w.mu.Lock()
@@ -341,6 +345,8 @@ type WSMessage struct {
 type OfferData struct {
 	SDP       string `json:"sd"`
 	MachineID string `json:"machine_id,omitempty"`
+	Width     uint32 `json:"width,omitempty"`
+	Height    uint32 `json:"height,omitempty"`
 }
 
 func handleSignaling(c *gin.Context, registry *machineRegistry) {
@@ -351,6 +357,30 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 	}
 	defer ws.Close()
 	writer := &wsWriter{ws: ws}
+	_ = ws.SetReadDeadline(time.Now().Add(signalingIdleTimeout))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(signalingIdleTimeout))
+	})
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(signalingPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := ws.WriteControl(
+					websocket.PingMessage,
+					nil,
+					time.Now().Add(5*time.Second),
+				); err != nil {
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
 
 	log.Printf("[ws] client connected: %s", c.ClientIP())
 	var session *Session
@@ -404,6 +434,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 
 			next.machine = upstream
 			next.release = func() { registry.release(upstream) }
+			next.writer = writer
 
 			if old := upstream.bindSession(next); old != nil {
 				old.releaseNow()
@@ -414,6 +445,35 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				session.PeerConnection.Close()
 			}
 			session = next
+			if offerData.Width != 0 || offerData.Height != 0 {
+				if offerData.Width < 640 || offerData.Height < 480 ||
+					offerData.Width > 2560 || offerData.Height > 1440 ||
+					offerData.Width%2 != 0 || offerData.Height%2 != 0 {
+					next.releaseNow()
+					next.PeerConnection.Close()
+					sendWSError(writer, "Invalid resolution; use even dimensions from 640x480 through 2560x1440")
+					session = nil
+					continue
+				}
+				command := make([]byte, 5)
+				command[0] = 0x06
+				binary.BigEndian.PutUint16(command[1:3], uint16(offerData.Width))
+				binary.BigEndian.PutUint16(command[3:5], uint16(offerData.Height))
+				if !upstream.send(command) {
+					next.releaseNow()
+					next.PeerConnection.Close()
+					sendWSError(writer, "Resolution change could not be queued")
+					session = nil
+					continue
+				}
+				status, _ := json.Marshal(map[string]any{
+					"state":  "transitioning",
+					"width":  offerData.Width,
+					"height": offerData.Height,
+				})
+				resp, _ := json.Marshal(WSMessage{Type: "resolution-status", Data: status})
+				_ = writer.write(websocket.TextMessage, resp)
+			}
 			go forwardCursorUpdates(writer, next)
 			next.needsIDR = true
 
