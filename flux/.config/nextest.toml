@@ -2,4 +2,4 @@
 fail-fast = false
 
 [profile.ci.junit]
-path = "target/junit/rust.xml"
+path = "junit.xml"

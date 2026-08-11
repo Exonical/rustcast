@@ -7,7 +7,7 @@ suite="${1:-all}"
 
 run_rust() {
   (cd flux && cargo nextest run --workspace --profile ci)
-  cp flux/target/nextest/target/junit/rust.xml target/junit/rust.xml
+  cp flux/target/nextest/ci/junit.xml target/junit/rust.xml
   (cd flux && cargo clippy --workspace --all-targets)
 }
 
@@ -23,7 +23,7 @@ run_go() {
 }
 
 run_ui() {
-  (cd flux-web/ui && pnpm install --frozen-lockfile && pnpm lint && pnpm test && pnpm run test:junit && pnpm build)
+  (cd flux-web/ui && pnpm install --frozen-lockfile && pnpm lint && pnpm run test:junit && pnpm build)
 }
 
 case "$suite" in

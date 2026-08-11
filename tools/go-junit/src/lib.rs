@@ -1,6 +1,6 @@
 use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::Path;
 
@@ -30,6 +30,7 @@ struct CaseData {
 pub fn convert<R: BufRead>(reader: R) -> Result<(Report, bool), serde_json::Error> {
     let mut cases = BTreeMap::<(String, String), CaseData>::new();
     let mut package_failures = BTreeMap::<String, String>::new();
+    let mut failed_packages = BTreeSet::new();
 
     for line in reader.lines() {
         let line = line.map_err(serde_json::Error::io)?;
@@ -43,6 +44,9 @@ pub fn convert<R: BufRead>(reader: R) -> Result<(Report, bool), serde_json::Erro
                     .entry(event.package.clone())
                     .or_default()
                     .push_str(event.output.as_deref().unwrap_or(""));
+            }
+            if event.action == "fail" {
+                failed_packages.insert(event.package.clone());
             }
             continue;
         }
@@ -67,6 +71,9 @@ pub fn convert<R: BufRead>(reader: R) -> Result<(Report, bool), serde_json::Erro
     }
 
     for (package, output) in package_failures {
+        if !failed_packages.contains(&package) {
+            continue;
+        }
         if !cases
             .keys()
             .any(|(case_package, _)| case_package == &package)
@@ -160,5 +167,17 @@ mod tests {
         assert_eq!(report.tests, 1);
         assert_eq!(report.failures, 1);
         assert!(report.to_string().unwrap().contains("package build"));
+    }
+
+    #[test]
+    fn package_without_test_files_is_not_a_failure() {
+        let fixture = r#"{"Action":"output","Package":"example/gt/emptypkg","Output":"?   \texample/gt/emptypkg\t[no test files]\n"}
+{"Action":"skip","Package":"example/gt/emptypkg","Elapsed":0}
+"#;
+        let (report, failed) = convert(Cursor::new(fixture)).unwrap();
+        assert!(!failed);
+        assert_eq!(report.tests, 0);
+        assert_eq!(report.failures, 0);
+        assert!(!report.to_string().unwrap().contains("package build"));
     }
 }

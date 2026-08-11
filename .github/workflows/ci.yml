@@ -57,10 +57,25 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm llvm-14 lld libclang-dev
+          sudo apt-get install -y clang llvm lld libclang-dev
           cargo install cargo-xwin --locked
           rustup target add x86_64-pc-windows-msvc
-          sudo ln -sf /usr/lib/llvm-14/bin/llvm-lib /usr/local/bin/llvm-lib
+          llvm_bindir="$(llvm-config --bindir 2>/dev/null || true)"
+          llvm_lib="${llvm_bindir}/llvm-lib"
+          if [ ! -x "$llvm_lib" ]; then
+            llvm_lib="$(
+              for candidate in /usr/lib/llvm-*/bin/llvm-lib; do
+                if [ -x "$candidate" ]; then
+                  printf '%s\n' "$candidate"
+                fi
+              done | sort -V | tail -n 1
+            )"
+          fi
+          if [ -z "$llvm_lib" ] || [ ! -x "$llvm_lib" ]; then
+            echo "Unable to locate llvm-lib" >&2
+            exit 1
+          fi
+          sudo ln -sf "$llvm_lib" /usr/local/bin/llvm-lib
       - name: Windows check
         run: ./ci/run.sh windows
 
