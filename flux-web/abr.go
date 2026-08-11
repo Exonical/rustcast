@@ -174,6 +174,9 @@ func (a *abrState) onEstimate(kbps uint32) {
 }
 
 func gccEstimateIsMaterial(current, next, ceiling uint32) bool {
+	if current == next {
+		return false
+	}
 	if next == abrMinKbps || ceiling != 0 && next == ceiling {
 		return true
 	}

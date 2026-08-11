@@ -1,12 +1,36 @@
 package main
 
 import (
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
+
+func TestSessionMachineAccessIsSynchronized(t *testing.T) {
+	session := &Session{}
+	machine := &machineUpstream{
+		abr: &abrState{commandChan: make(chan []byte, 256)},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			session.setMachine(machine)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			session.onGCCEstimate(5_000 + uint32(i))
+		}
+	}()
+	wg.Wait()
+}
 
 func TestMediaEngineInterceptorsSendTWCCLoopback(t *testing.T) {
 	mediaEngine, interceptors, _, err := newMediaEngineAndInterceptors()

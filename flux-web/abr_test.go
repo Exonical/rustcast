@@ -64,6 +64,31 @@ func TestABRGCCEstimateSuppressesSmallAndRapidUpdates(t *testing.T) {
 	}
 }
 
+func TestABRGCCEstimateDoesNotRepeatClampCommands(t *testing.T) {
+	floorCommands := make(chan []byte, 4)
+	floor := &abrState{
+		commandChan:   floorCommands,
+		targetKbps:    abrMinKbps,
+		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
+	}
+	floor.onEstimate(500)
+	if len(floorCommands) != 0 {
+		t.Fatal("floor estimate repeated the current target")
+	}
+
+	ceilingCommands := make(chan []byte, 4)
+	ceiling := &abrState{
+		commandChan:   ceilingCommands,
+		targetKbps:    10_000,
+		ceilingKbps:   10_000,
+		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
+	}
+	ceiling.onEstimate(20_000)
+	if len(ceilingCommands) != 0 {
+		t.Fatal("ceiling estimate repeated the current target")
+	}
+}
+
 func TestABRReportsDoNotSteerGCCTarget(t *testing.T) {
 	commands := make(chan []byte, 4)
 	state := &abrState{

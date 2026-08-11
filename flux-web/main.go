@@ -74,6 +74,7 @@ type Session struct {
 	initialIDRRequested bool
 	hasStarted          bool
 	machine             *machineUpstream
+	machineMu           sync.RWMutex
 	release             func()
 	releaseOnce         sync.Once
 	sessionDone         chan struct{}
@@ -299,11 +300,13 @@ func newSession() (*Session, error) {
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack, Packetizer: packetizer}
 	session.sessionDone = make(chan struct{})
 	session.bwe = bandwidthEstimator()
-	session.bwe.OnTargetBitrateChange(func(bitrate int) {
-		if bitrate > 0 {
-			session.onGCCEstimate(uint32(bitrate / 1000))
-		}
-	})
+	if session.bwe != nil {
+		session.bwe.OnTargetBitrateChange(func(bitrate int) {
+			if bitrate > 0 {
+				session.onGCCEstimate(uint32(bitrate / 1000))
+			}
+		})
+	}
 	go logBandwidthEstimate(session)
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
@@ -329,16 +332,29 @@ func newSession() (*Session, error) {
 }
 
 func (s *Session) onGCCEstimate(kbps uint32) {
-	if s.machine == nil {
+	machine := s.getMachine()
+	if machine == nil {
 		return
 	}
-	s.machine.abr.onEstimate(kbps)
+	machine.abr.onEstimate(kbps)
+}
+
+func (s *Session) setMachine(machine *machineUpstream) {
+	s.machineMu.Lock()
+	s.machine = machine
+	s.machineMu.Unlock()
+}
+
+func (s *Session) getMachine() *machineUpstream {
+	s.machineMu.RLock()
+	defer s.machineMu.RUnlock()
+	return s.machine
 }
 
 func (s *Session) releaseNow() {
 	s.releaseOnce.Do(func() {
-		if s.machine != nil {
-			s.machine.clearSession(s)
+		if machine := s.getMachine(); machine != nil {
+			machine.clearSession(s)
 		}
 		if s.release != nil {
 			s.release()
@@ -370,8 +386,8 @@ func logBandwidthEstimate(session *Session) {
 		case <-ticker.C:
 			stats := session.bwe.GetStats()
 			var abrTarget uint32
-			if session.machine != nil {
-				abrTarget = session.machine.abr.targetBitrateKbps()
+			if machine := session.getMachine(); machine != nil {
+				abrTarget = machine.abr.targetBitrateKbps()
 			}
 			log.Printf("[bwe] gcc=%d kbps abr=%d kbps loss=%.1f%% delay=%.1fms (threshold %.1fms) usage=%v state=%v",
 				session.bwe.GetTargetBitrate()/1000,
@@ -419,20 +435,25 @@ func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
 			return
 		}
 		for _, pkt := range packets {
-			if rr, ok := pkt.(*rtcp.ReceiverReport); ok && session.machine != nil {
+			if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
+				machine := session.getMachine()
+				if machine == nil {
+					continue
+				}
 				for _, report := range rr.Reports {
-					session.machine.abr.onReceiverReport(float64(report.FractionLost) / 256.0)
+					machine.abr.onReceiverReport(float64(report.FractionLost) / 256.0)
 					if rtt := rttFromReport(report, time.Now()); rtt > 0 {
-						session.machine.abr.onRTTSample(rtt)
+						machine.abr.onRTTSample(rtt)
 					}
 				}
 			}
 			switch pkt.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-				if session.machine == nil {
+				machine := session.getMachine()
+				if machine == nil {
 					continue
 				}
-				if !session.machine.requestIDR(idrReasonViewerPLI) {
+				if !machine.requestIDR(idrReasonViewerPLI) {
 					continue
 				}
 				log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
@@ -570,10 +591,12 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				continue
 			}
 
-			next.machine = upstream
+			next.setMachine(upstream)
 			next.release = func() { registry.release(upstream) }
 			next.writer = writer
-			next.onGCCEstimate(uint32(next.bwe.GetTargetBitrate() / 1000))
+			if next.bwe != nil {
+				next.onGCCEstimate(uint32(next.bwe.GetTargetBitrate() / 1000))
+			}
 
 			if old := upstream.bindSession(next); old != nil {
 				old.releaseNow()
@@ -656,7 +679,11 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			_ = writer.write(websocket.TextMessage, resp)
 
 		case "input":
-			if session == nil || session.machine == nil {
+			machine := (*machineUpstream)(nil)
+			if session != nil {
+				machine = session.getMachine()
+			}
+			if machine == nil {
 				sendWSError(writer, "No active machine session")
 				continue
 			}
@@ -668,11 +695,15 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			packet[0] = 0x02
 			binary.BigEndian.PutUint32(packet[1:5], uint32(len(payload)))
 			copy(packet[5:], payload)
-			if !session.machine.send(packet) {
+			if !machine.send(packet) {
 				log.Printf("[ws] upstream command channel full, dropped input event")
 			}
 		case "quality":
-			if session == nil || session.machine == nil {
+			machine := (*machineUpstream)(nil)
+			if session != nil {
+				machine = session.getMachine()
+			}
+			if machine == nil {
 				sendWSError(writer, "No active machine session")
 				continue
 			}
@@ -684,7 +715,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				sendWSError(writer, "Quality must be 0-10 and FPS must be 0-144")
 				continue
 			}
-			if !session.machine.send([]byte{0x05, control.Level, control.FPS}) {
+			if !machine.send([]byte{0x05, control.Level, control.FPS}) {
 				log.Printf("[ws] upstream command channel full, dropped quality/FPS control")
 			}
 		default:
@@ -703,19 +734,21 @@ func forwardCursorUpdates(writer *wsWriter, session *Session) {
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 	var latest *cursorMsg
-	if session.machine != nil {
-		session.machine.mu.Lock()
-		if session.machine.lastCursor != nil {
-			copy := *session.machine.lastCursor
-			latest = &copy
-		}
-		session.machine.mu.Unlock()
+	machine := session.getMachine()
+	if machine == nil {
+		return
 	}
+	machine.mu.Lock()
+	if machine.lastCursor != nil {
+		copy := *machine.lastCursor
+		latest = &copy
+	}
+	machine.mu.Unlock()
 	for {
 		select {
 		case <-session.sessionDone:
 			return
-		case msg := <-session.machine.cursorChan:
+		case msg := <-machine.cursorChan:
 			latest = &msg
 		case <-ticker.C:
 			if latest == nil {
