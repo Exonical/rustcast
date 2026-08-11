@@ -8,80 +8,100 @@ import (
 	"github.com/pion/rtcp"
 )
 
-func TestABRIdleLossRecoversToSenderTarget(t *testing.T) {
+func TestABRGCCEstimateClampsToFloorAndCeiling(t *testing.T) {
 	commands := make(chan []byte, 4)
-	state := &abrState{commandChan: commands}
-	state.setSenderTarget(10_000)
-	state.measuredKbps = 20 // Idle heartbeat traffic must not define capacity.
-	state.lastDecrease = time.Now().Add(-abrDecreaseCooldown)
+	state := &abrState{commandChan: commands, ceilingKbps: 10_000, lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval)}
 
-	state.onReceiverReport(0.10)
-	if state.targetKbps != 7_000 {
-		t.Fatalf("loss target = %d, want 7000", state.targetKbps)
+	state.onEstimate(500)
+	if state.targetKbps != abrMinKbps {
+		t.Fatalf("floor target = %d, want %d", state.targetKbps, abrMinKbps)
 	}
-	if state.ceilingKbps != 10_000 {
-		t.Fatalf("loss ceiling = %d, want sender target 10000", state.ceilingKbps)
-	}
-	command := <-commands
-	if got := binary.BigEndian.Uint32(command[1:]); got != 7_000 {
-		t.Fatalf("loss command = %d, want 7000", got)
+	if got := binary.BigEndian.Uint32((<-commands)[1:]); got != abrMinKbps {
+		t.Fatalf("floor command = %d, want %d", got, abrMinKbps)
 	}
 
-	state.cleanSince = time.Now().Add(-abrCleanBeforeRaise)
-	state.lastIncrease = time.Time{}
-	state.onReceiverReport(0)
-	if state.targetKbps != 8_049 {
-		t.Fatalf("recovery target = %d, want 8049", state.targetKbps)
+	state.lastGCCUpdate = time.Now().Add(-abrGCCUpdateInterval)
+	state.onEstimate(20_000)
+	if state.targetKbps != 10_000 {
+		t.Fatalf("ceiling target = %d, want 10000", state.targetKbps)
 	}
-	if state.ceilingKbps != 10_000 {
-		t.Fatalf("recovery ceiling = %d, want sender target 10000", state.ceilingKbps)
-	}
-
-	state.setSenderTarget(10_000) // Repeated heartbeat must not undo adaptation.
-	if state.targetKbps != 8_049 {
-		t.Fatalf("repeated sender report reset target to %d", state.targetKbps)
+	if got := binary.BigEndian.Uint32((<-commands)[1:]); got != 10_000 {
+		t.Fatalf("ceiling command = %d, want 10000", got)
 	}
 }
 
-func TestABRRTTInflationLowersBitrateAndGatesRecovery(t *testing.T) {
+func TestABRGCCEstimateSuppressesSmallAndRapidUpdates(t *testing.T) {
 	commands := make(chan []byte, 4)
-	state := &abrState{commandChan: commands}
-	state.setSenderTarget(10_000)
-	state.lastDecrease = time.Now().Add(-abrDecreaseCooldown)
-
-	state.onRTTSample(10 * time.Millisecond) // establishes baseline
-	if state.targetKbps != 10_000 {
-		t.Fatalf("baseline sample changed target to %d", state.targetKbps)
+	state := &abrState{
+		commandChan:   commands,
+		targetKbps:    5_000,
+		ceilingKbps:   20_000,
+		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
 	}
 
-	// Sustained inflated RTT converges the EWMA above baseline+threshold.
+	state.onEstimate(5_400)
+	if state.targetKbps != 5_000 {
+		t.Fatalf("small estimate changed target to %d", state.targetKbps)
+	}
+	if len(commands) != 0 {
+		t.Fatal("small estimate emitted a command")
+	}
+
+	state.onEstimate(6_000)
+	if state.targetKbps != 6_000 {
+		t.Fatalf("material estimate target = %d, want 6000", state.targetKbps)
+	}
+	if got := binary.BigEndian.Uint32((<-commands)[1:]); got != 6_000 {
+		t.Fatalf("material command = %d, want 6000", got)
+	}
+
+	state.onEstimate(8_000)
+	if state.targetKbps != 6_000 {
+		t.Fatalf("rapid estimate changed target to %d", state.targetKbps)
+	}
+	if len(commands) != 0 {
+		t.Fatal("rapid estimate emitted a command")
+	}
+}
+
+func TestABRReportsDoNotSteerGCCTarget(t *testing.T) {
+	commands := make(chan []byte, 4)
+	state := &abrState{
+		commandChan: commands,
+		targetKbps:  8_000,
+	}
+
+	state.onReceiverReport(0.50)
+	state.onRTTSample(10 * time.Millisecond)
 	for i := 0; i < 50; i++ {
 		state.onRTTSample(200 * time.Millisecond)
 	}
-	if state.targetKbps != 7_000 {
-		t.Fatalf("inflated RTT target = %d, want 7000", state.targetKbps)
+	if state.targetKbps != 8_000 {
+		t.Fatalf("measurement changed target to %d", state.targetKbps)
 	}
-	command := <-commands
-	if got := binary.BigEndian.Uint32(command[1:]); got != 7_000 {
-		t.Fatalf("RTT command = %d, want 7000", got)
+	if len(commands) != 0 {
+		t.Fatal("measurement emitted a bitrate command")
+	}
+}
+
+func TestABRSenderCeilingOnlyPullsTargetDown(t *testing.T) {
+	commands := make(chan []byte, 4)
+	state := &abrState{commandChan: commands, targetKbps: 8_000}
+
+	state.setSenderTarget(6_000)
+	if state.targetKbps != 6_000 {
+		t.Fatalf("lowered ceiling target = %d, want 6000", state.targetKbps)
+	}
+	if got := binary.BigEndian.Uint32((<-commands)[1:]); got != 6_000 {
+		t.Fatalf("lowered ceiling command = %d, want 6000", got)
 	}
 
-	// Clean loss reports must not raise the bitrate while RTT is still inflated.
-	state.cleanSince = time.Now().Add(-abrCleanBeforeRaise)
-	state.lastIncrease = time.Time{}
-	state.onReceiverReport(0)
-	if state.targetKbps != 7_000 {
-		t.Fatalf("recovery ran during RTT inflation: target = %d", state.targetKbps)
+	state.setSenderTarget(12_000)
+	if state.targetKbps != 6_000 {
+		t.Fatalf("raised ceiling pushed target to %d", state.targetKbps)
 	}
-
-	// Once RTT returns to baseline, recovery proceeds.
-	for i := 0; i < 100; i++ {
-		state.onRTTSample(10 * time.Millisecond)
-	}
-	state.cleanSince = time.Now().Add(-abrCleanBeforeRaise)
-	state.onReceiverReport(0)
-	if state.targetKbps != 8_049 {
-		t.Fatalf("post-drain recovery target = %d, want 8049", state.targetKbps)
+	if len(commands) != 0 {
+		t.Fatal("raised ceiling emitted a command")
 	}
 }
 

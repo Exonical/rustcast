@@ -212,13 +212,17 @@ func newMediaEngineAndInterceptors() (
 		return nil, nil, nil, fmt.Errorf("register default interceptors: %w", err)
 	}
 
-	// Send-side bandwidth estimation over that feedback. It is observational:
-	// pacing stays in the relay's frame pusher (hence the no-op pacer here) and
-	// the encoder target still comes from abrState, so GCC's estimate can be
-	// compared against ours on real links before it is given control.
+	// Send-side bandwidth estimation over that feedback. Pacing stays in the
+	// relay's frame pusher (hence the no-op pacer here), while GCC drives the
+	// encoder target from the per-packet transport feedback.
 	var estimator cc.BandwidthEstimator
 	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		return gcc.NewSendSideBWE(gcc.SendSideBWEPacer(gcc.NewNoOpPacer()))
+		return gcc.NewSendSideBWE(
+			gcc.SendSideBWEInitialBitrate(abrGCCInitialBitrateBps),
+			gcc.SendSideBWEMinBitrate(abrMinKbps*1000),
+			gcc.SendSideBWEMaxBitrate(abrGCCMaxBitrateBps),
+			gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
+		)
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("create congestion controller: %w", err)
@@ -295,6 +299,11 @@ func newSession() (*Session, error) {
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack, Packetizer: packetizer}
 	session.sessionDone = make(chan struct{})
 	session.bwe = bandwidthEstimator()
+	session.bwe.OnTargetBitrateChange(func(bitrate int) {
+		if bitrate > 0 {
+			session.onGCCEstimate(uint32(bitrate / 1000))
+		}
+	})
 	go logBandwidthEstimate(session)
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
@@ -317,6 +326,13 @@ func newSession() (*Session, error) {
 	})
 
 	return session, nil
+}
+
+func (s *Session) onGCCEstimate(kbps uint32) {
+	if s.machine == nil {
+		return
+	}
+	s.machine.abr.onEstimate(kbps)
 }
 
 func (s *Session) releaseNow() {
@@ -557,6 +573,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 			next.machine = upstream
 			next.release = func() { registry.release(upstream) }
 			next.writer = writer
+			next.onGCCEstimate(uint32(next.bwe.GetTargetBitrate() / 1000))
 
 			if old := upstream.bindSession(next); old != nil {
 				old.releaseNow()
