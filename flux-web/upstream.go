@@ -50,18 +50,47 @@ const (
 	pacingIDRInterval    = 500 * time.Millisecond
 )
 
-func pacingSchedule(packetSizes []int, targetKbps uint32) []time.Duration {
+func pacingSchedule(
+	packetSizes []int,
+	targetKbps uint32,
+	frameDuration time.Duration,
+) []time.Duration {
 	schedule := make([]time.Duration, len(packetSizes))
-	if targetKbps == 0 {
+	if len(packetSizes) == 0 || frameDuration <= 0 {
 		return schedule
 	}
-	bitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
+	frameBits := 0
+	for _, size := range packetSizes {
+		frameBits += size * 8
+	}
+	targetBitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
+	frameBitsPerSecond := float64(frameBits) / frameDuration.Seconds()
+	bitsPerSecond := targetBitsPerSecond
+	if bitsPerSecond < frameBitsPerSecond {
+		bitsPerSecond = frameBitsPerSecond
+	}
 	var elapsedSeconds float64
 	for i, size := range packetSizes {
 		schedule[i] = time.Duration(elapsedSeconds * float64(time.Second))
 		elapsedSeconds += float64(size*8) / bitsPerSecond
 	}
 	return schedule
+}
+
+func assignSequenceNumber(packet *rtp.Packet, next *uint16) {
+	packet.Header.SequenceNumber = *next
+	*next = *next + 1
+}
+
+func latestFrame(ch <-chan frameMsg, current frameMsg) frameMsg {
+	for {
+		select {
+		case newer := <-ch:
+			current = newer
+		default:
+			return current
+		}
+	}
 }
 
 func consumeRTPDuration(duration time.Duration, remainder float64) (uint32, float64) {
@@ -451,6 +480,7 @@ func (u *machineUpstream) framePusher() {
 		case <-u.stopChan:
 			return
 		case msg := <-u.frameChan:
+			msg = latestFrame(u.frameChan, msg)
 			idr := isIDRFrame(msg.data)
 			sess := u.currentSession()
 			if sess == nil || sess.VideoTrack == nil {
@@ -482,11 +512,13 @@ func (u *machineUpstream) framePusher() {
 			for i, packet := range packets {
 				packetSizes[i] = packet.MarshalSize()
 			}
-			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps())
-			next, sent := u.writePacedPackets(sess, packets, schedule)
+			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps(), frameDuration)
+			next, sent := u.writePacedPackets(sess, packets, schedule, idr)
 			if next != nil {
 				remaining := len(packets) - sent
 				if remaining > 0 {
+					// Leave the marker clear: the emitted prefix is truncated,
+					// not a complete access unit. Recovery comes from the IDR.
 					sess.needsIDR = true
 					if u.requestIDR() {
 						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
@@ -511,40 +543,49 @@ func (u *machineUpstream) writePacedPackets(
 	sess *Session,
 	packets []*rtp.Packet,
 	schedule []time.Duration,
+	idr bool,
 ) (*frameMsg, int) {
 	start := time.Now()
 	for i, packet := range packets {
 		wait := time.Until(start.Add(schedule[i]))
 		if wait > 0 {
 			timer := time.NewTimer(wait)
-			select {
-			case <-u.stopChan:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
+			if idr {
+				select {
+				case <-u.stopChan:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
 					}
+					return nil, i
+				case <-timer.C:
 				}
-				return nil, i
-			case next := <-u.frameChan:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
+			} else {
+				select {
+				case <-u.stopChan:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
 					}
-				}
-				latest := next
-				for {
-					select {
-					case newer := <-u.frameChan:
-						latest = newer
-					default:
-						return &latest, i
+					return nil, i
+				case next := <-u.frameChan:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
 					}
+					latest := latestFrame(u.frameChan, next)
+					return &latest, i
+				case <-timer.C:
 				}
-			case <-timer.C:
 			}
 		}
+		assignSequenceNumber(packet, &sess.nextSequenceNumber)
 		if err := sess.VideoTrack.WriteRTP(packet); err != nil {
 			log.Printf("[webrtc:%s] write RTP packet error: %v", u.id, err)
 		}

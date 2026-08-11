@@ -63,16 +63,17 @@ func initUDPMux() error {
 
 // Session wraps a single WebRTC peer connection + video track.
 type Session struct {
-	PeerConnection *webrtc.PeerConnection
-	VideoTrack     *webrtc.TrackLocalStaticRTP
-	Packetizer     rtp.Packetizer
-	rtpRemainder   float64
-	needsIDR       bool // true until the first IDR is sent to this session
-	machine        *machineUpstream
-	release        func()
-	releaseOnce    sync.Once
-	cursorDone     chan struct{}
-	writer         *wsWriter
+	PeerConnection     *webrtc.PeerConnection
+	VideoTrack         *webrtc.TrackLocalStaticRTP
+	Packetizer         rtp.Packetizer
+	rtpRemainder       float64
+	nextSequenceNumber uint16
+	needsIDR           bool // true until the first IDR is sent to this session
+	machine            *machineUpstream
+	release            func()
+	releaseOnce        sync.Once
+	cursorDone         chan struct{}
+	writer             *wsWriter
 }
 
 type wsWriter struct {

@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/pion/rtp"
 )
 
 func TestCaptureFrameDuration(t *testing.T) {
@@ -68,7 +70,7 @@ func TestCaptureFrameDuration(t *testing.T) {
 }
 
 func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
-	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000)
+	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000, 16*time.Millisecond)
 	want := []time.Duration{0, 4 * time.Millisecond, 8 * time.Millisecond}
 	for i := range want {
 		if schedule[i] != want[i] {
@@ -77,10 +79,46 @@ func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
 	}
 }
 
-func TestPacingScheduleWithoutTargetDoesNotAddDelay(t *testing.T) {
-	schedule := pacingSchedule([]int{1200, 800}, 0)
-	if schedule[0] != 0 || schedule[1] != 0 {
-		t.Fatalf("zero target should not add pacing delay: %v", schedule)
+func TestPacingScheduleUsesFrameRateFloor(t *testing.T) {
+	schedule := pacingSchedule([]int{1200, 800}, 0, 16*time.Millisecond)
+	if schedule[0] != 0 || schedule[1] != 9600*time.Microsecond {
+		t.Fatalf("frame-rate floor schedule = %v, want [0 9.6ms]", schedule)
+	}
+}
+
+func TestPacingScheduleLargeFrameFitsFrameInterval(t *testing.T) {
+	packetSizes := []int{10_000, 10_000}
+	frameDuration := 16 * time.Millisecond
+	schedule := pacingSchedule(packetSizes, 100, frameDuration)
+	frameBits := (packetSizes[0] + packetSizes[1]) * 8
+	rate := float64(frameBits) / frameDuration.Seconds()
+	lastPacketEnd := schedule[len(schedule)-1] +
+		time.Duration(float64(packetSizes[len(packetSizes)-1]*8)/rate*float64(time.Second))
+	if lastPacketEnd > frameDuration {
+		t.Fatalf("large frame ends at %s, beyond frame interval %s", lastPacketEnd, frameDuration)
+	}
+}
+
+func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) {
+	next := uint16(65534)
+	var emitted []uint16
+	for range 2 {
+		packet := &rtp.Packet{}
+		assignSequenceNumber(packet, &next)
+		emitted = append(emitted, packet.Header.SequenceNumber)
+	}
+	// The remainder of this frame is abandoned. The next frame starts with
+	// the next emitted sequence number rather than the packetizer's counter.
+	for range 3 {
+		packet := &rtp.Packet{}
+		assignSequenceNumber(packet, &next)
+		emitted = append(emitted, packet.Header.SequenceNumber)
+	}
+	want := []uint16{65534, 65535, 0, 1, 2}
+	for i := range want {
+		if emitted[i] != want[i] {
+			t.Fatalf("emitted sequence[%d] = %d, want %d", i, emitted[i], want[i])
+		}
 	}
 }
 
