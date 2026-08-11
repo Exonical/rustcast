@@ -10,6 +10,8 @@ struct GoEvent {
     action: String,
     #[serde(rename = "Package", default)]
     package: String,
+    #[serde(rename = "ImportPath", default)]
+    import_path: Option<String>,
     #[serde(rename = "Test", default)]
     test: Option<String>,
     #[serde(rename = "Elapsed", default)]
@@ -27,6 +29,21 @@ struct CaseData {
     action: String,
 }
 
+fn event_package(event: &GoEvent) -> String {
+    if !event.package.is_empty() {
+        return event.package.clone();
+    }
+    event
+        .import_path
+        .as_deref()
+        .unwrap_or_default()
+        .split_once(" [")
+        .map_or_else(
+            || event.import_path.clone().unwrap_or_default(),
+            |(package, _)| package.to_string(),
+        )
+}
+
 pub fn convert<R: BufRead>(reader: R) -> Result<(Report, bool), serde_json::Error> {
     let mut cases = BTreeMap::<(String, String), CaseData>::new();
     let mut package_failures = BTreeMap::<String, String>::new();
@@ -39,14 +56,15 @@ pub fn convert<R: BufRead>(reader: R) -> Result<(Report, bool), serde_json::Erro
         }
         let event: GoEvent = serde_json::from_str(&line)?;
         if event.test.is_none() {
-            if matches!(event.action.as_str(), "output" | "fail") {
+            let package = event_package(&event);
+            if matches!(event.action.as_str(), "output" | "fail" | "build-output") {
                 package_failures
-                    .entry(event.package.clone())
+                    .entry(package.clone())
                     .or_default()
                     .push_str(event.output.as_deref().unwrap_or(""));
             }
-            if event.action == "fail" {
-                failed_packages.insert(event.package.clone());
+            if matches!(event.action.as_str(), "fail" | "build-fail") {
+                failed_packages.insert(package);
             }
             continue;
         }
@@ -167,6 +185,19 @@ mod tests {
         assert_eq!(report.tests, 1);
         assert_eq!(report.failures, 1);
         assert!(report.to_string().unwrap().contains("package build"));
+    }
+
+    #[test]
+    fn package_build_failure_includes_build_diagnostics() {
+        let fixture = r#"{"ImportPath":"example/gt/emptypkg [example/gt/emptypkg.test]","Action":"build-output","Output":"emptypkg/broken_test.go:5:33: undefined: undefinedSymbol\n"}
+{"ImportPath":"example/gt/emptypkg [example/gt/emptypkg.test]","Action":"build-fail"}
+"#;
+        let (report, failed) = convert(Cursor::new(fixture)).unwrap();
+        assert!(failed);
+        assert_eq!(report.tests, 1);
+        assert_eq!(report.failures, 1);
+        let xml = report.to_string().unwrap();
+        assert!(xml.contains("undefined: undefinedSymbol"));
     }
 
     #[test]
