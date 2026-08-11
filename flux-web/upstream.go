@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/rtp"
 	"github.com/quic-go/quic-go"
 )
 
@@ -23,29 +23,52 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id          string
-	addr        string
-	frameChan   chan frameMsg
-	cursorChan  chan cursorMsg
-	commandChan chan []byte
-	abr         *abrState
-	stopChan    chan struct{}
-	stopOnce    sync.Once
-	viewers     int // Protected by machineRegistry.mu.
-	viewerCount atomic.Uint32
-	mu          sync.Mutex
-	session     *Session
-	lastCursor  *cursorMsg
-	conn        net.Conn
-	cancel      context.CancelFunc
-	status      func(string)
+	id             string
+	addr           string
+	frameChan      chan frameMsg
+	cursorChan     chan cursorMsg
+	commandChan    chan []byte
+	abr            *abrState
+	stopChan       chan struct{}
+	stopOnce       sync.Once
+	viewers        int // Protected by machineRegistry.mu.
+	viewerCount    atomic.Uint32
+	mu             sync.Mutex
+	session        *Session
+	lastCursor     *cursorMsg
+	conn           net.Conn
+	cancel         context.CancelFunc
+	status         func(string)
+	lastIDRRequest time.Time
 }
 
 const (
 	defaultFrameDuration = 16 * time.Millisecond // ~60fps for the first sample
 	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
 	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
+	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
+	pacingIDRInterval    = 500 * time.Millisecond
 )
+
+func pacingSchedule(packetSizes []int, targetKbps uint32) []time.Duration {
+	schedule := make([]time.Duration, len(packetSizes))
+	if targetKbps == 0 {
+		return schedule
+	}
+	bitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
+	var elapsedSeconds float64
+	for i, size := range packetSizes {
+		schedule[i] = time.Duration(elapsedSeconds * float64(time.Second))
+		elapsedSeconds += float64(size*8) / bitsPerSecond
+	}
+	return schedule
+}
+
+func consumeRTPDuration(duration time.Duration, remainder float64) (uint32, float64) {
+	total := duration.Seconds()*90000 + remainder
+	ticks := uint32(total)
+	return ticks, total - float64(ticks)
+}
 
 func captureFrameDuration(lastTs, currentTs uint64, haveLastTs bool) time.Duration {
 	if !haveLastTs || currentTs <= lastTs {
@@ -106,6 +129,16 @@ func (u *machineUpstream) send(cmd []byte) bool {
 	default:
 		return false
 	}
+}
+
+func (u *machineUpstream) requestIDR() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if !u.lastIDRRequest.IsZero() && time.Since(u.lastIDRRequest) < pacingIDRInterval {
+		return false
+	}
+	u.lastIDRRequest = time.Now()
+	return u.send([]byte{0x01})
 }
 
 func (u *machineUpstream) sendCursor(msg cursorMsg) {
@@ -282,6 +315,7 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 				case <-u.frameChan:
 				default:
 				}
+				u.requestIDR()
 				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
 			}
 		case 0x02:
@@ -387,6 +421,7 @@ func (u *machineUpstream) connectQUIC() error {
 				case <-u.frameChan:
 				default:
 				}
+				u.requestIDR()
 				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
 			}
 		case 0x02:
@@ -440,9 +475,79 @@ func (u *machineUpstream) framePusher() {
 			if sampleCount <= 5 || idr {
 				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
-			if err := sess.VideoTrack.WriteSample(media.Sample{Data: msg.data, Duration: frameDuration}); err != nil {
-				log.Printf("[webrtc:%s] write sample error: %v", u.id, err)
+			curTicks, remainder := consumeRTPDuration(frameDuration, sess.rtpRemainder)
+			sess.rtpRemainder = remainder
+			packets := sess.Packetizer.Packetize(msg.data, curTicks)
+			packetSizes := make([]int, len(packets))
+			for i, packet := range packets {
+				packetSizes[i] = packet.MarshalSize()
+			}
+			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps())
+			next, sent := u.writePacedPackets(sess, packets, schedule)
+			if next != nil {
+				remaining := len(packets) - sent
+				if remaining > 0 {
+					sess.needsIDR = true
+					if u.requestIDR() {
+						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
+					}
+				}
+				msg = *next
+				select {
+				case u.frameChan <- msg:
+				default:
+					select {
+					case <-u.frameChan:
+					default:
+					}
+					u.frameChan <- msg
+				}
 			}
 		}
 	}
+}
+
+func (u *machineUpstream) writePacedPackets(
+	sess *Session,
+	packets []*rtp.Packet,
+	schedule []time.Duration,
+) (*frameMsg, int) {
+	start := time.Now()
+	for i, packet := range packets {
+		wait := time.Until(start.Add(schedule[i]))
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-u.stopChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil, i
+			case next := <-u.frameChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				latest := next
+				for {
+					select {
+					case newer := <-u.frameChan:
+						latest = newer
+					default:
+						return &latest, i
+					}
+				}
+			case <-timer.C:
+			}
+		}
+		if err := sess.VideoTrack.WriteRTP(packet); err != nil {
+			log.Printf("[webrtc:%s] write RTP packet error: %v", u.id, err)
+		}
+	}
+	return nil, len(packets)
 }

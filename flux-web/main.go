@@ -17,6 +17,8 @@ import (
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -62,7 +64,9 @@ func initUDPMux() error {
 // Session wraps a single WebRTC peer connection + video track.
 type Session struct {
 	PeerConnection *webrtc.PeerConnection
-	VideoTrack     *webrtc.TrackLocalStaticSample
+	VideoTrack     *webrtc.TrackLocalStaticRTP
+	Packetizer     rtp.Packetizer
+	rtpRemainder   float64
 	needsIDR       bool // true until the first IDR is sent to this session
 	machine        *machineUpstream
 	release        func()
@@ -217,7 +221,7 @@ func newSession() (*Session, error) {
 	}
 
 	// Create H.264 video track
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{
 			MimeType:  webrtc.MimeTypeH264,
 			ClockRate: 90000,
@@ -228,6 +232,14 @@ func newSession() (*Session, error) {
 		pc.Close()
 		return nil, fmt.Errorf("create video track: %w", err)
 	}
+	packetizer := rtp.NewPacketizer(
+		1200,
+		0,
+		0,
+		&codecs.H264Payloader{},
+		rtp.NewRandomSequencer(),
+		90000,
+	)
 
 	sender, err := pc.AddTrack(videoTrack)
 	if err != nil {
@@ -235,7 +247,7 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("add track: %w", err)
 	}
 
-	session := &Session{PeerConnection: pc, VideoTrack: videoTrack}
+	session := &Session{PeerConnection: pc, VideoTrack: videoTrack, Packetizer: packetizer}
 	session.cursorDone = make(chan struct{})
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
