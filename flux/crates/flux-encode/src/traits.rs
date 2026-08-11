@@ -71,6 +71,14 @@ pub trait EncodeSession: Send {
     /// Request that the next encoded frame be an IDR / keyframe.
     fn request_idr(&mut self);
 
+    /// Request an IDR because an encoder session was rebuilt.
+    ///
+    /// Backends that do not distinguish this diagnostic cause can use the
+    /// ordinary request path.
+    fn request_idr_for_rebuild(&mut self) {
+        self.request_idr();
+    }
+
     /// Flush the encoder — returns any remaining buffered packets.
     fn flush(&mut self) -> Result<Vec<EncodedPacket>>;
 
