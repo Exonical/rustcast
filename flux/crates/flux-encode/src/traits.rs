@@ -1,5 +1,5 @@
 use flux_core::error::Result;
-use flux_core::frame::{CapturedFrame, EncodedPacket};
+use flux_core::frame::{CapturedFrame, EncodedPacket, GpuDeviceHandle};
 use flux_core::types::{ChromaSampling, DynamicRange, RateControlMode, Resolution, VideoCodec};
 
 /// Configuration for creating an encoding session.
@@ -58,6 +58,18 @@ pub trait VideoEncoder: Send + Sync {
 
     /// Create an encoding session with the given configuration.
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>>;
+
+    /// Create an encoding session using the capture device when available.
+    ///
+    /// Backends that support device sharing may override this method. Other
+    /// backends retain their existing device-selection behavior.
+    fn create_session_with_device(
+        &self,
+        config: EncodeConfig,
+        _capture_device: Option<GpuDeviceHandle>,
+    ) -> Result<Box<dyn EncodeSession>> {
+        self.create_session(config)
+    }
 }
 
 /// An active encoding session that converts captured frames into compressed packets.

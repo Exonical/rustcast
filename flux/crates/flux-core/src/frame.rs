@@ -1,4 +1,30 @@
 use crate::types::{PixelFormat, Resolution};
+#[cfg(windows)]
+use std::sync::Arc;
+
+/// Opaque GPU device associated with a capture session.
+///
+/// The concrete device is platform-specific and intentionally hidden from the
+/// capture/encode interfaces. Windows DXGI capture exposes its D3D11 device
+/// through this handle so a hardware encoder can use the same device.
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct GpuDeviceHandle(Arc<windows::Win32::Graphics::Direct3D11::ID3D11Device>);
+
+#[cfg(windows)]
+impl GpuDeviceHandle {
+    pub fn from_d3d11(device: windows::Win32::Graphics::Direct3D11::ID3D11Device) -> Self {
+        Self(Arc::new(device))
+    }
+
+    pub fn d3d11_device(&self) -> windows::Win32::Graphics::Direct3D11::ID3D11Device {
+        (*self.0).clone()
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug)]
+pub struct GpuDeviceHandle;
 
 /// A captured video frame ready for encoding.
 ///

@@ -996,6 +996,7 @@ fn create_encode_session(
     backend: flux_core::types::EncoderBackend,
     mut config: flux_encode::traits::EncodeConfig,
     quality_level: u8,
+    capture_device: Option<flux_core::frame::GpuDeviceHandle>,
 ) -> Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)> {
     let encoder = match flux_encode::create_encoder(Some(backend)) {
         Ok(enc) => {
@@ -1022,7 +1023,7 @@ fn create_encode_session(
     }
     let resolution = config.resolution;
     config.bitrate_kbps = bitrate_kbps_for(resolution, config.framerate, quality_level);
-    match encoder.create_session(config) {
+    match encoder.create_session_with_device(config, capture_device) {
         Ok(s) => {
             tracing::info!("{:?} H.264 encode session started at {}", backend, resolution);
             Some((s, resolution))
@@ -1043,6 +1044,7 @@ fn build_encode_session_for(
     resolution: flux_core::types::Resolution,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     quality_level: u8,
+    capture_device: Option<flux_core::frame::GpuDeviceHandle>,
 ) -> (
     Option<(Box<dyn flux_encode::traits::EncodeSession>, flux_core::types::Resolution)>,
     flux_core::types::EncoderBackend,
@@ -1066,7 +1068,12 @@ fn build_encode_session_for(
     let mut backend = flux_core::types::EncoderBackend::Software;
     let mut session = None;
     for candidate in encoder_backend_candidates(forced_backend) {
-        session = create_encode_session(candidate, encoder_config.clone(), quality_level);
+        session = create_encode_session(
+            candidate,
+            encoder_config.clone(),
+            quality_level,
+            capture_device.clone(),
+        );
         backend = candidate;
         if session.is_some() {
             break;
@@ -1421,11 +1428,11 @@ fn capture_loop(
                             old_mode.width,
                             old_mode.height
                         );
-                        let _ = session.stop();
-                        drop(session);
                         encode_session = None;
                         capture_resolution = flux_core::types::Resolution::new(0, 0);
                         encode_resolution = flux_core::types::Resolution::new(0, 0);
+                        let _ = session.stop();
+                        drop(session);
                         let transition = replug_capture(
                             capture.as_ref(),
                             virtual_display.as_mut().expect("checked above"),
@@ -1626,6 +1633,9 @@ fn capture_loop(
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
+                encode_session = None;
+                capture_resolution = flux_core::types::Resolution::new(0, 0);
+                encode_resolution = flux_core::types::Resolution::new(0, 0);
                 let _ = session.stop();
                 drop(session);
                 loop {
@@ -1698,6 +1708,7 @@ fn capture_loop(
                 frame.resolution,
                 forced_backend,
                 quality_level,
+                session.gpu_device(),
             );
             capture_resolution = frame.resolution;
             match sess {
@@ -1746,6 +1757,8 @@ fn capture_loop(
                 // Release the current session first: DXGI allows only one
                 // active IDXGIOutputDuplication per output per process, so
                 // DuplicateOutput fails while the old one is alive.
+                encode_session = None;
+                capture_resolution = flux_core::types::Resolution::new(0, 0);
                 let _ = session.stop();
                 drop(session);
                 match capture.start_capture(
@@ -1762,7 +1775,10 @@ fn capture_loop(
                             dimensions.2 = encode_resolution.width;
                             dimensions.3 = encode_resolution.height;
                         }
-                        capture_resolution = encode_resolution;
+                        // The encoder was released with the old capture
+                        // session; rebuild it from the restarted session's
+                        // device on the next frame.
+                        capture_resolution = flux_core::types::Resolution::new(0, 0);
                         tracing::info!("Capture restarted with GPU downscale to {}", encode_resolution);
                         continue;
                     }

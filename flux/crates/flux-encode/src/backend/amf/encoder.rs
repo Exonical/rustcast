@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::{CapturedFrame, EncodedPacket, GpuFrameHandle};
+use flux_core::frame::{CapturedFrame, EncodedPacket, GpuDeviceHandle, GpuFrameHandle};
 use flux_core::types::{DynamicRange, RateControlMode, Resolution, VideoCodec};
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
@@ -664,11 +664,20 @@ impl VideoEncoder for AmfEncoder {
     }
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
+        self.create_session_with_device(config, None)
+    }
+
+    fn create_session_with_device(
+        &self,
+        config: EncodeConfig,
+        capture_device: Option<GpuDeviceHandle>,
+    ) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
         Ok(Box::new(AmfSession::new(
             self.factory,
             self.runtime_version,
             config,
+            capture_device,
         )?))
     }
 }
@@ -732,6 +741,7 @@ pub struct AmfSession {
     context: AmfContext,
     encoder: AmfComponent,
     d3d11_device: ID3D11Device,
+    _capture_device: Option<GpuDeviceHandle>,
     config: EncodeConfig,
     frame_index: u64,
     pending_idr_trigger: Option<IdrTrigger>,
@@ -795,6 +805,7 @@ impl AmfSession {
         factory: *mut AMFFactoryObj,
         runtime_version: u64,
         config: EncodeConfig,
+        capture_device: Option<GpuDeviceHandle>,
     ) -> Result<Self> {
         tracing::info!(
             "Creating AMF session: {} {}@{}fps {}kbps",
@@ -807,10 +818,20 @@ impl AmfSession {
         // 1. Create context and init DX11
         let context = AmfContext::new(factory)?;
 
-        // Init DX11 with NULL device — AMF creates its own internal device.
-        // In production, pass the DXGI capture device for zero-copy.
-        context.init_dx11(ptr::null_mut())?;
-        tracing::debug!("AMF context initialized with DX11");
+        let init_device = capture_device.as_ref().map(GpuDeviceHandle::d3d11_device);
+        // Use the capture device when available so shared textures and AMF
+        // encode work stay on the adapter that owns the captured output.
+        context.init_dx11(init_device.as_ref().map_or(ptr::null_mut(), |device| {
+            device.as_raw() as *mut std::ffi::c_void
+        }))?;
+        tracing::debug!(
+            "AMF context initialized with {} DX11 device",
+            if init_device.is_some() {
+                "capture"
+            } else {
+                "AMF-selected"
+            }
+        );
 
         // Retrieve the internal D3D11 device to support OpenSharedResource
         let d3d11_device = context.get_dx11_device()?;
@@ -1023,6 +1044,7 @@ impl AmfSession {
             context,
             encoder,
             d3d11_device,
+            _capture_device: capture_device,
             config,
             frame_index: 0,
             pending_idr_trigger: None,
