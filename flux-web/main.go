@@ -191,11 +191,16 @@ func naluTypeName(t byte) string {
 // WebRTC session management
 // ---------------------------------------------------------------------------
 
-func newSession() (*Session, error) {
+func newMediaEngineAndInterceptors() (
+	*webrtc.MediaEngine,
+	*interceptor.Registry,
+	func() cc.BandwidthEstimator,
+	error,
+) {
 	// Use default codecs — lets browser and pion negotiate H.264 profile freely
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
-		return nil, fmt.Errorf("register default codecs: %w", err)
+		return nil, nil, nil, fmt.Errorf("register default codecs: %w", err)
 	}
 
 	// Default interceptors provide the NACK responder (RTP retransmission of
@@ -204,14 +209,7 @@ func newSession() (*Session, error) {
 	// corrupts the stream until the next keyframe.
 	i := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
-		return nil, fmt.Errorf("register default interceptors: %w", err)
-	}
-
-	// The default set generates TWCC for inbound media; this adds the
-	// transport-cc header extension to our outbound RTP so the viewer reports
-	// per-packet arrival times back to us.
-	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
-		return nil, fmt.Errorf("configure twcc header extension: %w", err)
+		return nil, nil, nil, fmt.Errorf("register default interceptors: %w", err)
 	}
 
 	// Send-side bandwidth estimation over that feedback. It is observational:
@@ -223,12 +221,27 @@ func newSession() (*Session, error) {
 		return gcc.NewSendSideBWE(gcc.SendSideBWEPacer(gcc.NewNoOpPacer()))
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create congestion controller: %w", err)
+		return nil, nil, nil, fmt.Errorf("create congestion controller: %w", err)
 	}
 	ccFactory.OnNewPeerConnection(func(_ string, bwe cc.BandwidthEstimator) {
 		estimator = bwe
 	})
 	i.Add(ccFactory)
+
+	// The TWCC writer must be the outermost interceptor so it adds the
+	// transport-cc extension before GCC inspects each outbound packet.
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
+		return nil, nil, nil, fmt.Errorf("configure twcc header extension: %w", err)
+	}
+
+	return m, i, func() cc.BandwidthEstimator { return estimator }, nil
+}
+
+func newSession() (*Session, error) {
+	m, i, bandwidthEstimator, err := newMediaEngineAndInterceptors()
+	if err != nil {
+		return nil, err
+	}
 
 	se := webrtc.SettingEngine{}
 	if iceUDPMux != nil {
@@ -281,7 +294,7 @@ func newSession() (*Session, error) {
 
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack, Packetizer: packetizer}
 	session.sessionDone = make(chan struct{})
-	session.bwe = estimator
+	session.bwe = bandwidthEstimator()
 	go logBandwidthEstimate(session)
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
