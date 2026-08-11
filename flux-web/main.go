@@ -272,6 +272,25 @@ func (s *Session) releaseNow() {
 	})
 }
 
+// rttFromReport computes the round-trip time from an RTCP reception report
+// (RFC 3550 §6.4.1): RTT = arrival − LSR − DLSR, all in NTP middle-32 units
+// of 1/65536 s. Zero LSR means the receiver has not seen a sender report yet.
+func rttFromReport(report rtcp.ReceptionReport, arrival time.Time) time.Duration {
+	if report.LastSenderReport == 0 {
+		return 0
+	}
+	const ntpEpochOffset = 2208988800 // seconds between 1900 (NTP) and 1970 (Unix)
+	secs := uint64(arrival.Unix()) + ntpEpochOffset
+	frac := uint64(arrival.Nanosecond()) << 32 / uint64(time.Second)
+	nowNTP32 := uint32(secs<<16 | frac>>16)
+	elapsed := nowNTP32 - report.LastSenderReport - report.Delay
+	// Discard wrapped/garbage values (> ~10s is not a real media RTT).
+	if elapsed > 10*65536 {
+		return 0
+	}
+	return time.Duration(elapsed) * time.Second / 65536
+}
+
 // forwardKeyframeRequests reads incoming RTCP on the video sender and turns
 // PLI/FIR feedback into upstream IDR requests, rate-limited to one per 250ms.
 func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
@@ -285,6 +304,9 @@ func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
 			if rr, ok := pkt.(*rtcp.ReceiverReport); ok && session.machine != nil {
 				for _, report := range rr.Reports {
 					session.machine.abr.onReceiverReport(float64(report.FractionLost) / 256.0)
+					if rtt := rttFromReport(report, time.Now()); rtt > 0 {
+						session.machine.abr.onRTTSample(rtt)
+					}
 				}
 			}
 			switch pkt.(type) {
@@ -511,6 +533,12 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 					log.Printf("[ws] add ICE candidate error: %v", err)
 				}
 			}
+
+		case "latency-ping":
+			// Echo for control-path RTT measurement: same WS + goroutine that
+			// carries input events, so it measures what input actually rides.
+			resp, _ := json.Marshal(WSMessage{Type: "latency-pong", Data: msg.Data})
+			_ = writer.write(websocket.TextMessage, resp)
 
 		case "input":
 			if session == nil || session.machine == nil {

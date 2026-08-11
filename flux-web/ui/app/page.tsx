@@ -859,6 +859,27 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
               <StatCard label="Packets lost" value={stats ? stats.packetsLost.toLocaleString() : "—"} accent={!!stats && stats.packetsLost > 0} />
               <StatCard label="Jitter" value={stats ? `${(stats.jitter * 1000).toFixed(1)} ms` : "—"} />
               <StatCard label="Received" value={stats ? formatBytes(stats.bytesReceived) : "—"} />
+              <StatCard
+                label="Media RTT"
+                value={stats?.mediaRttMs != null ? `${stats.mediaRttMs.toFixed(0)} ms` : "—"}
+                accent={!!stats?.mediaRttMs && stats.mediaRttMs > 100}
+              />
+              <StatCard
+                label="Input RTT"
+                value={stats?.controlRttMs != null ? `${stats.controlRttMs.toFixed(0)} ms` : "—"}
+                accent={!!stats?.controlRttMs && stats.controlRttMs > 100}
+              />
+              <StatCard
+                label="Jitter buffer"
+                value={stats?.jitterBufferMs != null ? `${stats.jitterBufferMs.toFixed(0)} ms` : "—"}
+                accent={!!stats?.jitterBufferMs && stats.jitterBufferMs > 100}
+              />
+              <StatCard label="Decode" value={stats?.decodeMs != null ? `${stats.decodeMs.toFixed(1)} ms` : "—"} />
+              <StatCard
+                label="Frames dropped"
+                value={stats ? stats.framesDropped.toLocaleString() : "—"}
+                accent={!!stats && stats.framesDropped > 0}
+              />
             </div>
           </div>
         )}

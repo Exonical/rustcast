@@ -412,7 +412,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::sync::broadcast::channel::<ResolutionStatusMessage>(8);
 
     // Input event channel: Frame server (TCP) -> Capture thread (Input Sink)
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<flux_input::InputEvent>();
+    let (input_tx, input_rx) =
+        std::sync::mpsc::channel::<(std::time::Instant, flux_input::InputEvent)>();
 
     let capture_fps = config.video.max_fps.min(144);
     let forced_encoder = config.video.encoder;
@@ -585,7 +586,7 @@ async fn frame_server(
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<ModeRequest>,
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<flux_input::InputEvent>,
+    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -683,7 +684,7 @@ async fn frame_server(
                                             tracing::info!("Input: {:?}", event);
                                         }
                                     }
-                                    let _ = input_tx.send(event);
+                                    let _ = input_tx.send((std::time::Instant::now(), event));
                                 }
                                 Err(e) => {
                                     tracing::warn!("Failed to deserialize input event: {}", e);
@@ -1102,7 +1103,7 @@ fn capture_loop(
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
     quality_rx: std::sync::mpsc::Receiver<(u8, u8)>,
     resolution_rx: std::sync::mpsc::Receiver<ModeRequest>,
-    input_rx: std::sync::mpsc::Receiver<flux_input::InputEvent>,
+    input_rx: std::sync::mpsc::Receiver<(std::time::Instant, flux_input::InputEvent)>,
     target_fps: u32,
     default_fps_cap: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
@@ -1207,9 +1208,38 @@ fn capture_loop(
     let input_sink_thread = input_sink.clone();
     std::thread::spawn(move || {
         tracing::info!("Input dispatch thread started");
-        while let Ok(event) = input_rx.recv() {
+        let mut max_queue_delay = std::time::Duration::ZERO;
+        let mut dispatched: u64 = 0;
+        let mut last_report = std::time::Instant::now();
+        let mut last_stall_warning: Option<std::time::Instant> = None;
+        while let Ok((enqueued_at, event)) = input_rx.recv() {
+            let queue_delay = enqueued_at.elapsed();
+            max_queue_delay = max_queue_delay.max(queue_delay);
+            dispatched += 1;
+            // Rate-limited: a stalled dispatch thread releases a whole backlog
+            // of late events at once, and one line per event drowns the log.
+            if queue_delay > std::time::Duration::from_millis(20)
+                && last_stall_warning
+                    .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+            {
+                last_stall_warning = Some(std::time::Instant::now());
+                tracing::warn!(
+                    "Input event sat {:.1}ms in the dispatch queue (scheduler stall?)",
+                    queue_delay.as_secs_f64() * 1000.0
+                );
+            }
             if let Err(e) = input_sink_thread.handle_event(&event) {
                 tracing::warn!("Input injection error: {}", e);
+            }
+            if last_report.elapsed() >= std::time::Duration::from_secs(30) && dispatched > 0 {
+                tracing::info!(
+                    "Input dispatch: {} events, max queue delay {:.2}ms over last 30s",
+                    dispatched,
+                    max_queue_delay.as_secs_f64() * 1000.0
+                );
+                dispatched = 0;
+                max_queue_delay = std::time::Duration::ZERO;
+                last_report = std::time::Instant::now();
             }
         }
         tracing::info!("Input dispatch thread stopped");

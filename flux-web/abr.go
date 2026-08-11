@@ -29,6 +29,11 @@ type abrState struct {
 	lastDecrease time.Time
 	lastIncrease time.Time
 	cleanSince   time.Time
+
+	baseRTT       time.Duration // lowest RTT in the trailing window: the path's uninflated floor
+	smoothedRTT   time.Duration // EWMA of recent RTT samples
+	windowMinRTT  time.Duration // lowest RTT in the window currently being collected
+	windowStarted time.Time
 }
 
 const (
@@ -40,6 +45,10 @@ const (
 	abrDecreaseCooldown = 2 * time.Second
 	abrIncreaseCooldown = 5 * time.Second
 	abrCleanBeforeRaise = 5 * time.Second
+
+	abrRTTInflation  = 75 * time.Millisecond // queue delay above baseline that triggers a decrease
+	abrRTTAlpha      = 0.125                 // EWMA weight for new RTT samples
+	abrRTTBaseWindow = 30 * time.Second      // baseline is re-estimated over this trailing window
 )
 
 // countFrameBytes records incoming video bytes for bitrate measurement.
@@ -69,6 +78,68 @@ func (a *abrState) setSenderTarget(kbps uint32) {
 		a.senderTargetKbps = kbps
 		a.targetKbps = kbps
 	}
+}
+
+// onRTTSample feeds a round-trip-time measurement derived from RTCP
+// receiver reports. Rising RTT means packets are queueing (bufferbloat) —
+// the link is saturating even though nothing is being lost yet — so the
+// bitrate is cut before loss appears. Inflation is measured against a
+// baseline re-estimated over a trailing window.
+func (a *abrState) onRTTSample(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// The baseline tracks the minimum over a trailing window rather than the
+	// session minimum: a path that genuinely gets slower (moving from Ethernet
+	// to WiFi) would otherwise look permanently inflated and pin the bitrate
+	// at the floor forever.
+	now := time.Now()
+	if a.windowStarted.IsZero() {
+		a.windowStarted = now
+	}
+	if a.windowMinRTT == 0 || rtt < a.windowMinRTT {
+		a.windowMinRTT = rtt
+	}
+	if a.baseRTT == 0 || rtt < a.baseRTT {
+		a.baseRTT = rtt
+	} else if now.Sub(a.windowStarted) >= abrRTTBaseWindow {
+		a.baseRTT = a.windowMinRTT
+		a.windowMinRTT = 0
+		a.windowStarted = now
+	}
+
+	if a.smoothedRTT == 0 {
+		a.smoothedRTT = rtt
+	} else {
+		a.smoothedRTT = time.Duration((1-abrRTTAlpha)*float64(a.smoothedRTT) + abrRTTAlpha*float64(rtt))
+	}
+	if a.smoothedRTT-a.baseRTT <= abrRTTInflation {
+		return
+	}
+	a.cleanSince = time.Time{}
+	if now.Sub(a.lastDecrease) < abrDecreaseCooldown {
+		return
+	}
+	base := a.targetKbps
+	if base == 0 {
+		return
+	}
+	target := uint32(float64(base) * abrDecreaseFactor)
+	if target < abrMinKbps {
+		target = abrMinKbps
+	}
+	if target == a.targetKbps {
+		return
+	}
+	a.targetKbps = target
+	a.lastDecrease = now
+	log.Printf("[abr] RTT %.0fms (baseline %.0fms) → lowering encoder bitrate to %d kbps",
+		float64(a.smoothedRTT)/float64(time.Millisecond),
+		float64(a.baseRTT)/float64(time.Millisecond), target)
+	a.sendBitrateCommand(target)
 }
 
 // onReceiverReport reacts to loss feedback from the viewer.
@@ -105,7 +176,11 @@ func (a *abrState) onReceiverReport(fractionLost float64) {
 		if a.cleanSince.IsZero() {
 			a.cleanSince = now
 		}
-		// Only raise if we previously lowered and the link has been clean.
+		// Only raise if we previously lowered, the link has been clean,
+		// and RTT is not sitting above its baseline (queues still draining).
+		if a.smoothedRTT-a.baseRTT > abrRTTInflation {
+			return
+		}
 		if a.targetKbps == 0 ||
 			a.targetKbps >= a.ceilingKbps ||
 			now.Sub(a.cleanSince) < abrCleanBeforeRaise ||
