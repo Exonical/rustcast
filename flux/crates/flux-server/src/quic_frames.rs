@@ -16,7 +16,7 @@
 //!                                | [0x06][2-byte BE width][2-byte BE height]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flux_crypto::CertificateManager;
 
@@ -28,6 +28,49 @@ type PrivacyController = ();
 type PrivacyConnection = ();
 
 pub const ALPN: &[u8] = b"flux-frames";
+
+const FRAME_RESET_BACKLOG_THRESHOLD: usize = 3;
+const FRAME_RESET_IDR_COOLDOWN: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+struct FrameResetPolicy {
+    last_reset: Option<Instant>,
+}
+
+impl FrameResetPolicy {
+    fn should_reset(&mut self, backlog: usize, is_idr: bool, now: Instant) -> bool {
+        if is_idr || backlog < FRAME_RESET_BACKLOG_THRESHOLD {
+            return false;
+        }
+        if self
+            .last_reset
+            .is_some_and(|last| now.duration_since(last) < FRAME_RESET_IDR_COOLDOWN)
+        {
+            return false;
+        }
+        self.last_reset = Some(now);
+        true
+    }
+}
+
+fn is_idr_frame(data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < data.len() {
+        let start_code_len = if data[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        if index + start_code_len < data.len() && data[index + start_code_len] & 0x1f == 5 {
+            return true;
+        }
+        index += start_code_len;
+    }
+    false
+}
 
 pub fn make_endpoint(
     bind_addr: std::net::SocketAddr,
@@ -110,6 +153,7 @@ async fn handle_connection(
         .map(|privacy| privacy.connection());
     #[cfg(not(target_os = "windows"))]
     let privacy_connection = None;
+    let frame_idr_tx = idr_tx.clone();
     let control_conn = connection.clone();
     let control = tokio::spawn(async move {
         loop {
@@ -143,7 +187,26 @@ async fn handle_connection(
         }
     }
 
+    let mut reset_policy = FrameResetPolicy::default();
+    let mut pending_frame: Option<Arc<(u64, Vec<u8>)>> = None;
     loop {
+        if let Some(frame) = pending_frame.take() {
+            match send_frame_message(
+                &connection,
+                frame.0,
+                frame.1.clone(),
+                &mut rx,
+                &mut reset_policy,
+                &frame_idr_tx,
+            )
+            .await
+            {
+                FrameSendResult::Complete => {}
+                FrameSendResult::Superseded(frame) => pending_frame = Some(frame),
+                FrameSendResult::Disconnected => break,
+            }
+            continue;
+        }
         tokio::select! {
             result = rx.recv() => {
                 let frame = match result {
@@ -154,8 +217,17 @@ async fn handle_connection(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if !send_message(&connection, 0x01, frame.0, frame.1.clone()).await {
-                    break;
+                match send_frame_message(
+                    &connection,
+                    frame.0,
+                    frame.1.clone(),
+                    &mut rx,
+                    &mut reset_policy,
+                    &frame_idr_tx,
+                ).await {
+                    FrameSendResult::Complete => {}
+                    FrameSendResult::Superseded(frame) => pending_frame = Some(frame),
+                    FrameSendResult::Disconnected => break,
                 }
             }
             result = cursor_rx.changed() => {
@@ -210,6 +282,116 @@ async fn send_message(
     }
     let _ = stream.finish();
     true
+}
+
+enum FrameSendResult {
+    Complete,
+    Superseded(Arc<(u64, Vec<u8>)>),
+    Disconnected,
+}
+
+async fn send_frame_message(
+    connection: &quinn::Connection,
+    ts: u64,
+    payload: Vec<u8>,
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
+    reset_policy: &mut FrameResetPolicy,
+    idr_tx: &std::sync::mpsc::Sender<()>,
+) -> FrameSendResult {
+    let mut stream = match connection.open_uni().await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::info!("QUIC frame client disconnected: {}", error);
+            return FrameSendResult::Disconnected;
+        }
+    };
+    let mut header = [0u8; 13];
+    header[0] = 0x01;
+    header[1..9].copy_from_slice(&ts.to_be_bytes());
+    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    if stream.write_all(&header).await.is_err() {
+        tracing::info!("QUIC frame write failed; client disconnected");
+        return FrameSendResult::Disconnected;
+    }
+
+    let is_idr = is_idr_frame(&payload);
+    let mut pending = None;
+    let mut backlog = 0;
+    let mut offset = 0;
+    while offset < payload.len() {
+        let end = (offset + 16 * 1024).min(payload.len());
+        if is_idr {
+            if stream.write_all(&payload[offset..end]).await.is_err() {
+                tracing::info!("QUIC frame write failed; client disconnected");
+                return FrameSendResult::Disconnected;
+            }
+            offset = end;
+            continue;
+        }
+
+        let mut reset = false;
+        let write_result = {
+            let write = stream.write_all(&payload[offset..end]);
+            tokio::pin!(write);
+            tokio::select! {
+                result = &mut write => {
+                    if result.is_err() {
+                        tracing::info!("QUIC frame write failed; client disconnected");
+                        return FrameSendResult::Disconnected;
+                    }
+                    None
+                }
+                result = rx.recv() => {
+                    match result {
+                        Ok(frame) => {
+                            pending = Some(frame);
+                            backlog += 1;
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(frame) => {
+                                        pending = Some(frame);
+                                        backlog += 1;
+                                    }
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                                        backlog += n as usize;
+                                    }
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                                        return FrameSendResult::Disconnected;
+                                    }
+                                }
+                            }
+                            if reset_policy.should_reset(backlog, false, Instant::now()) {
+                                reset = true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            backlog += n as usize;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return FrameSendResult::Disconnected;
+                        }
+                    }
+                    Some(())
+                }
+            }
+        };
+        if reset {
+            let _ = stream.reset(quinn::VarInt::from_u32(0));
+            let _ = idr_tx.send(());
+            tracing::debug!(
+                "resetting stale QUIC P-frame after {} newer frames queued",
+                backlog
+            );
+            return FrameSendResult::Superseded(pending.expect("pending frame"));
+        }
+        if write_result.is_none() {
+            offset = end;
+        }
+    }
+
+    let _ = stream.finish();
+    pending.map_or(FrameSendResult::Complete, FrameSendResult::Superseded)
 }
 
 async fn read_commands(
@@ -299,5 +481,46 @@ async fn read_commands(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_requires_a_backlog() {
+        let now = Instant::now();
+        let mut policy = FrameResetPolicy::default();
+        assert!(!policy.should_reset(1, false, now));
+        assert!(!policy.should_reset(FRAME_RESET_BACKLOG_THRESHOLD - 1, false, now));
+        assert!(policy.should_reset(FRAME_RESET_BACKLOG_THRESHOLD, false, now));
+    }
+
+    #[test]
+    fn idr_frames_are_never_reset() {
+        let now = Instant::now();
+        let mut policy = FrameResetPolicy::default();
+        assert!(!policy.should_reset(FRAME_RESET_BACKLOG_THRESHOLD + 2, true, now));
+    }
+
+    #[test]
+    fn resets_are_rate_limited() {
+        let now = Instant::now();
+        let mut policy = FrameResetPolicy::default();
+        assert!(policy.should_reset(FRAME_RESET_BACKLOG_THRESHOLD, false, now));
+        assert!(!policy.should_reset(FRAME_RESET_BACKLOG_THRESHOLD, false, now));
+        assert!(policy.should_reset(
+            FRAME_RESET_BACKLOG_THRESHOLD,
+            false,
+            now + FRAME_RESET_IDR_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn detects_annex_b_idr_nalus() {
+        assert!(is_idr_frame(&[0, 0, 0, 1, 5]));
+        assert!(is_idr_frame(&[0, 0, 1, 5]));
+        assert!(!is_idr_frame(&[0, 0, 0, 1, 1]));
     }
 }

@@ -66,3 +66,29 @@ func TestCaptureFrameDuration(t *testing.T) {
 		})
 	}
 }
+
+func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
+	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000)
+	want := []time.Duration{0, 4 * time.Millisecond, 8 * time.Millisecond}
+	for i := range want {
+		if schedule[i] != want[i] {
+			t.Fatalf("schedule[%d] = %s, want %s", i, schedule[i], want[i])
+		}
+	}
+}
+
+func TestPacingScheduleWithoutTargetDoesNotAddDelay(t *testing.T) {
+	schedule := pacingSchedule([]int{1200, 800}, 0)
+	if schedule[0] != 0 || schedule[1] != 0 {
+		t.Fatalf("zero target should not add pacing delay: %v", schedule)
+	}
+}
+
+func TestAbandonedPacketCountTracksSupersededRemainder(t *testing.T) {
+	if got := abandonedPacketCount(3, 10); got != 7 {
+		t.Fatalf("abandonedPacketCount(3, 10) = %d, want 7", got)
+	}
+	if got := abandonedPacketCount(10, 10); got != 0 {
+		t.Fatalf("completed frame has %d abandoned packets", got)
+	}
+}

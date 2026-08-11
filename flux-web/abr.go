@@ -80,6 +80,12 @@ func (a *abrState) setSenderTarget(kbps uint32) {
 	}
 }
 
+func (a *abrState) targetBitrateKbps() uint32 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.targetKbps
+}
+
 // onRTTSample feeds a round-trip-time measurement derived from RTCP
 // receiver reports. Rising RTT means packets are queueing (bufferbloat) —
 // the link is saturating even though nothing is being lost yet — so the

@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/rtp"
 	"github.com/quic-go/quic-go"
 )
 
@@ -45,7 +45,30 @@ const (
 	defaultFrameDuration = 16 * time.Millisecond // ~60fps for the first sample
 	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
 	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
+	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
+	pacingIDRInterval    = 500 * time.Millisecond
 )
+
+func pacingSchedule(packetSizes []int, targetKbps uint32) []time.Duration {
+	schedule := make([]time.Duration, len(packetSizes))
+	if targetKbps == 0 {
+		return schedule
+	}
+	bitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
+	var elapsedSeconds float64
+	for i, size := range packetSizes {
+		schedule[i] = time.Duration(elapsedSeconds * float64(time.Second))
+		elapsedSeconds += float64(size*8) / bitsPerSecond
+	}
+	return schedule
+}
+
+func abandonedPacketCount(sent, total int) int {
+	if sent >= total {
+		return 0
+	}
+	return total - sent
+}
 
 func captureFrameDuration(lastTs, currentTs uint64, haveLastTs bool) time.Duration {
 	if !haveLastTs || currentTs <= lastTs {
@@ -411,6 +434,7 @@ func (u *machineUpstream) framePusher() {
 	var sampleCount uint64
 	var lastTs uint64
 	var haveLastTs bool
+	var lastPacingIDR time.Time
 	for {
 		select {
 		case <-u.stopChan:
@@ -435,14 +459,89 @@ func (u *machineUpstream) framePusher() {
 			// server timestamp resets on reconnect, so guard against going
 			// backwards and fall back to the nominal duration.
 			frameDuration := captureFrameDuration(lastTs, msg.tsMicros, haveLastTs)
-			lastTs, haveLastTs = msg.tsMicros, true
 			// Log first few frames and IDRs for diagnostics.
 			if sampleCount <= 5 || idr {
 				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
-			if err := sess.VideoTrack.WriteSample(media.Sample{Data: msg.data, Duration: frameDuration}); err != nil {
-				log.Printf("[webrtc:%s] write sample error: %v", u.id, err)
+			tickF := frameDuration.Seconds() * 90000
+			curTotal := tickF + sess.rtpRemainder
+			curTicks := uint32(curTotal)
+			sess.rtpRemainder = curTotal - float64(curTicks)
+			packets := sess.Packetizer.Packetize(msg.data, curTicks)
+			packetSizes := make([]int, len(packets))
+			for i, packet := range packets {
+				packetSizes[i] = packet.MarshalSize()
+			}
+			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps())
+			next, sent := u.writePacedPackets(sess, packets, schedule)
+			if next != nil {
+				remaining := abandonedPacketCount(sent, len(packets))
+				if remaining > 0 {
+					sess.needsIDR = true
+					if time.Since(lastPacingIDR) >= pacingIDRInterval {
+						lastPacingIDR = time.Now()
+						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
+						_ = u.send([]byte{0x01})
+					}
+				}
+				msg = *next
+				select {
+				case u.frameChan <- msg:
+				default:
+					select {
+					case <-u.frameChan:
+					default:
+					}
+					u.frameChan <- msg
+				}
+			} else if sent == len(packets) {
+				lastTs, haveLastTs = msg.tsMicros, true
 			}
 		}
 	}
+}
+
+func (u *machineUpstream) writePacedPackets(
+	sess *Session,
+	packets []*rtp.Packet,
+	schedule []time.Duration,
+) (*frameMsg, int) {
+	start := time.Now()
+	for i, packet := range packets {
+		wait := time.Until(start.Add(schedule[i]))
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-u.stopChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil, i
+			case next := <-u.frameChan:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				latest := next
+				for {
+					select {
+					case newer := <-u.frameChan:
+						latest = newer
+					default:
+						return &latest, i
+					}
+				}
+			case <-timer.C:
+			}
+		}
+		if err := sess.VideoTrack.WriteRTP(packet); err != nil {
+			log.Printf("[webrtc:%s] write RTP packet error: %v", u.id, err)
+		}
+	}
+	return nil, len(packets)
 }
