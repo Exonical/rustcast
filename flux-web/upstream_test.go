@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/pion/rtp"
 )
 
 func TestCaptureFrameDuration(t *testing.T) {
@@ -68,7 +70,7 @@ func TestCaptureFrameDuration(t *testing.T) {
 }
 
 func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
-	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000)
+	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000, 16*time.Millisecond)
 	want := []time.Duration{0, 4 * time.Millisecond, 8 * time.Millisecond}
 	for i := range want {
 		if schedule[i] != want[i] {
@@ -77,10 +79,51 @@ func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
 	}
 }
 
-func TestPacingScheduleWithoutTargetDoesNotAddDelay(t *testing.T) {
-	schedule := pacingSchedule([]int{1200, 800}, 0)
-	if schedule[0] != 0 || schedule[1] != 0 {
-		t.Fatalf("zero target should not add pacing delay: %v", schedule)
+func TestPacingScheduleUsesFrameRateFloor(t *testing.T) {
+	schedule := pacingSchedule([]int{1200, 800}, 0, 16*time.Millisecond)
+	if schedule[0] != 0 || schedule[1] != 9600*time.Microsecond {
+		t.Fatalf("frame-rate floor schedule = %v, want [0 9.6ms]", schedule)
+	}
+}
+
+func TestPacingScheduleLargeFrameFitsFrameInterval(t *testing.T) {
+	packetSizes := []int{10_000, 10_000}
+	schedule := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
+	if schedule[len(schedule)-1] > 16*time.Millisecond {
+		t.Fatalf("large frame's final packet starts at %s, beyond 16ms frame interval", schedule[len(schedule)-1])
+	}
+}
+
+func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
+	ch := make(chan frameMsg, 2)
+	ch <- frameMsg{tsMicros: 2}
+	ch <- frameMsg{tsMicros: 3}
+	latest, dropped := latestFrame(ch, frameMsg{tsMicros: 1})
+	if !dropped || latest.tsMicros != 3 {
+		t.Fatalf("latestFrame() = (%+v, %t), want newest frame and dropped=true", latest, dropped)
+	}
+}
+
+func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) {
+	next := uint16(65534)
+	var emitted []uint16
+	for range 2 {
+		packet := &rtp.Packet{}
+		assignSequenceNumber(packet, &next)
+		emitted = append(emitted, packet.Header.SequenceNumber)
+	}
+	// The remainder of this frame is abandoned. The next frame starts with
+	// the next emitted sequence number rather than the packetizer's counter.
+	for range 3 {
+		packet := &rtp.Packet{}
+		assignSequenceNumber(packet, &next)
+		emitted = append(emitted, packet.Header.SequenceNumber)
+	}
+	want := []uint16{65534, 65535, 0, 1, 2}
+	for i := range want {
+		if emitted[i] != want[i] {
+			t.Fatalf("emitted sequence[%d] = %d, want %d", i, emitted[i], want[i])
+		}
 	}
 }
 
