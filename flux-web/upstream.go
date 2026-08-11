@@ -40,6 +40,7 @@ type machineUpstream struct {
 	cancel      context.CancelFunc
 	status      func(string)
 	idrGate     idrRequestGate
+	idrStats    idrStats
 }
 
 const (
@@ -49,7 +50,141 @@ const (
 	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
 	maxPacingMultiplier  = 4                     // cap frame-size floor at 4x target
 	idrRequestInterval   = 2 * time.Second
+	stageStatsInterval   = 5 * time.Second // how often per-stage timings are logged
 )
+
+// Why a keyframe was asked for. Every request path is tagged so the logs show
+// whether keyframes are driven by the viewer's decoder (real loss on the path)
+// or by the relay's own drop paths (the stream not keeping up locally) — the two
+// call for opposite fixes.
+type idrReason string
+
+const (
+	idrReasonViewerPLI    idrReason = "viewer-pli"
+	idrReasonUpstreamDrop idrReason = "upstream-queue-full"
+	idrReasonStaleQueue   idrReason = "stale-queue-discard"
+	idrReasonAbandoned    idrReason = "abandoned-packets"
+	idrReasonRequeueDrop  idrReason = "requeue-drop"
+)
+
+// idrStats counts keyframe requests by origin, including the ones the gate
+// suppressed: a high suppressed count means the stream is still asking for
+// keyframes far faster than it can send them.
+type idrStats struct {
+	mu         sync.Mutex
+	granted    map[idrReason]int
+	suppressed map[idrReason]int
+}
+
+func (s *idrStats) record(reason idrReason, granted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := &s.suppressed
+	if granted {
+		counts = &s.granted
+	}
+	if *counts == nil {
+		*counts = map[idrReason]int{}
+	}
+	(*counts)[reason]++
+}
+
+// drain returns a summary of the counts since the last call and resets them.
+func (s *idrStats) drain() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.granted) == 0 && len(s.suppressed) == 0 {
+		return ""
+	}
+	var summary string
+	for _, reason := range []idrReason{
+		idrReasonViewerPLI,
+		idrReasonUpstreamDrop,
+		idrReasonStaleQueue,
+		idrReasonAbandoned,
+		idrReasonRequeueDrop,
+	} {
+		granted, suppressed := s.granted[reason], s.suppressed[reason]
+		if granted == 0 && suppressed == 0 {
+			continue
+		}
+		if summary != "" {
+			summary += " "
+		}
+		summary += fmt.Sprintf("%s=%d(+%d suppressed)", reason, granted, suppressed)
+	}
+	s.granted, s.suppressed = nil, nil
+	return summary
+}
+
+// stageStats accumulates the per-frame timings of the relay's own stages over a
+// logging window. The point is to attribute a stall: relay wait is how long a
+// frame sat between arriving from the sender and its first packet going out,
+// pacing is how long the rest of its packets then took.
+type stageStats struct {
+	frames       int
+	maxQueueLen  int
+	queueLenSum  int
+	maxRelayMs   float64
+	relayMsSum   float64
+	maxPacingMs  float64
+	pacingMsSum  float64
+	idrFrames    int
+	maxIDRBytes  int
+	maxIDRPaceMs float64
+}
+
+func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool, bytes int) {
+	s.frames++
+	s.queueLenSum += queueLen
+	if queueLen > s.maxQueueLen {
+		s.maxQueueLen = queueLen
+	}
+	relayMs := relay.Seconds() * 1000
+	s.relayMsSum += relayMs
+	if relayMs > s.maxRelayMs {
+		s.maxRelayMs = relayMs
+	}
+	pacingMs := pacing.Seconds() * 1000
+	s.pacingMsSum += pacingMs
+	if pacingMs > s.maxPacingMs {
+		s.maxPacingMs = pacingMs
+	}
+	if !idr {
+		return
+	}
+	s.idrFrames++
+	if bytes > s.maxIDRBytes {
+		s.maxIDRBytes = bytes
+	}
+	if pacingMs > s.maxIDRPaceMs {
+		s.maxIDRPaceMs = pacingMs
+	}
+}
+
+func (s *stageStats) summary() string {
+	if s.frames == 0 {
+		return ""
+	}
+	frames := float64(s.frames)
+	summary := fmt.Sprintf(
+		"frames=%d queue avg=%.1f max=%d | relay wait avg=%.1fms max=%.1fms | pacing avg=%.1fms max=%.1fms",
+		s.frames,
+		float64(s.queueLenSum)/frames,
+		s.maxQueueLen,
+		s.relayMsSum/frames,
+		s.maxRelayMs,
+		s.pacingMsSum/frames,
+		s.maxPacingMs,
+	)
+	if s.idrFrames > 0 {
+		summary += fmt.Sprintf(
+			" | idr n=%d max=%d bytes max pacing=%.1fms",
+			s.idrFrames, s.maxIDRBytes, s.maxIDRPaceMs,
+		)
+	}
+	return summary
+}
 
 // idrRequestGate bounds the feedback-loop gain: regardless of how many
 // independent drop/PLI paths observe corruption, they can produce at most one
@@ -201,7 +336,13 @@ func (u *machineUpstream) send(cmd []byte) bool {
 	}
 }
 
-func (u *machineUpstream) requestIDR() bool {
+func (u *machineUpstream) requestIDR(reason idrReason) bool {
+	granted := u.sendIDRRequest()
+	u.idrStats.record(reason, granted)
+	return granted
+}
+
+func (u *machineUpstream) sendIDRRequest() bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if !u.idrGate.allow() {
@@ -402,15 +543,16 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
+			frame := frameMsg{tsMicros: tsMicros, data: data, receivedAt: time.Now()}
 			select {
-			case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
+			case u.frameChan <- frame:
 			default:
 				select {
 				case <-u.frameChan:
 				default:
 				}
-				u.requestIDR()
-				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+				u.requestIDR(idrReasonUpstreamDrop)
+				u.frameChan <- frame
 			}
 		case 0x02:
 			if !json.Valid(data) {
@@ -508,15 +650,16 @@ func (u *machineUpstream) connectQUIC() error {
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
+			frame := frameMsg{tsMicros: tsMicros, data: data, receivedAt: time.Now()}
 			select {
-			case u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}:
+			case u.frameChan <- frame:
 			default:
 				select {
 				case <-u.frameChan:
 				default:
 				}
-				u.requestIDR()
-				u.frameChan <- frameMsg{tsMicros: tsMicros, data: data}
+				u.requestIDR(idrReasonUpstreamDrop)
+				u.frameChan <- frame
 			}
 		case 0x02:
 			if json.Valid(data) {
@@ -540,11 +683,23 @@ func (u *machineUpstream) framePusher() {
 	var sampleCount uint64
 	var lastTs uint64
 	var haveLastTs bool
+	var stats stageStats
+	statsTicker := time.NewTicker(stageStatsInterval)
+	defer statsTicker.Stop()
 	for {
 		select {
 		case <-u.stopChan:
 			return
+		case <-statsTicker.C:
+			if summary := stats.summary(); summary != "" {
+				log.Printf("[stage:%s] %s", u.id, summary)
+			}
+			if summary := u.idrStats.drain(); summary != "" {
+				log.Printf("[idr:%s] %s", u.id, summary)
+			}
+			stats = stageStats{}
 		case msg := <-u.frameChan:
+			queueLen := len(u.frameChan)
 			var dropped bool
 			msg, dropped = latestFrame(u.frameChan, msg)
 			idr := isIDRFrame(msg.data)
@@ -554,7 +709,7 @@ func (u *machineUpstream) framePusher() {
 			}
 			if dropped {
 				sess.needsIDR = true
-				if u.requestIDR() {
+				if u.requestIDR(idrReasonStaleQueue) {
 					log.Printf("[webrtc:%s] discarded queued frames for newer frame; requesting IDR", u.id)
 				}
 			}
@@ -594,14 +749,25 @@ func (u *machineUpstream) framePusher() {
 				packetSizes[i] = packet.MarshalSize()
 			}
 			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps(), frameDuration)
+			pacingStart := time.Now()
 			next, sent := u.writePacedPackets(sess, packets, schedule, idr)
+			pacingElapsed := time.Since(pacingStart)
+			var relayWait time.Duration
+			if !msg.receivedAt.IsZero() {
+				relayWait = pacingStart.Sub(msg.receivedAt)
+			}
+			stats.observe(queueLen, relayWait, pacingElapsed, idr, len(msg.data))
+			if idr {
+				log.Printf("[webrtc:%s] IDR paced: %d packets, waited %.1fms in relay, sent over %.1fms",
+					u.id, len(packets), relayWait.Seconds()*1000, pacingElapsed.Seconds()*1000)
+			}
 			if next != nil {
 				remaining := len(packets) - sent
 				if remaining > 0 {
 					// Leave the marker clear: the emitted prefix is truncated,
 					// not a complete access unit. Recovery comes from the IDR.
 					sess.needsIDR = true
-					if u.requestIDR() {
+					if u.requestIDR(idrReasonAbandoned) {
 						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
 					}
 				}
@@ -619,7 +785,7 @@ func (u *machineUpstream) framePusher() {
 				}
 				if droppedQueued {
 					sess.needsIDR = true
-					if u.requestIDR() {
+					if u.requestIDR(idrReasonRequeueDrop) {
 						log.Printf("[webrtc:%s] dropped queued frame while requeueing newer frame; requesting IDR", u.id)
 					}
 				}

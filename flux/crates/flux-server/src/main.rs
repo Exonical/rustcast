@@ -925,6 +925,68 @@ fn should_encode_frame(
     }
 }
 
+/// Per-frame capture and encode durations accumulated over a reporting window.
+/// A single instantaneous sample hides exactly the frames that matter, since the
+/// stalls being chased are occasional: only the maxima show them, and keyframes
+/// are tracked separately because their cost is what the rest of the pipeline
+/// has to absorb.
+#[derive(Debug, Default)]
+struct StageTimings {
+    frames: u64,
+    capture_sum: std::time::Duration,
+    capture_max: std::time::Duration,
+    encode_sum: std::time::Duration,
+    encode_max: std::time::Duration,
+    keyframes: u64,
+    keyframe_encode_max: std::time::Duration,
+    keyframe_bytes_max: usize,
+}
+
+impl StageTimings {
+    fn observe(
+        &mut self,
+        capture: std::time::Duration,
+        encode: std::time::Duration,
+        keyframe_bytes: Option<usize>,
+    ) {
+        self.frames += 1;
+        self.capture_sum += capture;
+        self.capture_max = self.capture_max.max(capture);
+        self.encode_sum += encode;
+        self.encode_max = self.encode_max.max(encode);
+        if let Some(bytes) = keyframe_bytes {
+            self.keyframes += 1;
+            self.keyframe_encode_max = self.keyframe_encode_max.max(encode);
+            self.keyframe_bytes_max = self.keyframe_bytes_max.max(bytes);
+        }
+    }
+
+    /// Formats the window's timings, or `None` if no frames were observed.
+    fn summary(&self) -> Option<String> {
+        if self.frames == 0 {
+            return None;
+        }
+        let frames = self.frames as f64;
+        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        let mut summary = format!(
+            "capture avg={:.1}ms max={:.1}ms | encode avg={:.1}ms max={:.1}ms",
+            ms(self.capture_sum) / frames,
+            ms(self.capture_max),
+            ms(self.encode_sum) / frames,
+            ms(self.encode_max),
+        );
+        if self.keyframes > 0 {
+            summary += &format!(
+                " | keyframes n={} max encode={:.1}ms max={} bytes",
+                self.keyframes,
+                ms(self.keyframe_encode_max),
+                self.keyframe_bytes_max,
+            );
+        }
+        Some(summary)
+    }
+}
+
 /// Create an encoder of the given backend and open a session, returning `None`
 /// (with a warning logged) if either the encoder or the session can't be built.
 /// If the requested resolution exceeds the encoder's maximum, the session is
@@ -1302,6 +1364,7 @@ fn capture_loop(
     );
 
     let mut frame_count: u64 = 0;
+    let mut stage_timings = StageTimings::default();
     loop {
         if let Ok(request) = resolution_rx.try_recv() {
             #[cfg(target_os = "windows")]
@@ -1751,11 +1814,15 @@ fn capture_loop(
             .timestamp
             .saturating_duration_since(loop_start)
             .as_micros() as u64;
+        let mut keyframe_bytes = None;
         if let Some(ref mut enc) = encode_session {
             match enc.encode(&frame) {
                 Ok(packets) => {
                     for pkt in &packets {
                         total_encoded_bytes += pkt.data.len() as u64;
+                        if pkt.is_keyframe {
+                            keyframe_bytes = Some(pkt.data.len());
+                        }
 
                         if frame_count <= max_verify_frames {
                             if let Some(ref mut f) = h264_file {
@@ -1780,6 +1847,7 @@ fn capture_loop(
             }
         }
         let t_encode = t1.elapsed();
+        stage_timings.observe(t_capture, t_encode, keyframe_bytes);
 
         // Periodic performance stats (every 5 seconds)
         if frame_count % (target_fps as u64 * 5) == 0 {
@@ -1788,11 +1856,12 @@ fn capture_loop(
             let avg_kbps = if frame_count > 0 {
                 (total_encoded_bytes as f64 * 8.0 / wall / 1000.0) as u64
             } else { 0 };
+            let stages = stage_timings.summary().unwrap_or_default();
+            stage_timings = StageTimings::default();
             tracing::info!(
-                "Perf: {:.1} fps | capture={:.1}ms encode={:.1}ms | {} frames, ~{} kbps",
+                "Perf: {:.1} fps | {} | {} frames, ~{} kbps",
                 actual_fps,
-                t_capture.as_secs_f64() * 1000.0,
-                t_encode.as_secs_f64() * 1000.0,
+                stages,
                 frame_count,
                 avg_kbps,
             );
@@ -1910,6 +1979,33 @@ mod quality_tests {
             start + std::time::Duration::from_secs(1) + std::time::Duration::from_millis(1),
             48
         ));
+    }
+}
+
+#[cfg(test)]
+mod stage_timing_tests {
+    use super::*;
+
+    fn ms(millis: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn reports_worst_case_alongside_average() {
+        let mut timings = StageTimings::default();
+        timings.observe(ms(2), ms(4), None);
+        timings.observe(ms(8), ms(40), Some(700_000));
+
+        assert_eq!(
+            timings.summary().unwrap(),
+            "capture avg=5.0ms max=8.0ms | encode avg=22.0ms max=40.0ms \
+             | keyframes n=1 max encode=40.0ms max=700000 bytes"
+        );
+    }
+
+    #[test]
+    fn idle_window_has_no_summary() {
+        assert!(StageTimings::default().summary().is_none());
     }
 }
 

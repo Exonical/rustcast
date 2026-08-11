@@ -16,6 +16,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
@@ -74,8 +76,9 @@ type Session struct {
 	machine             *machineUpstream
 	release             func()
 	releaseOnce         sync.Once
-	cursorDone          chan struct{}
+	sessionDone         chan struct{}
 	writer              *wsWriter
+	bwe                 cc.BandwidthEstimator
 }
 
 type wsWriter struct {
@@ -99,6 +102,9 @@ func (w *wsWriter) write(messageType int, payload []byte) error {
 type frameMsg struct {
 	tsMicros uint64
 	data     []byte
+	// receivedAt is when the relay finished reading the frame off the wire, so
+	// the time it then spends queued behind the pusher can be measured.
+	receivedAt time.Time
 }
 
 type cursorMsg struct {
@@ -201,6 +207,29 @@ func newSession() (*Session, error) {
 		return nil, fmt.Errorf("register default interceptors: %w", err)
 	}
 
+	// The default set generates TWCC for inbound media; this adds the
+	// transport-cc header extension to our outbound RTP so the viewer reports
+	// per-packet arrival times back to us.
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
+		return nil, fmt.Errorf("configure twcc header extension: %w", err)
+	}
+
+	// Send-side bandwidth estimation over that feedback. It is observational:
+	// pacing stays in the relay's frame pusher (hence the no-op pacer here) and
+	// the encoder target still comes from abrState, so GCC's estimate can be
+	// compared against ours on real links before it is given control.
+	var estimator cc.BandwidthEstimator
+	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		return gcc.NewSendSideBWE(gcc.SendSideBWEPacer(gcc.NewNoOpPacer()))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create congestion controller: %w", err)
+	}
+	ccFactory.OnNewPeerConnection(func(_ string, bwe cc.BandwidthEstimator) {
+		estimator = bwe
+	})
+	i.Add(ccFactory)
+
 	se := webrtc.SettingEngine{}
 	if iceUDPMux != nil {
 		se.SetICEUDPMux(iceUDPMux)
@@ -251,7 +280,9 @@ func newSession() (*Session, error) {
 	}
 
 	session := &Session{PeerConnection: pc, VideoTrack: videoTrack, Packetizer: packetizer}
-	session.cursorDone = make(chan struct{})
+	session.sessionDone = make(chan struct{})
+	session.bwe = estimator
+	go logBandwidthEstimate(session)
 
 	// Read RTCP from the browser: on PLI/FIR (decoder lost reference frames,
 	// e.g. after WiFi packet loss the NACK window couldn't cover) request a
@@ -283,8 +314,52 @@ func (s *Session) releaseNow() {
 		if s.release != nil {
 			s.release()
 		}
-		close(s.cursorDone)
+		close(s.sessionDone)
 	})
+}
+
+// bweLogInterval is how often GCC's view of the path is logged. It is a
+// diagnostic cadence, not a control loop: slow enough to read in a terminal,
+// frequent enough to line up with the keyframe and pacing lines around it.
+const bweLogInterval = 2 * time.Second
+
+// logBandwidthEstimate reports GCC's send-side estimate alongside the target
+// abrState is actually asking the encoder for, so the two can be compared on a
+// real link. GCC sees per-packet arrival times (TWCC) rather than the RTCP
+// receiver reports abrState uses, so a persistent gap between the two means our
+// loss/RTT signal is the weaker estimator.
+func logBandwidthEstimate(session *Session) {
+	if session.bwe == nil {
+		return
+	}
+	ticker := time.NewTicker(bweLogInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-session.sessionDone:
+			return
+		case <-ticker.C:
+			stats := session.bwe.GetStats()
+			var abrTarget uint32
+			if session.machine != nil {
+				abrTarget = session.machine.abr.targetBitrateKbps()
+			}
+			log.Printf("[bwe] gcc=%d kbps abr=%d kbps loss=%.1f%% delay=%.1fms (threshold %.1fms) usage=%v state=%v",
+				session.bwe.GetTargetBitrate()/1000,
+				abrTarget,
+				floatStat(stats, "averageLoss")*100,
+				floatStat(stats, "delayEstimate"),
+				floatStat(stats, "delayThreshold"),
+				stats["usage"],
+				stats["state"],
+			)
+		}
+	}
+}
+
+func floatStat(stats map[string]any, key string) float64 {
+	value, _ := stats[key].(float64)
+	return value
 }
 
 // rttFromReport computes the round-trip time from an RTCP reception report
@@ -328,7 +403,7 @@ func forwardKeyframeRequests(session *Session, sender *webrtc.RTPSender) {
 				if session.machine == nil {
 					continue
 				}
-				if !session.machine.requestIDR() {
+				if !session.machine.requestIDR(idrReasonViewerPLI) {
 					continue
 				}
 				log.Printf("[webrtc] PLI from viewer → requested IDR from upstream")
@@ -608,7 +683,7 @@ func forwardCursorUpdates(writer *wsWriter, session *Session) {
 	}
 	for {
 		select {
-		case <-session.cursorDone:
+		case <-session.sessionDone:
 			return
 		case msg := <-session.machine.cursorChan:
 			latest = &msg
