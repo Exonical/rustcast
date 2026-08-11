@@ -19,6 +19,7 @@ use flux_core::frame::{CapturedFrame, EncodedPacket, GpuFrameHandle};
 use flux_core::types::{DynamicRange, RateControlMode, Resolution, VideoCodec};
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice};
 use windows::core::Interface;
 
 use crate::traits::{EncodeConfig, EncodeSession, EncoderCapabilities, VideoEncoder};
@@ -745,6 +746,50 @@ pub struct AmfSession {
     cached_shared_texture: Option<(u64, ID3D11Texture2D)>,
 }
 
+fn log_amf_encode_adapter(device: &ID3D11Device) {
+    let dxgi_device: IDXGIDevice = match device.cast() {
+        Ok(device) => device,
+        Err(error) => {
+            tracing::warn!("AMF encoder adapter lookup: IDXGIDevice cast failed: {}", error);
+            return;
+        }
+    };
+    let adapter = match unsafe { dxgi_device.GetAdapter() } {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            tracing::warn!("AMF encoder adapter lookup: GetAdapter failed: {}", error);
+            return;
+        }
+    };
+    let adapter: IDXGIAdapter1 = match adapter.cast() {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            tracing::warn!("AMF encoder adapter lookup: IDXGIAdapter1 cast failed: {}", error);
+            return;
+        }
+    };
+    let desc = match unsafe { adapter.GetDesc1() } {
+        Ok(desc) => desc,
+        Err(error) => {
+            tracing::warn!("AMF encoder adapter lookup: GetDesc1 failed: {}", error);
+            return;
+        }
+    };
+    let adapter_luid =
+        u64::from(desc.AdapterLuid.LowPart) | ((desc.AdapterLuid.HighPart as i64 as u64) << 32);
+    let adapter_name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+    let adapter_name = String::from_utf16_lossy(&desc.Description[..adapter_name_len]);
+
+    tracing::info!(
+        "AMF DXGI Adapter: {} (LUID=0x{:016X}, VendorID=0x{:04X}, DeviceID=0x{:04X}, VRAM={} MB)",
+        adapter_name,
+        adapter_luid,
+        desc.VendorId,
+        desc.DeviceId,
+        desc.DedicatedVideoMemory / (1024 * 1024),
+    );
+}
+
 impl AmfSession {
     fn new(
         factory: *mut AMFFactoryObj,
@@ -769,6 +814,7 @@ impl AmfSession {
 
         // Retrieve the internal D3D11 device to support OpenSharedResource
         let d3d11_device = context.get_dx11_device()?;
+        log_amf_encode_adapter(&d3d11_device);
 
         // 2. Create encoder component
         let codec_id = match config.codec {
