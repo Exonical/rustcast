@@ -127,8 +127,9 @@ export class WebRTCClient {
       // sizes the jitter buffer for smoothness.
       const receiver = e.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
       try {
-        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 40;
-        receiver.playoutDelayHint = 0.04;
+        // Chromium treats both controls as minimum-delay hints, not ceilings.
+        if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
+        receiver.playoutDelayHint = 0;
       } catch { /* hint only */ }
       if (e.streams?.[0]) this.onStream?.(e.streams[0]);
     };

@@ -84,4 +84,11 @@ pub trait EncodeSession: Send {
 
     /// Dynamically update the target bitrate (kbps).
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()>;
+
+    /// Dynamically update the configured frame rate without rebuilding the
+    /// session. Backends that do not expose runtime frame-rate control may
+    /// leave this as a no-op.
+    fn set_framerate(&mut self, _framerate: u32) -> Result<()> {
+        Ok(())
+    }
 }

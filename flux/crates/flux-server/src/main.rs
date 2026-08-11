@@ -891,21 +891,38 @@ fn bitrate_kbps_for(
     (bps / 1000.0).round().clamp(3_000.0, 50_000.0) as u32
 }
 
-const FRAME_PACING_TOLERANCE: f64 = 0.10;
+#[derive(Debug, Default)]
+struct FramePacer {
+    last_input_at: Option<std::time::Instant>,
+    credit: f64,
+}
+
+const FRAME_PACING_ACCEPT_THRESHOLD: f64 = 0.90;
 
 fn should_encode_frame(
-    last_encoded_at: &mut Option<std::time::Instant>,
+    pacer: &mut FramePacer,
     now: std::time::Instant,
     fps_cap: u32,
 ) -> bool {
-    let interval = std::time::Duration::from_secs_f64(1.0 / fps_cap.max(1) as f64);
-    if let Some(last) = *last_encoded_at {
-        if now.duration_since(last) + interval.mul_f64(FRAME_PACING_TOLERANCE) < interval {
-            return false;
-        }
+    let fps = fps_cap.max(1) as f64;
+    let Some(last) = pacer.last_input_at.replace(now) else {
+        pacer.credit = 0.0;
+        return true;
+    };
+
+    let elapsed = now.duration_since(last).as_secs_f64();
+    if elapsed >= 1.0 / fps {
+        pacer.credit = 0.0;
+        return true;
     }
-    *last_encoded_at = Some(now);
-    true
+
+    pacer.credit += elapsed * fps;
+    if pacer.credit >= FRAME_PACING_ACCEPT_THRESHOLD {
+        pacer.credit -= 1.0;
+        true
+    } else {
+        false
+    }
 }
 
 /// Create an encoder of the given backend and open a session, returning `None`
@@ -960,7 +977,7 @@ fn create_encode_session(
 /// opened (e.g. no VA-API driver). Returns the session and the backend used.
 #[allow(clippy::type_complexity)]
 fn build_encode_session_for(
-    target_fps: u32,
+    framerate: u32,
     resolution: flux_core::types::Resolution,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     quality_level: u8,
@@ -971,7 +988,7 @@ fn build_encode_session_for(
     let encoder_config = flux_encode::traits::EncodeConfig {
         codec: flux_core::types::VideoCodec::H264,
         resolution,
-        framerate: target_fps,
+        framerate,
         // Placeholder; recomputed per-backend from the fitted resolution.
         bitrate_kbps: 10_000,
         rate_control: flux_core::types::RateControlMode::Vbr,
@@ -979,7 +996,7 @@ fn build_encode_session_for(
         chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
         // Emit a keyframe every ~2s so a late joiner or any decode desync
         // recovers on its own without depending solely on a PLI/IDR request.
-        gop_size: target_fps.saturating_mul(2).max(1),
+        gop_size: framerate.saturating_mul(2).max(1),
         b_frames: 0,
         max_ref_frames: 1,
     };
@@ -1268,7 +1285,7 @@ fn capture_loop(
     let configured_fps = target_fps;
     let default_fps_cap = effective_default_fps_cap(configured_fps, default_fps_cap);
     let mut fps_cap = default_fps_cap;
-    let mut last_encoded_at: Option<std::time::Instant> = None;
+    let mut frame_pacer = FramePacer::default();
     let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
     let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
@@ -1516,6 +1533,9 @@ fn capture_loop(
             }
             if let Some(ref mut enc) = encode_session {
                 let kbps = bitrate_kbps_for(encode_resolution, fps_cap, quality_level);
+                if let Err(error) = enc.set_framerate(fps_cap) {
+                    tracing::warn!("runtime framerate update to {} failed: {}", fps_cap, error);
+                }
                 if let Err(error) = enc.set_bitrate(kbps) {
                     tracing::warn!("quality level {} bitrate update failed: {}", quality_level, error);
                 } else if let Ok(mut status) = runtime_status.write() {
@@ -1601,7 +1621,7 @@ fn capture_loop(
         };
 
         let t_capture = t0.elapsed();
-        if !should_encode_frame(&mut last_encoded_at, t0, fps_cap) {
+        if !should_encode_frame(&mut frame_pacer, t0, fps_cap) {
             continue;
         }
         frame_count += 1;
@@ -1611,7 +1631,7 @@ fn capture_loop(
         // so the encoder dimensions always match the frames it receives.
         if capture_resolution != frame.resolution {
             let (sess, backend) = build_encode_session_for(
-                target_fps,
+                fps_cap,
                 frame.resolution,
                 forced_backend,
                 quality_level,
@@ -1840,11 +1860,54 @@ mod quality_tests {
     fn pacing_accepts_native_interval_and_small_jitter() {
         let start = std::time::Instant::now();
         let interval = std::time::Duration::from_secs_f64(1.0 / 48.0);
-        let mut last = Some(start);
-        assert!(should_encode_frame(&mut last, start + interval, 48));
+        let mut pacer = FramePacer::default();
+        assert!(should_encode_frame(&mut pacer, start, 48));
+        assert!(should_encode_frame(&mut pacer, start + interval, 48));
         assert!(should_encode_frame(
-            &mut last,
+            &mut pacer,
             start + interval + interval.mul_f64(0.95),
+            48
+        ));
+    }
+
+    fn accepted_count(input_fps: u32, output_fps: u32, frames: usize) -> usize {
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs_f64(1.0 / input_fps as f64);
+        let mut pacer = FramePacer::default();
+        (0..frames)
+            .filter(|index| {
+                should_encode_frame(
+                    &mut pacer,
+                    start + interval.mul_f64(*index as f64),
+                    output_fps,
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn pacing_targets_48_fps_from_60_fps_capture() {
+        assert_eq!(accepted_count(60, 48, 600), 480);
+    }
+
+    #[test]
+    fn pacing_targets_30_fps_from_60_fps_capture() {
+        assert_eq!(accepted_count(60, 30, 600), 300);
+    }
+
+    #[test]
+    fn pacing_does_not_burst_after_capture_stall() {
+        let start = std::time::Instant::now();
+        let mut pacer = FramePacer::default();
+        assert!(should_encode_frame(&mut pacer, start, 48));
+        assert!(should_encode_frame(
+            &mut pacer,
+            start + std::time::Duration::from_secs(1),
+            48
+        ));
+        assert!(!should_encode_frame(
+            &mut pacer,
+            start + std::time::Duration::from_secs(1) + std::time::Duration::from_millis(1),
             48
         ));
     }

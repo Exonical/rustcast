@@ -13,10 +13,10 @@
 pub const AMF_VIDEO_ENCODER_VCE_AVC: &str = "AMFVideoEncoderVCE_AVC";
 
 /// H.265 / HEVC encoder component ID.
-pub const AMF_VIDEO_ENCODER_HEVC: &str = "AMFVideoEncoder_HEVC";
+pub const AMF_VIDEO_ENCODER_HEVC: &str = "AMFVideoEncoderHW_HEVC";
 
 /// AV1 encoder component ID (VCN 4.0+ / RDNA 3+).
-pub const AMF_VIDEO_ENCODER_AV1: &str = "AMFVideoEncoder_AV1";
+pub const AMF_VIDEO_ENCODER_AV1: &str = "AMFVideoEncoderHW_AV1";
 
 // ─── H.264 encoder properties ───────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ pub const H264_TARGET_BITRATE: &str = "TargetBitrate";
 pub const H264_PEAK_BITRATE: &str = "PeakBitrate";
 /// VBV buffer size in bits (amf_int64).
 pub const H264_VBV_BUFFER_SIZE: &str = "VBVBufferSize";
-/// Maximum access-unit size in bytes (amf_int64). Runtime support varies.
+/// Maximum access-unit size in bits (amf_int64). Runtime support varies.
 pub const H264_MAX_AU_SIZE: &str = "MaxAUSize";
 /// Minimum quantizer (amf_int64). Runtime support varies.
 pub const H264_MIN_QP: &str = "MinQP";
@@ -55,7 +55,7 @@ pub const H264_IDR_PERIOD: &str = "IDRPeriod";
 pub const H264_B_PIC_PATTERN: &str = "BPicturesPattern";
 /// Max number of consecutive B-pictures.
 pub const H264_MAX_NUM_REFRAMES: &str = "MaxNumRefFrames";
-/// Header insertion mode: "none", "gop", "idr".
+/// Header insertion mode. Runtime support varies; rejection is non-fatal.
 pub const H264_HEADER_INSERTION_MODE: &str = "HeaderInsertionMode";
 /// Low-latency mode (amf_bool).
 pub const H264_LOWLATENCY_MODE: &str = "LowLatencyInternal";

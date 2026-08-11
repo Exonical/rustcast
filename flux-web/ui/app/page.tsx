@@ -499,6 +499,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     e.preventDefault();
     const button = mapMouseButton(e.button);
     if (button) {
+      flushMove();
       clientRef.current.sendInput({
         Mouse: {
           ButtonDown: { button }
@@ -506,7 +507,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
       });
       heldButtons.current.add(button);
     }
-  }, []);
+  }, [flushMove]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocalControlTarget(e.target)) return;
@@ -515,6 +516,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     const button = mapMouseButton(e.button);
     if (button) {
       if (!heldButtons.current.has(button)) return;
+      flushMove();
       clientRef.current.sendInput({
         Mouse: {
           ButtonUp: { button }
@@ -522,7 +524,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
       });
       heldButtons.current.delete(button);
     }
-  }, []);
+  }, [flushMove]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -530,6 +532,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     const handleWheel = (e: WheelEvent) => {
       if (!clientRef.current) return;
       e.preventDefault();
+      flushMove();
       // e.deltaY is usually 100 or -100. Flux expects windows WHEEL_DELTA (120).
       // But we are sending raw delta. The server injects it as mouseData.
       // Standard mouse wheel is 120 per notch.
@@ -548,7 +551,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     };
     container.addEventListener("wheel", handleWheel, { passive: false });
     return () => container.removeEventListener("wheel", handleWheel);
-  }, []);
+  }, [flushMove]);
 
   useEffect(() => {
     const container = containerRef.current;

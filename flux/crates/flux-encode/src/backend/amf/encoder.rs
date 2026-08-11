@@ -306,6 +306,29 @@ impl AmfComponent {
         }
     }
 
+    fn set_optional_rate(&self, name: &str, num: u32, den: u32) -> PropertyStatus {
+        if !self.has_property(name) {
+            tracing::info!("AMF: SetProperty({}) unsupported", name);
+            return PropertyStatus::Unsupported;
+        }
+        match self.set_property_rate(name, num, den) {
+            Ok(()) => {
+                tracing::info!("AMF: SetProperty({}) = {}/{} accepted", name, num, den);
+                PropertyStatus::Accepted
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "AMF: SetProperty({}) = {}/{} rejected: {}",
+                    name,
+                    num,
+                    den,
+                    e
+                );
+                PropertyStatus::Rejected
+            }
+        }
+    }
+
     fn set_property_bool(&self, name: &str, value: bool) -> Result<()> {
         let wide_name = to_wide(name);
         let variant = AMFVariantStruct::from_bool(value);
@@ -482,13 +505,12 @@ fn vbv_buffer_size(bitrate_bps: i64, framerate: u32, frame_count: u64) -> i64 {
 
 /// Cap one access unit at roughly one tenth of a second of target bitrate.
 ///
-/// This is deliberately derived from bitrate: at 10 Mbps it is 125,000 bytes,
-/// small enough to keep a forced IDR from monopolizing the stream while still
-/// allowing a complex desktop keyframe to encode. AMF support is queried at
+/// AMF's MaxAUSize property is expressed in bits. At 10 Mbps this is
+/// 1,000,000 bits, or approximately 125 KiB. AMF support is queried at
 /// runtime because MaxAUSize is not present on every driver.
-fn max_au_size_bytes(bitrate_bps: i64) -> i64 {
+fn max_au_size_bits(bitrate_bps: i64) -> i64 {
     (bitrate_bps.max(0) as u64)
-        .checked_div(8 * H264_MAX_AU_TENTHS_OF_A_SECOND)
+        .checked_div(H264_MAX_AU_TENTHS_OF_A_SECOND)
         .unwrap_or(0)
         .max(1)
         .min(i64::MAX as u64) as i64
@@ -788,6 +810,7 @@ impl AmfSession {
         let frame_duration = frame_duration_100ns(config.framerate);
         let hrd_status;
         let filler_status;
+        let header_insertion_status;
         let max_au_status;
         let min_qp_status;
         let max_qp_status;
@@ -828,12 +851,13 @@ impl AmfSession {
                 // IDR_PERIOD must be 0 to allow per-frame ForcePictureType
                 encoder.set_property_int64(H264_IDR_PERIOD, 0)?;
                 encoder.set_property_int64(H264_B_PIC_PATTERN, 0)?;
-                encoder.set_property_int64(H264_HEADER_INSERTION_MODE, HEADER_INSERTION_IDR)?;
+                header_insertion_status =
+                    encoder.set_optional_int64(H264_HEADER_INSERTION_MODE, HEADER_INSERTION_IDR);
                 hrd_status = encoder.set_optional_bool(H264_ENFORCE_HRD, true);
                 // Bound the expensive case directly. These properties are
                 // absent from some AMF runtimes, so rejection is non-fatal.
                 max_au_status =
-                    encoder.set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bytes(bitrate_bps));
+                    encoder.set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bits(bitrate_bps));
                 min_qp_status = encoder.property_support_status(H264_MIN_QP);
                 max_qp_status = encoder.property_support_status(H264_MAX_QP);
                 // Adaptive quantization: spend bits where the eye notices
@@ -872,6 +896,7 @@ impl AmfSession {
                 encoder.set_property_int64(HEVC_VBV_BUFFER_SIZE, vbv_size)?;
 
                 filler_status = encoder.set_optional_bool(HEVC_FILLER_DATA, false);
+                header_insertion_status = PropertyStatus::NotApplicable;
                 max_au_status = PropertyStatus::NotApplicable;
                 min_qp_status = PropertyStatus::NotApplicable;
                 max_qp_status = PropertyStatus::NotApplicable;
@@ -905,6 +930,7 @@ impl AmfSession {
                     vbv_buffer_size(bitrate_bps, config.framerate, 1),
                 )?;
                 filler_status = encoder.set_optional_bool(AV1_FILLER_DATA, false);
+                header_insertion_status = PropertyStatus::NotApplicable;
                 hrd_status = encoder.set_optional_bool(AV1_ENFORCE_HRD, true);
                 max_au_status = PropertyStatus::NotApplicable;
                 min_qp_status = PropertyStatus::NotApplicable;
@@ -917,7 +943,7 @@ impl AmfSession {
         // 5. Initialize the encoder
         encoder.init(surface_format, w, h)?;
         tracing::info!(
-            "AMF effective config: backend=AMF runtime={}.{}.{}.{} codec={} resolution={} framerate={} target_bps={} peak_bps={} vbv_bits={} hrd={} filler={} MaxAUSize={} MinQP={} MaxQP={} VBAQ={} preanalysis={}",
+            "AMF effective config: backend=AMF runtime={}.{}.{}.{} codec={} resolution={} framerate={} target_bps={} peak_bps={} vbv_bits={} hrd={} filler={} header_insertion={} MaxAUSize={} MinQP={} MaxQP={} VBAQ={} preanalysis={}",
             amf_get_major(runtime_version),
             amf_get_minor(runtime_version),
             amf_get_subminor(runtime_version),
@@ -934,6 +960,7 @@ impl AmfSession {
             ),
             hrd_status,
             filler_status,
+            header_insertion_status,
             max_au_status,
             min_qp_status,
             max_qp_status,
@@ -1162,6 +1189,25 @@ impl EncodeSession for AmfSession {
         self.pending_idr_trigger = Some(IdrTrigger::EncoderRebuild);
     }
 
+    fn set_framerate(&mut self, framerate: u32) -> Result<()> {
+        let framerate = framerate.max(1);
+        let property = match self.config.codec {
+            VideoCodec::H264 => H264_FRAMERATE,
+            VideoCodec::H265 => HEVC_FRAMERATE,
+            VideoCodec::Av1 => AV1_FRAMERATE,
+        };
+        let status = self.encoder.set_optional_rate(property, framerate, 1);
+        tracing::info!(
+            "AMF: runtime framerate {} -> {} ({})",
+            property,
+            framerate,
+            status
+        );
+        self.config.framerate = framerate;
+        self.frame_duration_100ns = frame_duration_100ns(framerate);
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         tracing::debug!("AMF: flushing encoder");
 
@@ -1200,7 +1246,7 @@ impl EncodeSession for AmfSession {
                     vbv_buffer_size(bitrate_bps, self.config.framerate, 3),
                 )?;
                 self.encoder
-                    .set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bytes(bitrate_bps));
+                    .set_optional_int64(H264_MAX_AU_SIZE, max_au_size_bits(bitrate_bps));
             }
             VideoCodec::H265 => {
                 self.encoder.set_property_int64(HEVC_TARGET_BITRATE, bitrate_bps)?;
@@ -1298,9 +1344,9 @@ mod tests {
 
     #[test]
     fn max_au_size_is_one_tenth_second_of_target_bitrate() {
-        assert_eq!(max_au_size_bytes(10_000_000), 125_000);
-        assert_eq!(max_au_size_bytes(6_827_000), 85_337);
-        assert_eq!(max_au_size_bytes(0), 1);
+        assert_eq!(max_au_size_bits(10_000_000), 1_000_000);
+        assert_eq!(max_au_size_bits(6_827_000), 682_700);
+        assert_eq!(max_au_size_bits(0), 1);
     }
 
     #[test]
