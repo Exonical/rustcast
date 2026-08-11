@@ -112,13 +112,100 @@ func TestPacingScheduleIDRRespectsAbsoluteRateCeiling(t *testing.T) {
 }
 
 func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
-	ch := make(chan frameMsg, 2)
-	ch <- frameMsg{tsMicros: 2}
-	ch <- frameMsg{tsMicros: 3}
-	latest, dropped := latestFrame(ch, frameMsg{tsMicros: 1})
-	if !dropped || latest.tsMicros != 3 {
-		t.Fatalf("latestFrame() = (%+v, %t), want newest frame and dropped=true", latest, dropped)
+	tests := []struct {
+		name     string
+		current  frameMsg
+		queued   []frameMsg
+		wantTs   uint64
+		wantIDR  bool
+		wantDrop bool
+	}{
+		{
+			name:     "keyframe outranks newer P-frame",
+			current:  pFrame(1),
+			queued:   []frameMsg{idrFrame(2), pFrame(3)},
+			wantTs:   2,
+			wantIDR:  true,
+			wantDrop: true,
+		},
+		{
+			name:     "newest keyframe wins among multiple keyframes",
+			current:  pFrame(1),
+			queued:   []frameMsg{idrFrame(2), pFrame(3), idrFrame(4), pFrame(5)},
+			wantTs:   4,
+			wantIDR:  true,
+			wantDrop: true,
+		},
+		{
+			name:     "newest P-frame wins without a keyframe",
+			current:  pFrame(1),
+			queued:   []frameMsg{pFrame(2), pFrame(3)},
+			wantTs:   3,
+			wantIDR:  false,
+			wantDrop: true,
+		},
 	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ch := make(chan frameMsg, len(test.queued))
+			for _, frame := range test.queued {
+				ch <- frame
+			}
+			latest, dropped := latestFrame(ch, test.current)
+			if latest.tsMicros != test.wantTs || isIDRFrame(latest.data) != test.wantIDR || dropped != test.wantDrop {
+				t.Fatalf("latestFrame() = (%+v, %t), want ts=%d idr=%t dropped=%t",
+					latest, dropped, test.wantTs, test.wantIDR, test.wantDrop)
+			}
+		})
+	}
+}
+
+func TestGatedSkipRequestsRecoveryIDRThroughGate(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	u := newMachineUpstream("", "", nil)
+	u.idrGate = newIDRRequestGate(func() time.Time { return now })
+	session := &Session{needsIDR: true}
+
+	if !u.skipFrameUntilIDR(session, false) {
+		t.Fatal("gated P-frame was not skipped")
+	}
+	if got := len(u.commandChan); got != 1 {
+		t.Fatalf("first gated skip queued %d IDR requests, want 1", got)
+	}
+	if !u.skipFrameUntilIDR(session, false) {
+		t.Fatal("second gated P-frame was not skipped")
+	}
+	if got := len(u.commandChan); got != 1 {
+		t.Fatalf("same-window gated skip queued %d IDR requests, want 1", got)
+	}
+
+	now = now.Add(idrRequestInterval)
+	if !u.skipFrameUntilIDR(session, false) {
+		t.Fatal("next-window gated P-frame was not skipped")
+	}
+	if got := len(u.commandChan); got != 2 {
+		t.Fatalf("next-window gated skip queued %d IDR requests, want 2 total", got)
+	}
+}
+
+func TestGatedSkipDoesNotSkipIDR(t *testing.T) {
+	u := newMachineUpstream("", "", nil)
+	session := &Session{needsIDR: true}
+	if u.skipFrameUntilIDR(session, true) {
+		t.Fatal("IDR was incorrectly skipped")
+	}
+	if got := len(u.commandChan); got != 0 {
+		t.Fatalf("IDR path queued %d recovery requests, want 0", got)
+	}
+}
+
+func pFrame(ts uint64) frameMsg {
+	return frameMsg{tsMicros: ts, data: []byte{0, 0, 0, 1, 0x41}}
+}
+
+func idrFrame(ts uint64) frameMsg {
+	return frameMsg{tsMicros: ts, data: []byte{0, 0, 0, 1, 0x65}}
 }
 
 func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
