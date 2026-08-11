@@ -44,13 +44,15 @@ type machineUpstream struct {
 }
 
 const (
-	defaultFrameDuration = 16 * time.Millisecond // ~60fps for the first sample
-	minFrameDuration     = 4 * time.Millisecond  // clamp absurdly fast bursts
-	maxSaneFrameDuration = 30 * time.Second      // cap corrupted/absurd timestamps
-	pacingMultiplier     = 2                     // smooth bursts at 2x target bitrate
-	maxPacingMultiplier  = 4                     // cap frame-size floor at 4x target
-	idrRequestInterval   = 2 * time.Second
-	stageStatsInterval   = 5 * time.Second // how often per-stage timings are logged
+	defaultFrameDuration    = 16 * time.Millisecond // ~60fps for the first sample
+	minFrameDuration        = 4 * time.Millisecond  // clamp absurdly fast bursts
+	maxSaneFrameDuration    = 30 * time.Second      // cap corrupted/absurd timestamps
+	pacingMultiplier        = 2                     // smooth bursts at 2x target bitrate
+	maxPacingMultiplier     = 4                     // cap frame-size floor at 4x target
+	pacingIDRTargetEmission = 40 * time.Millisecond // emit a keyframe within ~2 frame intervals
+	pacingIDRMaxRate        = 10_000_000            // bits/s ceiling so that bound can't become a burst
+	idrRequestInterval      = 2 * time.Second
+	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
 )
 
 // Why a keyframe was asked for. Every request path is tagged so the logs show
@@ -216,6 +218,15 @@ func pacingSchedule(
 	targetKbps uint32,
 	frameDuration time.Duration,
 ) []time.Duration {
+	return pacingScheduleForFrame(packetSizes, targetKbps, frameDuration, false)
+}
+
+func pacingScheduleForFrame(
+	packetSizes []int,
+	targetKbps uint32,
+	frameDuration time.Duration,
+	idr bool,
+) []time.Duration {
 	schedule := make([]time.Duration, len(packetSizes))
 	if len(packetSizes) == 0 || frameDuration <= 0 {
 		return schedule
@@ -235,6 +246,15 @@ func pacingSchedule(
 		maxBitsPerSecond := float64(targetKbps) * 1000 * maxPacingMultiplier
 		if bitsPerSecond > maxBitsPerSecond {
 			bitsPerSecond = maxBitsPerSecond
+		}
+	}
+	if idr {
+		idrBitsPerSecond := float64(frameBits) / pacingIDRTargetEmission.Seconds()
+		if idrBitsPerSecond > bitsPerSecond {
+			bitsPerSecond = idrBitsPerSecond
+		}
+		if bitsPerSecond > pacingIDRMaxRate {
+			bitsPerSecond = pacingIDRMaxRate
 		}
 	}
 	var elapsedSeconds float64
@@ -748,7 +768,7 @@ func (u *machineUpstream) framePusher() {
 			for i, packet := range packets {
 				packetSizes[i] = packet.MarshalSize()
 			}
-			schedule := pacingSchedule(packetSizes, u.abr.targetBitrateKbps(), frameDuration)
+			schedule := pacingScheduleForFrame(packetSizes, u.abr.targetBitrateKbps(), frameDuration, idr)
 			pacingStart := time.Now()
 			next, sent := u.writePacedPackets(sess, packets, schedule, idr)
 			pacingElapsed := time.Since(pacingStart)

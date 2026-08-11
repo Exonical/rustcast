@@ -94,6 +94,23 @@ func TestPacingScheduleLargeFrameIsBoundedByTargetMultiple(t *testing.T) {
 	}
 }
 
+func TestPacingScheduleIDRUsesEmissionTargetAfterLongGap(t *testing.T) {
+	schedule := pacingScheduleForFrame([]int{50_000, 30_000}, 2_100, time.Second, true)
+	if got, want := schedule[1], 40*time.Millisecond; got != want {
+		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
+	}
+	if got, want := schedule[1]+30_000*8*time.Second/time.Duration(pacingIDRMaxRate), 64*time.Millisecond; got != want {
+		t.Fatalf("IDR emission time = %s, want %s", got, want)
+	}
+}
+
+func TestPacingScheduleIDRRespectsAbsoluteRateCeiling(t *testing.T) {
+	schedule := pacingScheduleForFrame([]int{1_000_000, 1}, 1_000, time.Second, true)
+	if got, want := schedule[1], 800*time.Millisecond; got != want {
+		t.Fatalf("large IDR final packet starts at %s, want %s", got, want)
+	}
+}
+
 func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
 	ch := make(chan frameMsg, 2)
 	ch <- frameMsg{tsMicros: 2}
