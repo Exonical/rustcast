@@ -49,8 +49,8 @@ const (
 	maxSaneFrameDuration    = 30 * time.Second      // cap corrupted/absurd timestamps
 	pacingMultiplier        = 2                     // smooth bursts at 2x target bitrate
 	maxPacingMultiplier     = 4                     // cap frame-size floor at 4x target
-	pacingIDRTargetEmission = 40 * time.Millisecond
-	pacingIDRMaxRate        = 10_000_000
+	pacingIDRTargetEmission = 40 * time.Millisecond // emit a keyframe within ~2 frame intervals
+	pacingIDRMaxRate        = 10_000_000            // bits/s ceiling so that bound can't become a burst
 	idrRequestInterval      = 2 * time.Second
 	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
 )

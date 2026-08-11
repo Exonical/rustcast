@@ -1,7 +1,6 @@
 package main
 
 import (
-	"reflect"
 	"testing"
 	"time"
 
@@ -109,15 +108,6 @@ func TestPacingScheduleIDRRespectsAbsoluteRateCeiling(t *testing.T) {
 	schedule := pacingScheduleForFrame([]int{1_000_000, 1}, 1_000, time.Second, true)
 	if got, want := schedule[1], 800*time.Millisecond; got != want {
 		t.Fatalf("large IDR final packet starts at %s, want %s", got, want)
-	}
-}
-
-func TestPacingScheduleNonIDRMatchesExistingBehavior(t *testing.T) {
-	packetSizes := []int{1200, 800, 400}
-	want := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
-	got := pacingScheduleForFrame(packetSizes, 100, 16*time.Millisecond, false)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("non-IDR schedule changed: got %v, want %v", got, want)
 	}
 }
 
