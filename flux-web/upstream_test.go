@@ -110,7 +110,7 @@ func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 
 	for range 6 {
-		u.requestIDR()
+		u.requestIDR(idrReasonStaleQueue)
 	}
 	if got := len(u.commandChan); got != 1 {
 		t.Fatalf("burst queued %d IDR requests, want exactly 1", got)
@@ -120,7 +120,7 @@ func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 	}
 
 	now = now.Add(idrRequestInterval)
-	if !u.requestIDR() {
+	if !u.requestIDR(idrReasonStaleQueue) {
 		t.Fatal("request at the next gate window was rejected")
 	}
 	if got := len(u.commandChan); got != 1 {
@@ -137,7 +137,7 @@ func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 	session := &Session{}
 
-	if !u.requestIDR() {
+	if !u.requestIDR(idrReasonViewerPLI) {
 		t.Fatal("regular IDR request was rejected")
 	}
 	if !u.requestInitialIDR(session) {
@@ -209,5 +209,41 @@ func TestAbandonedFrameDoesNotOveradvanceRTPClock(t *testing.T) {
 			combinedTicks,
 			combinedRemainder,
 		)
+	}
+}
+
+func TestIDRStatsSeparatesGrantedFromSuppressedByReason(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	u := newMachineUpstream("", "", nil)
+	u.idrGate = newIDRRequestGate(func() time.Time { return now })
+
+	u.requestIDR(idrReasonViewerPLI)  // granted
+	u.requestIDR(idrReasonAbandoned)  // gated
+	u.requestIDR(idrReasonStaleQueue) // gated
+	u.requestIDR(idrReasonStaleQueue) // gated
+
+	summary := u.idrStats.drain()
+	want := "viewer-pli=1(+0 suppressed) stale-queue-discard=0(+2 suppressed) abandoned-packets=0(+1 suppressed)"
+	if summary != want {
+		t.Fatalf("summary = %q, want %q", summary, want)
+	}
+	if again := u.idrStats.drain(); again != "" {
+		t.Fatalf("counts survived a drain: %q", again)
+	}
+}
+
+func TestStageStatsReportsWorstCaseSeparatelyFromAverage(t *testing.T) {
+	var stats stageStats
+	stats.observe(1, 2*time.Millisecond, 4*time.Millisecond, false, 10_000)
+	stats.observe(9, 20*time.Millisecond, 40*time.Millisecond, true, 700_000)
+
+	summary := stats.summary()
+	want := "frames=2 queue avg=5.0 max=9 | relay wait avg=11.0ms max=20.0ms | " +
+		"pacing avg=22.0ms max=40.0ms | idr n=1 max=700000 bytes max pacing=40.0ms"
+	if summary != want {
+		t.Fatalf("summary = %q, want %q", summary, want)
+	}
+	if empty := (&stageStats{}).summary(); empty != "" {
+		t.Fatalf("idle window summary = %q, want empty", empty)
 	}
 }

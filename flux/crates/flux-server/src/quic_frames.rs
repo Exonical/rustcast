@@ -32,6 +32,72 @@ pub const ALPN: &[u8] = b"flux-frames";
 const FRAME_RESET_BACKLOG_THRESHOLD: usize = 3;
 const FRAME_RESET_IDR_COOLDOWN: Duration = Duration::from_millis(500);
 
+const SEND_TIMING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long frames take to hand to QUIC, accumulated over a reporting window.
+/// This is the sender's share of a stall: a frame whose send takes far longer
+/// than a frame interval is either being flow-controlled by the transport or is
+/// simply too large for the link, and keyframes are tracked apart because they
+/// are the frames big enough for that to happen to.
+#[derive(Debug, Default)]
+struct SendTimings {
+    frames: u64,
+    lagged: u64,
+    sum: Duration,
+    max: Duration,
+    keyframes: u64,
+    keyframe_max: Duration,
+    keyframe_bytes_max: usize,
+    window_started: Option<Instant>,
+}
+
+impl SendTimings {
+    fn observe(&mut self, elapsed: Duration, bytes: usize, is_idr: bool) {
+        self.frames += 1;
+        self.sum += elapsed;
+        self.max = self.max.max(elapsed);
+        if is_idr {
+            self.keyframes += 1;
+            self.keyframe_max = self.keyframe_max.max(elapsed);
+            self.keyframe_bytes_max = self.keyframe_bytes_max.max(bytes);
+        }
+    }
+
+    /// Records frames the transport never saw because this task fell behind the
+    /// encoder's broadcast channel.
+    fn record_lag(&mut self, frames: u64) {
+        self.lagged += frames;
+    }
+
+    /// Returns the window's summary once the reporting interval has elapsed,
+    /// resetting the accumulator.
+    fn take_due(&mut self, now: Instant) -> Option<String> {
+        let started = *self.window_started.get_or_insert(now);
+        if now.duration_since(started) < SEND_TIMING_INTERVAL || self.frames == 0 {
+            return None;
+        }
+        let frames = self.frames as f64;
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let mut summary = format!(
+            "frames={} lagged={} | send avg={:.1}ms max={:.1}ms",
+            self.frames,
+            self.lagged,
+            ms(self.sum) / frames,
+            ms(self.max),
+        );
+        if self.keyframes > 0 {
+            summary += &format!(
+                " | keyframes n={} max send={:.1}ms max={} bytes",
+                self.keyframes,
+                ms(self.keyframe_max),
+                self.keyframe_bytes_max,
+            );
+        }
+        *self = Self { window_started: Some(now), ..Self::default() };
+        Some(summary)
+    }
+}
+
 // A single newer frame is not enough reason to reset a stream, but discarded
 // intermediate frames still warrant a rate-limited IDR request.
 #[derive(Debug, Default)]
@@ -201,10 +267,17 @@ async fn handle_connection(
     }
 
     let mut reset_policy = FrameResetPolicy::default();
+    let mut send_timings = SendTimings::default();
     let mut pending_frame: Option<Arc<(u64, Vec<u8>)>> = None;
     loop {
+        if let Some(summary) = send_timings.take_due(Instant::now()) {
+            tracing::info!("QUIC send: {}", summary);
+        }
         if let Some(frame) = pending_frame.take() {
-            match send_frame_message(
+            let bytes = frame.1.len();
+            let is_idr = is_idr_frame(&frame.1);
+            let started = Instant::now();
+            let result = send_frame_message(
                 &connection,
                 frame.0,
                 frame.1.clone(),
@@ -212,8 +285,9 @@ async fn handle_connection(
                 &mut reset_policy,
                 &frame_idr_tx,
             )
-            .await
-            {
+            .await;
+            send_timings.observe(started.elapsed(), bytes, is_idr);
+            match result {
                 FrameSendResult::Complete => {}
                 FrameSendResult::Superseded {
                     frame,
@@ -238,18 +312,24 @@ async fn handle_connection(
                     Ok(f) => f,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("QUIC frame sender lagged by {} frames", n);
+                        send_timings.record_lag(n);
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                match send_frame_message(
+                let bytes = frame.1.len();
+                let is_idr = is_idr_frame(&frame.1);
+                let started = Instant::now();
+                let result = send_frame_message(
                     &connection,
                     frame.0,
                     frame.1.clone(),
                     &mut rx,
                     &mut reset_policy,
                     &frame_idr_tx,
-                ).await {
+                ).await;
+                send_timings.observe(started.elapsed(), bytes, is_idr);
+                match result {
                     FrameSendResult::Complete => {}
                     FrameSendResult::Superseded {
                         frame,
@@ -597,5 +677,29 @@ mod tests {
         assert!(is_idr_frame(&[0, 0, 0, 1, 5]));
         assert!(is_idr_frame(&[0, 0, 1, 5]));
         assert!(!is_idr_frame(&[0, 0, 0, 1, 1]));
+    }
+
+    #[test]
+    fn send_timings_report_once_per_interval() {
+        let start = Instant::now();
+        let mut timings = SendTimings::default();
+        timings.observe(Duration::from_millis(2), 20_000, false);
+        assert!(timings.take_due(start).is_none());
+
+        timings.record_lag(3);
+        timings.observe(Duration::from_millis(60), 700_000, true);
+        let summary = timings.take_due(start + SEND_TIMING_INTERVAL).unwrap();
+        assert_eq!(
+            summary,
+            "frames=2 lagged=3 | send avg=31.0ms max=60.0ms \
+             | keyframes n=1 max send=60.0ms max=700000 bytes"
+        );
+
+        // Counts are per window, so the next interval starts from zero.
+        timings.observe(Duration::from_millis(1), 10_000, false);
+        assert_eq!(
+            timings.take_due(start + 2 * SEND_TIMING_INTERVAL).unwrap(),
+            "frames=1 lagged=0 | send avg=1.0ms max=1.0ms"
+        );
     }
 }
