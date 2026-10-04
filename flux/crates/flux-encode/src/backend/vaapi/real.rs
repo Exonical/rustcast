@@ -30,7 +30,7 @@ use cros_codecs::encoder::h264::EncoderConfig as H264Config;
 use cros_codecs::encoder::stateless::h264;
 use cros_codecs::encoder::{FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder as CcEncoder};
 use cros_codecs::{BlockingMode, Fourcc, FrameLayout, PlaneLayout, Resolution as CcResolution};
-use libva::{Display, Image, Surface, UsageHint, VAEntrypoint, VAProfile};
+use libva::{Display, Image, Surface, UsageHint, VAEntrypoint, VAImageFormat, VAProfile};
 
 /// Number of NV12 surfaces kept in the encoder's input pool.
 const SURFACE_POOL_SIZE: usize = 16;
@@ -238,9 +238,10 @@ fn run_encode_thread(config: EncodeConfig, rx: crossbeam_channel::Receiver<Cmd>,
 
 /// All `!Send` VA state, owned exclusively by the encode thread.
 struct EncoderState {
-    display: Rc<Display>,
     encoder: Box<dyn CcEncoder<PooledVaSurface<()>>>,
     pool: VaSurfacePool<()>,
+    /// NV12 `VAImageFormat`, queried once: a display's image formats are fixed.
+    nv12_format: VAImageFormat,
     width: u32,
     height: u32,
     timestamp: u64,
@@ -260,6 +261,7 @@ impl EncoderState {
         let coded = CcResolution { width, height };
         let tunings = low_latency_tunings(config);
         let low_power = pick_h264_low_power(&display)?;
+        let nv12_format = query_nv12_image_format(&display)?;
 
         let h264_config = H264Config {
             resolution: coded,
@@ -291,9 +293,9 @@ impl EncoderState {
             .map_err(|e| FluxError::EncoderInit(format!("failed to allocate VA surfaces: {e}")))?;
 
         Ok(Self {
-            display,
             encoder: Box::new(encoder),
             pool,
+            nv12_format,
             width,
             height,
             timestamp: 0,
@@ -311,7 +313,7 @@ impl EncoderState {
             reason: "no free VA surface in pool (encoder backpressure)".into(),
         })?;
 
-        let layout = upload_nv12(&self.display, handle.borrow(), self.width, self.height, &nv12).map_err(|e| {
+        let layout = upload_nv12(self.nv12_format, handle.borrow(), self.width, self.height, &nv12).map_err(|e| {
             FluxError::Encode {
                 frame: frame_no,
                 reason: e,
@@ -441,23 +443,25 @@ fn pick_h264_low_power(display: &Rc<Display>) -> Result<bool> {
     ))
 }
 
+/// Look up the driver's NV12 `VAImageFormat` (used by [`upload_nv12`]).
+fn query_nv12_image_format(display: &Rc<Display>) -> Result<VAImageFormat> {
+    display
+        .query_image_formats()
+        .map_err(|e| FluxError::EncoderInit(format!("vaQueryImageFormats failed: {e}")))?
+        .into_iter()
+        .find(|f| f.fourcc == libva::constants::VA_FOURCC_NV12)
+        .ok_or_else(|| FluxError::EncoderInit("driver does not expose an NV12 image format".into()))
+}
+
 /// Upload a packed NV12 buffer into a VA surface via `vaPutImage`, returning the
 /// surface's plane layout. Mirrors the `cros-codecs` `ccenc` upload example.
 fn upload_nv12(
-    display: &Rc<Display>,
+    image_fmt: VAImageFormat,
     surface: &Surface<()>,
     width: u32,
     height: u32,
     nv12: &[u8],
 ) -> std::result::Result<FrameLayout, String> {
-    let image_fmts = display
-        .query_image_formats()
-        .map_err(|e| format!("vaQueryImageFormats failed: {e}"))?;
-    let image_fmt = image_fmts
-        .into_iter()
-        .find(|f| f.fourcc == libva::constants::VA_FOURCC_NV12)
-        .ok_or_else(|| "driver does not expose an NV12 image format".to_string())?;
-
     let mut image = Image::create_from(surface, image_fmt, (width, height), (width, height))
         .map_err(|e| format!("vaCreateImage(NV12) failed: {e}"))?;
 
