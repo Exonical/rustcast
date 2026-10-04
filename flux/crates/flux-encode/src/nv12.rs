@@ -79,44 +79,76 @@ pub(crate) fn packed_rgb_to_nv12(
     let mut nv12 = vec![0u8; w * h + w * (h / 2)];
     let (y_plane, uv_plane) = nv12.split_at_mut(w * h);
 
-    let (ro, go, bo) = match order {
-        ChannelOrder::Bgra => (2usize, 1usize, 0usize),
-        ChannelOrder::Rgba => (0usize, 1usize, 2usize),
-    };
-
-    let px = |x: usize, y: usize| -> (i32, i32, i32) {
-        let base = y * stride + x * 4;
-        (data[base + ro] as i32, data[base + go] as i32, data[base + bo] as i32)
-    };
-
-    for y in 0..h {
-        for x in 0..w {
-            let (r, g, b) = px(x, y);
-            y_plane[y * w + x] = bt601_luma(r, g, b);
-        }
-    }
-
-    // Chroma is subsampled 2×2; average the block to reduce aliasing.
-    let cw = w / 2;
-    for cy in 0..(h / 2) {
-        for cx in 0..cw {
-            let (mut rs, mut gs, mut bs) = (0i32, 0i32, 0i32);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let (r, g, b) = px(cx * 2 + dx, cy * 2 + dy);
-                    rs += r;
-                    gs += g;
-                    bs += b;
-                }
-            }
-            let (r, g, b) = (rs / 4, gs / 4, bs / 4);
-            let idx = cy * w + cx * 2;
-            uv_plane[idx] = bt601_u(r, g, b);
-            uv_plane[idx + 1] = bt601_v(r, g, b);
-        }
+    match order {
+        ChannelOrder::Bgra => convert_rgb_rows::<2, 1, 0>(data, stride, w, h, y_plane, uv_plane),
+        ChannelOrder::Rgba => convert_rgb_rows::<0, 1, 2>(data, stride, w, h, y_plane, uv_plane),
     }
 
     Ok(nv12)
+}
+
+/// Single pass over the source: each 2×2 block is loaded once and feeds both
+/// its four luma samples and its averaged chroma pair. A trailing odd column
+/// or row only contributes luma.
+fn convert_rgb_rows<const RO: usize, const GO: usize, const BO: usize>(
+    data: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    y_plane: &mut [u8],
+    uv_plane: &mut [u8],
+) {
+    let row_bytes = w * 4;
+    let cw = w / 2;
+    let px = |p: &[u8]| (p[RO] as i32, p[GO] as i32, p[BO] as i32);
+
+    for cy in 0..(h / 2) {
+        let top = &data[2 * cy * stride..][..row_bytes];
+        let bottom = &data[(2 * cy + 1) * stride..][..row_bytes];
+        let (y_top, y_bottom) = y_plane[2 * cy * w..][..2 * w].split_at_mut(w);
+        let uv_row = &mut uv_plane[cy * w..][..2 * cw];
+
+        let blocks = top
+            .chunks_exact(8)
+            .zip(bottom.chunks_exact(8))
+            .zip(y_top.chunks_exact_mut(2))
+            .zip(y_bottom.chunks_exact_mut(2))
+            .zip(uv_row.chunks_exact_mut(2));
+        for ((((t, b), yt), yb), uv) in blocks {
+            let (r0, g0, b0) = px(&t[..4]);
+            let (r1, g1, b1) = px(&t[4..]);
+            let (r2, g2, b2) = px(&b[..4]);
+            let (r3, g3, b3) = px(&b[4..]);
+            yt[0] = bt601_luma(r0, g0, b0);
+            yt[1] = bt601_luma(r1, g1, b1);
+            yb[0] = bt601_luma(r2, g2, b2);
+            yb[1] = bt601_luma(r3, g3, b3);
+
+            // Chroma is subsampled 2×2; average the block to reduce aliasing.
+            let r = (r0 + r1 + r2 + r3) / 4;
+            let g = (g0 + g1 + g2 + g3) / 4;
+            let b = (b0 + b1 + b2 + b3) / 4;
+            uv[0] = bt601_u(r, g, b);
+            uv[1] = bt601_v(r, g, b);
+        }
+
+        if w % 2 == 1 {
+            let x = w - 1;
+            let (r, g, b) = px(&top[x * 4..]);
+            y_top[x] = bt601_luma(r, g, b);
+            let (r, g, b) = px(&bottom[x * 4..]);
+            y_bottom[x] = bt601_luma(r, g, b);
+        }
+    }
+
+    if h % 2 == 1 {
+        let y = h - 1;
+        let src = &data[y * stride..][..row_bytes];
+        for (p, out) in src.chunks_exact(4).zip(&mut y_plane[y * w..][..w]) {
+            let (r, g, b) = px(p);
+            *out = bt601_luma(r, g, b);
+        }
+    }
 }
 
 pub(crate) fn bt601_luma(r: i32, g: i32, b: i32) -> u8 {
@@ -237,6 +269,69 @@ mod tests {
         // Same bytes, but interpreted as BGRA means the 255 is the blue channel.
         let from_bgra = packed_rgb_to_nv12(&rgba, stride, w, h, ChannelOrder::Bgra).unwrap();
         assert_ne!(from_rgba[0], from_bgra[0]);
+    }
+
+    /// The original two-pass conversion, kept as an oracle for the fused one.
+    fn two_pass_reference(data: &[u8], stride: usize, w: usize, h: usize, order: ChannelOrder) -> Vec<u8> {
+        let mut nv12 = vec![0u8; w * h + w * (h / 2)];
+        let (y_plane, uv_plane) = nv12.split_at_mut(w * h);
+        let (ro, go, bo) = match order {
+            ChannelOrder::Bgra => (2usize, 1usize, 0usize),
+            ChannelOrder::Rgba => (0usize, 1usize, 2usize),
+        };
+        let px = |x: usize, y: usize| -> (i32, i32, i32) {
+            let base = y * stride + x * 4;
+            (data[base + ro] as i32, data[base + go] as i32, data[base + bo] as i32)
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let (r, g, b) = px(x, y);
+                y_plane[y * w + x] = bt601_luma(r, g, b);
+            }
+        }
+        for cy in 0..(h / 2) {
+            for cx in 0..(w / 2) {
+                let (mut rs, mut gs, mut bs) = (0i32, 0i32, 0i32);
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let (r, g, b) = px(cx * 2 + dx, cy * 2 + dy);
+                        rs += r;
+                        gs += g;
+                        bs += b;
+                    }
+                }
+                let (r, g, b) = (rs / 4, gs / 4, bs / 4);
+                let idx = cy * w + cx * 2;
+                uv_plane[idx] = bt601_u(r, g, b);
+                uv_plane[idx + 1] = bt601_v(r, g, b);
+            }
+        }
+        nv12
+    }
+
+    #[test]
+    fn fused_conversion_matches_two_pass_reference() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        for &(w, h) in &[(1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (5, 4), (4, 5), (7, 9), (64, 36)] {
+            for pad in [0usize, 4, 12] {
+                let stride = w * 4 + pad;
+                let data: Vec<u8> = (0..stride * h).map(|_| next()).collect();
+                for order in [ChannelOrder::Bgra, ChannelOrder::Rgba] {
+                    let fused = packed_rgb_to_nv12(&data, stride, w, h, order).unwrap();
+                    assert_eq!(
+                        fused,
+                        two_pass_reference(&data, stride, w, h, order),
+                        "{w}x{h} pad {pad}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
