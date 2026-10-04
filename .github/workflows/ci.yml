@@ -91,7 +91,7 @@ jobs:
           restore-keys: ${{ runner.os }}-go-
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26.5'
+          go-version-file: flux-web/go.mod
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
