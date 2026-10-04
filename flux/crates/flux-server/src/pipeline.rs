@@ -230,7 +230,20 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "encoder-vaapi")))]
+    #[test]
+    fn vaapi_stub_fails_pipeline_construction() {
+        let config = FluxConfig::default();
+        let platform = linux_amd_platform();
+        match StreamingPipeline::new(&config, &platform, &params(true)) {
+            Ok(_) => panic!("pipeline must not start on the VA-API placeholder encoder"),
+            Err(flux_core::error::FluxError::EncoderInit(msg)) => assert!(msg.contains("encoder-vaapi"), "{msg}"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
+    #[ignore = "requires a VA-API render node"]
     #[test]
     fn builds_and_selects_linux_amd_backends() {
         let config = FluxConfig::default();
@@ -249,7 +262,8 @@ mod tests {
         pipeline.stop().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "encoder-vaapi"))]
+    #[ignore = "requires a VA-API render node"]
     #[test]
     fn input_disabled_has_no_backend() {
         let config = FluxConfig::default();
