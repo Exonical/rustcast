@@ -68,6 +68,9 @@ rustls = { version = "0.23.27", default-features = false, features = ["ring"] }
 rustls-pemfile = "2.2.0"
 x509-parser = "0.18"
 
+# Time
+time = { version = "0.3.47", features = ["formatting"] }
+
 # Networking
 quinn = "0.11.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
