@@ -256,9 +256,9 @@ fn run_core(
             unsafe {
                 if !buffer.MetaData.pSurface.is_null() {
                     // The surface is returned with a reference we own.
-                    let surface: windows::core::IUnknown =
-                        core::mem::transmute(buffer.MetaData.pSurface);
-                    drop(surface);
+                    drop(windows::core::IUnknown::from_raw(
+                        buffer.MetaData.pSurface as *mut c_void,
+                    ));
                 }
             }
 
