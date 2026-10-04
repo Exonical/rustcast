@@ -752,8 +752,8 @@ pub struct AmfSession {
     surface_format: AMF_SURFACE_FORMAT,
     /// Force an IDR every this many frames (workaround: AMF ignores H264_IDR_PERIOD)
     idr_interval: u64,
-    /// Cached texture opened via OpenSharedResource (keyed by handle value)
-    cached_shared_texture: Option<(u64, ID3D11Texture2D)>,
+    /// Cached shared textures opened via OpenSharedResource (keyed by handle value)
+    cached_shared_textures: Vec<(u64, ID3D11Texture2D)>,
 }
 
 fn log_amf_encode_adapter(device: &ID3D11Device) {
@@ -1054,24 +1054,25 @@ impl AmfSession {
             last_pts_amf: 0,
             surface_format,
             idr_interval,
-            cached_shared_texture: None,
+            cached_shared_textures: Vec::new(),
         })
     }
 
     /// Open (or return cached) shared texture from a DXGI shared handle.
     fn open_shared_texture(&mut self, handle_val: u64) -> Result<&ID3D11Texture2D> {
-        // If we already have a cached texture for this handle, reuse it
-        if let Some((cached_handle, _)) = &self.cached_shared_texture {
-            if *cached_handle == handle_val {
-                return Ok(&self.cached_shared_texture.as_ref().unwrap().1);
-            }
+        if let Some(index) = self
+            .cached_shared_textures
+            .iter()
+            .position(|(cached_handle, _)| *cached_handle == handle_val)
+        {
+            return Ok(&self.cached_shared_textures[index].1);
         }
 
-        // Open the shared resource on AMF's internal D3D11 device
         unsafe {
             let handle = windows::Win32::Foundation::HANDLE(handle_val as *mut std::ffi::c_void);
             let mut texture: Option<ID3D11Texture2D> = None;
-            self.d3d11_device.OpenSharedResource(handle, &mut texture)
+            self.d3d11_device
+                .OpenSharedResource(handle, &mut texture)
                 .map_err(|e| FluxError::Encode {
                     frame: self.frame_index,
                     reason: format!("OpenSharedResource failed: {}", e),
@@ -1080,10 +1081,18 @@ impl AmfSession {
                 frame: self.frame_index,
                 reason: "OpenSharedResource returned null texture".into(),
             })?;
-            self.cached_shared_texture = Some((handle_val, texture));
+            self.cached_shared_textures.push((handle_val, texture));
+        }
+        if self.cached_shared_textures.len() > 4 {
+            self.cached_shared_textures.remove(0);
         }
 
-        Ok(&self.cached_shared_texture.as_ref().unwrap().1)
+        let index = self
+            .cached_shared_textures
+            .iter()
+            .position(|(cached_handle, _)| *cached_handle == handle_val)
+            .expect("opened shared texture is cached");
+        Ok(&self.cached_shared_textures[index].1)
     }
 
     /// Extract bitstream from an AMFBuffer output.

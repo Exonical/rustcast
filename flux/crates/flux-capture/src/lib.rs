@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod bridge;
 pub mod cursor;
+pub mod pacing;
 // The Wayland portal / PipeWire interfaces are fd-based and only compile on
 // unix; Windows uses the DXGI backend instead.
 #[cfg(all(unix, any(test, feature = "mock")))]
