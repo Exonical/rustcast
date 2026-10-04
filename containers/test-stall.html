@@ -1,0 +1,185 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>flux-stall-test</title>
+<video id="v" muted autoplay playsinline width="960" height="540"></video>
+<canvas id="c" width="48" height="24"></canvas>
+<pre id="out">running</pre>
+<script>
+// Reproduces "video stalls while the mouse moves": plays the relay stream,
+// alternates idle and mouse phases (MoveAbsolute sent exactly like the viewer
+// UI: one event per animation frame over the signaling WebSocket), and reports
+// per-phase presentation cadence, content-change cadence (a region of the
+// desktop away from the cursor) and receiver stats. Query parameters:
+//   phases=idle:15,mouse:15,...   region=x0,y0,x1,y1 (normalized)
+//   moveHz=raf|<n>                snapshot=1 (emit one full frame as PNG)
+const params = new URLSearchParams(location.search);
+const PHASES = (params.get('phases') || 'idle:15,mouse:15,idle:15,mouse:15,idle:10')
+  .split(',').map(p => { const [name, s] = p.split(':'); return { name, ms: Number(s) * 1000 }; });
+const REGION = (params.get('region') || '0.55,0.55,0.80,0.75').split(',').map(Number);
+const MOVE_HZ = params.get('moveHz') || 'raf';
+const out = document.getElementById('out');
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const result = { phases: [], events: [] };
+let phase = null;
+
+const pct = (values, p) => {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return +sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))].toFixed(1);
+};
+const dist = values => ({ n: values.length, p50: pct(values, 0.5), p95: pct(values, 0.95), p99: pct(values, 0.99), max: values.length ? +Math.max(...values).toFixed(1) : null });
+
+function regionHash() {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return null;
+  const [x0, y0, x1, y1] = REGION;
+  ctx.drawImage(video, x0 * w, y0 * h, (x1 - x0) * w, (y1 - y0) * h, 0, 0, canvas.width, canvas.height);
+  const px = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  let hash = 2166136261;
+  for (let i = 0; i < px.length; i++) hash = Math.imul(hash ^ px[i], 16777619);
+  return hash >>> 0;
+}
+
+// Headless Chrome hands rVFC a coarse `now`, so frame timing uses the callback's
+// own clock and, for content changes, the frame's network receive time.
+function onFrame(_now, md) {
+  if (phase) {
+    const t = performance.now();
+    const hash = regionHash();
+    const f = { t, presented: md.presentedFrames, rtp: md.rtpTimestamp, recv: md.receiveTime };
+    if (phase.lastFrame) {
+      phase.presentedIntervals.push(t - phase.lastFrame.t);
+      if (f.rtp !== undefined && phase.lastFrame.rtp !== undefined) phase.rtpDeltas.push(((f.rtp - phase.lastFrame.rtp) >>> 0) / 90);
+      if (f.recv !== undefined && phase.lastFrame.recv !== undefined) phase.recvDeltas.push(f.recv - phase.lastFrame.recv);
+      if (md.presentedFrames - phase.lastFrame.presented > 1) phase.skippedPresentations += md.presentedFrames - phase.lastFrame.presented - 1;
+    }
+    phase.lastFrame = f;
+    if (hash !== null && hash !== phase.lastHash) {
+      const at = f.recv ?? t;
+      if (phase.lastChange !== null) phase.contentIntervals.push(at - phase.lastChange);
+      phase.lastChange = at;
+      phase.lastHash = hash;
+    }
+  }
+  video.requestVideoFrameCallback(onFrame);
+}
+video.requestVideoFrameCallback(onFrame);
+
+const pc = new RTCPeerConnection({ iceServers: [] });
+pc.addTransceiver('video', { direction: 'recvonly' });
+pc.ontrack = e => {
+  const r = e.receiver;
+  try { if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0; r.playoutDelayHint = 0; } catch {}
+  video.srcObject = e.streams[0];
+  video.play().catch(() => {});
+};
+pc.oniceconnectionstatechange = () => result.events.push(`ice=${pc.iceConnectionState}`);
+let ws;
+
+async function inboundStats() {
+  let s = null;
+  (await pc.getStats()).forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') s = r; });
+  return s;
+}
+
+const COUNTERS = ['framesReceived', 'framesDecoded', 'framesDropped', 'keyFramesDecoded', 'freezeCount', 'totalFreezesDuration',
+  'pauseCount', 'totalPausesDuration', 'pliCount', 'nackCount', 'packetsLost', 'packetsReceived', 'bytesReceived', 'jitterBufferDelay', 'jitterBufferEmittedCount'];
+
+function startPhase(spec) {
+  phase = { name: spec.name, ms: spec.ms, presentedIntervals: [], contentIntervals: [], rtpDeltas: [], recvDeltas: [],
+    lastFrame: null, lastHash: null, lastChange: null, skippedPresentations: 0, movesSent: 0, started: performance.now() };
+}
+
+async function finishPhase(startStats) {
+  const end = await inboundStats();
+  const p = phase;
+  const secs = (performance.now() - p.started) / 1000;
+  const delta = {};
+  for (const k of COUNTERS) delta[k] = end && startStats ? +((end[k] || 0) - (startStats[k] || 0)).toFixed(3) : null;
+  const frozen = p.contentIntervals.filter(v => v > 100);
+  result.phases.push({
+    phase: p.name, secs: +secs.toFixed(1), movesSent: p.movesSent, moveRate: +(p.movesSent / secs).toFixed(1),
+    presentedFps: +(p.presentedIntervals.length / secs).toFixed(1), contentFps: +(p.contentIntervals.length / secs).toFixed(1),
+    presentedMs: dist(p.presentedIntervals), contentMs: dist(p.contentIntervals), rtpDeltaMs: dist(p.rtpDeltas), recvDeltaMs: dist(p.recvDeltas),
+    contentGapsOver100ms: frozen.length, contentGapsOver250ms: p.contentIntervals.filter(v => v > 250).length,
+    frozenMsTotal: Math.round(frozen.reduce((a, b) => a + b, 0)), skippedPresentations: p.skippedPresentations,
+    jitterBufferMsPerFrame: delta.jitterBufferEmittedCount ? +(delta.jitterBufferDelay / delta.jitterBufferEmittedCount * 1000).toFixed(1) : null,
+    stats: delta,
+  });
+}
+
+// movePattern=burst moves for 1 s out of every 3.5 s, so hover UI (player
+// controls) keeps appearing and fading out as it does for a real user.
+const BURST = params.get('movePattern') === 'burst';
+function moveLoop(spec) {
+  let angle = 0;
+  const step = () => {
+    if (!phase || phase.name !== 'mouse' || phase !== spec) return false;
+    if (BURST && (performance.now() - spec.started) % 3500 > 1000) return true;
+    angle += 0.05;
+    const x = 0.25 + 0.1 * Math.cos(angle), y = 0.35 + 0.1 * Math.sin(angle);
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'input', data: { Mouse: { MoveAbsolute: { x, y } } } }));
+      phase.movesSent++;
+    }
+    return true;
+  };
+  if (MOVE_HZ === 'raf') {
+    const raf = () => { if (step()) requestAnimationFrame(raf); };
+    requestAnimationFrame(raf);
+  } else {
+    const timer = setInterval(() => { if (!step()) clearInterval(timer); }, 1000 / Number(MOVE_HZ));
+  }
+}
+
+async function run() {
+  // Wait for the first decoded frame so phase 1 does not include startup.
+  const t0 = performance.now();
+  while (!(video.videoWidth > 0) && performance.now() - t0 < 15000) await new Promise(r => setTimeout(r, 100));
+  result.events.push(`firstFrameAfterMs=${Math.round(performance.now() - t0)} size=${video.videoWidth}x${video.videoHeight}`);
+  await new Promise(r => setTimeout(r, 2000));
+  if (params.get('snapshot')) {
+    const snap = document.createElement('canvas');
+    snap.width = video.videoWidth; snap.height = video.videoHeight;
+    snap.getContext('2d').drawImage(video, 0, 0);
+    result.snapshot = snap.toDataURL('image/png');
+  }
+  for (const spec of PHASES) {
+    const startStats = await inboundStats();
+    startPhase(spec);
+    const current = phase;
+    result.events.push(`${new Date().toISOString()} start ${spec.name}`);
+    if (spec.name === 'mouse') moveLoop(current);
+    await new Promise(r => setTimeout(r, spec.ms));
+    await finishPhase(startStats);
+    phase = null;
+  }
+  out.textContent = JSON.stringify(result);
+  document.title = 'done';
+}
+
+fetch('http://localhost:8080/api/machines').then(r => r.json()).then(machines => {
+  const list = Array.isArray(machines) ? machines : (machines.machines || []);
+  const wanted = params.get('machine');
+  const machine = wanted ? { id: wanted }
+    : list.find(m => m.status === 'online' && m.id !== 'default') || list.find(m => m.status === 'online');
+  result.events.push(`machine=${machine ? machine.id : 'default'}`);
+  ws = new WebSocket('ws://localhost:8080/ws/signaling');
+  pc.onicecandidate = e => { if (e.candidate && ws.readyState === 1) ws.send(JSON.stringify({ type: 'new-ice-candidate', data: e.candidate.toJSON() })); };
+  ws.onopen = async () => {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({ type: 'offer', data: { sd: offer.sdp, ...(machine ? { machine_id: machine.id } : {}) } }));
+  };
+  ws.onmessage = async evt => {
+    const msg = JSON.parse(evt.data);
+    const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+    if (msg.type === 'answer') await pc.setRemoteDescription({ type: 'answer', sdp: data.sd });
+    else if (msg.type === 'new-ice-candidate' && data.candidate) await pc.addIceCandidate(data);
+    else if (msg.type === 'error') result.events.push(`error=${JSON.stringify(data)}`);
+  };
+  run();
+});
+</script>

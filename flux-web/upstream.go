@@ -28,6 +28,7 @@ type machineUpstream struct {
 	id           string
 	addr         string
 	frameChan    chan frameMsg
+	frameReady   chan struct{} // signalled on every enqueue; wakes paced writes
 	frameQueueMu sync.Mutex
 	frameBuffers frameBufferPool
 	cursorChan   chan cursorMsg
@@ -59,6 +60,11 @@ const (
 	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
 	maxFramePayloadSize     = 10 * 1024 * 1024
 	maxCachedFrameBuffers   = 4
+	// A frame that has waited this long in the relay queue means the relay is
+	// genuinely behind; only then does it skip ahead, at the cost of a recovery
+	// keyframe. Shorter backlogs are sent in order, because dropping any frame
+	// of an IPPP stream freezes the picture until the next keyframe arrives.
+	maxRelayBacklog = 150 * time.Millisecond
 )
 
 // Keep only a small, bounded free list per upstream, rather than retaining the
@@ -166,8 +172,6 @@ const (
 	idrReasonViewerPLI    idrReason = "viewer-pli"
 	idrReasonUpstreamDrop idrReason = "upstream-queue-full"
 	idrReasonStaleQueue   idrReason = "stale-queue-discard"
-	idrReasonAbandoned    idrReason = "abandoned-packets"
-	idrReasonRequeueDrop  idrReason = "requeue-drop"
 	idrReasonAwaitingIDR  idrReason = "awaiting-idr"
 )
 
@@ -205,8 +209,6 @@ func (s *idrStats) drain() string {
 		idrReasonViewerPLI,
 		idrReasonUpstreamDrop,
 		idrReasonStaleQueue,
-		idrReasonAbandoned,
-		idrReasonRequeueDrop,
 		idrReasonAwaitingIDR,
 	} {
 		granted, suppressed := s.granted[reason], s.suppressed[reason]
@@ -237,10 +239,14 @@ type stageStats struct {
 	idrFrames    int
 	maxIDRBytes  int
 	maxIDRPaceMs float64
+	flushed      int // frames whose pacing was cut short by a queued newer frame
 }
 
-func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool, bytes int) {
+func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool, bytes int, flushed bool) {
 	s.frames++
+	if flushed {
+		s.flushed++
+	}
 	s.queueLenSum += queueLen
 	if queueLen > s.maxQueueLen {
 		s.maxQueueLen = queueLen
@@ -287,6 +293,9 @@ func (s *stageStats) summary() string {
 			" | idr n=%d max=%d bytes max pacing=%.1fms",
 			s.idrFrames, s.maxIDRBytes, s.maxIDRPaceMs,
 		)
+	}
+	if s.flushed > 0 {
+		summary += fmt.Sprintf(" | flushed=%d", s.flushed)
 	}
 	return summary
 }
@@ -406,6 +415,17 @@ func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool, bool) {
 	}
 }
 
+// nextFrame picks what to send after current was taken from the queue. Frames
+// normally go out in order; only when current has waited longer than
+// maxRelayBacklog and newer frames are queued does it skip ahead through
+// latestFrame, reporting the drop so the caller recovers with a keyframe.
+func nextFrame(ch <-chan frameMsg, current frameMsg, now time.Time) (frameMsg, bool, bool) {
+	if len(ch) == 0 || current.receivedAt.IsZero() || now.Sub(current.receivedAt) <= maxRelayBacklog {
+		return current, isIDRFrame(current.data), false
+	}
+	return latestFrame(ch, current)
+}
+
 func consumeRTPDuration(duration time.Duration, remainder float64) (uint32, float64) {
 	total := duration.Seconds()*90000 + remainder
 	ticks := uint32(total)
@@ -434,6 +454,7 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 	u := &machineUpstream{
 		id: id, addr: addr,
 		frameChan:   make(chan frameMsg, 120),
+		frameReady:  make(chan struct{}, 1),
 		cursorChan:  make(chan cursorMsg, 1),
 		commandChan: make(chan []byte, 100),
 		stopChan:    make(chan struct{}),
@@ -488,16 +509,19 @@ func (u *machineUpstream) queueFrame(frame frameMsg) (dropped bool) {
 	}
 	select {
 	case u.frameChan <- frame:
-		return false
 	default:
+		select {
+		case old := <-u.frameChan:
+			old.release()
+			dropped = true
+		default:
+		}
+		u.frameChan <- frame
 	}
 	select {
-	case old := <-u.frameChan:
-		old.release()
-		dropped = true
+	case u.frameReady <- struct{}{}:
 	default:
 	}
-	u.frameChan <- frame
 	return dropped
 }
 
@@ -886,7 +910,7 @@ func (u *machineUpstream) framePusher() {
 		case msg := <-u.frameChan:
 			queueLen := len(u.frameChan)
 			var idr, dropped bool
-			msg, idr, dropped = latestFrame(u.frameChan, msg)
+			msg, idr, dropped = nextFrame(u.frameChan, msg, time.Now())
 			sess := u.currentSession()
 			if sess == nil || sess.VideoTrack == nil {
 				msg.release()
@@ -895,7 +919,7 @@ func (u *machineUpstream) framePusher() {
 			if dropped {
 				sess.needsIDR = true
 				if u.requestIDR(idrReasonStaleQueue) {
-					log.Printf("[webrtc:%s] discarded queued frames for newer frame; requesting IDR", u.id)
+					log.Printf("[webrtc:%s] relay fell more than %s behind; discarded queued frames and requesting IDR", u.id, maxRelayBacklog)
 				}
 			}
 			sampleCount++
@@ -938,83 +962,52 @@ func (u *machineUpstream) framePusher() {
 			}
 			schedule := pacingScheduleForFrame(packetSizes, u.abr.targetBitrateKbps(), frameDuration, idr)
 			pacingStart := time.Now()
-			next, sent := u.writePacedPackets(sess, packets, schedule, idr)
+			_, flushed := u.writePacedPackets(sess, packets, schedule)
 			pacingElapsed := time.Since(pacingStart)
 			var relayWait time.Duration
 			if !msg.receivedAt.IsZero() {
 				relayWait = pacingStart.Sub(msg.receivedAt)
 			}
-			stats.observe(queueLen, relayWait, pacingElapsed, idr, frameBytes)
+			stats.observe(queueLen, relayWait, pacingElapsed, idr, frameBytes, flushed)
 			if idr {
 				log.Printf("[webrtc:%s] IDR paced: %d packets, waited %.1fms in relay, sent over %.1fms",
 					u.id, len(packets), relayWait.Seconds()*1000, pacingElapsed.Seconds()*1000)
-			}
-			if next != nil {
-				remaining := len(packets) - sent
-				if remaining > 0 {
-					// Leave the marker clear: the emitted prefix is truncated,
-					// not a complete access unit. Recovery comes from the IDR.
-					sess.needsIDR = true
-					if u.requestIDR(idrReasonAbandoned) {
-						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
-					}
-				}
-				droppedQueued := u.queueFrame(*next)
-				if droppedQueued {
-					sess.needsIDR = true
-					if u.requestIDR(idrReasonRequeueDrop) {
-						log.Printf("[webrtc:%s] dropped queued frame while requeueing newer frame; requesting IDR", u.id)
-					}
-				}
 			}
 		}
 	}
 }
 
+// writePacedPackets sends one frame's packets on its pacing schedule. Once a
+// newer frame is queued the rest of this frame goes out unpaced: truncating it
+// instead would leave the viewer unable to decode anything until the next
+// keyframe. It returns how many packets were written (fewer only on shutdown)
+// and whether pacing was cut short.
 func (u *machineUpstream) writePacedPackets(
 	sess *Session,
 	packets []*rtp.Packet,
 	schedule []time.Duration,
-	idr bool,
-) (*frameMsg, int) {
+) (int, bool) {
 	start := time.Now()
+	flush := false
 	for i, packet := range packets {
-		wait := time.Until(start.Add(schedule[i]))
-		if wait > 0 {
+		for !flush {
+			if len(u.frameChan) > 0 {
+				flush = true
+				break
+			}
+			wait := time.Until(start.Add(schedule[i]))
+			if wait <= 0 {
+				break
+			}
 			timer := time.NewTimer(wait)
-			if idr {
-				select {
-				case <-u.stopChan:
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					return nil, i
-				case <-timer.C:
-				}
-			} else {
-				select {
-				case <-u.stopChan:
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					return nil, i
-				case next := <-u.frameChan:
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					latest, _, _ := latestFrame(u.frameChan, next)
-					return &latest, i
-				case <-timer.C:
-				}
+			select {
+			case <-u.stopChan:
+				timer.Stop()
+				return i, flush
+			case <-u.frameReady:
+				// Re-checked above: the signal may predate a frame already consumed.
+				timer.Stop()
+			case <-timer.C:
 			}
 		}
 		assignSequenceNumber(packet, &sess.nextSequenceNumber)
@@ -1024,5 +1017,5 @@ func (u *machineUpstream) writePacedPackets(
 		}
 		commitSequenceNumber(&sess.nextSequenceNumber, err == nil)
 	}
-	return nil, len(packets)
+	return len(packets), flush
 }

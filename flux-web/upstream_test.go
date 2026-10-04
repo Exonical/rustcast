@@ -209,30 +209,101 @@ func TestConcurrentQueueAndStop(t *testing.T) {
 	}
 }
 
-func TestPacingRequeueTransfersBufferOwnership(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
-	u.frameChan = make(chan frameMsg, 1)
+func pacingSession(t *testing.T) *Session {
+	t.Helper()
 	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := &Session{VideoTrack: track}
-	u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(1)))
-	next, sent := u.writePacedPackets(session, []*rtp.Packet{{}}, []time.Duration{time.Hour}, false)
-	if next == nil || sent != 0 || u.frameBuffers.count != 0 {
-		t.Fatalf("pacing released the selected frame: next=%+v sent=%d cached=%d", next, sent, u.frameBuffers.count)
+	return &Session{VideoTrack: track}
+}
+
+func emptyPackets(n int) []*rtp.Packet {
+	packets := make([]*rtp.Packet, n)
+	for i := range packets {
+		packets[i] = &rtp.Packet{}
 	}
+	return packets
+}
+
+func TestPacingFlushesWholeFrameWhenNewerFrameIsQueued(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	session := pacingSession(t)
 	u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(2)))
-	if !u.queueFrame(*next) || u.frameBuffers.count != 1 {
-		t.Fatal("requeue did not return the evicted buffer exactly once")
+	done := make(chan struct{})
+	var sent int
+	var flushed bool
+	go func() {
+		sent, flushed = u.writePacedPackets(session, emptyPackets(3), []time.Duration{0, time.Hour, time.Hour})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pacing kept waiting with a newer frame queued")
 	}
-	selected := <-u.frameChan
-	if selected.tsMicros != 1 || u.frameBuffers.count != 1 {
-		t.Fatal("requeued frame was released before consumption")
+	if sent != 3 || !flushed || session.nextSequenceNumber != 3 {
+		t.Fatalf("writePacedPackets = (%d, %t), seq=%d; want the whole frame flushed", sent, flushed, session.nextSequenceNumber)
 	}
-	selected.release()
-	if u.frameBuffers.count != 2 {
-		t.Fatal("consumed requeued frame was not returned")
+	if len(u.frameChan) != 1 || u.frameBuffers.count != 0 {
+		t.Fatal("pacing consumed or released the queued newer frame")
+	}
+}
+
+func TestPacingFlushesWhenFrameArrivesMidWait(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	session := pacingSession(t)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		u.queueFrame(pFrame(2))
+	}()
+	start := time.Now()
+	sent, flushed := u.writePacedPackets(session, emptyPackets(2), []time.Duration{0, time.Hour})
+	if sent != 2 || !flushed || time.Since(start) > time.Second {
+		t.Fatalf("writePacedPackets = (%d, %t) after %s; want a flush on arrival", sent, flushed, time.Since(start))
+	}
+}
+
+func TestPacingIgnoresStaleReadySignal(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	session := pacingSession(t)
+	u.queueFrame(pFrame(1))
+	<-u.frameChan // consumed by the pusher; the ready signal is still pending
+	start := time.Now()
+	sent, flushed := u.writePacedPackets(session, emptyPackets(2), []time.Duration{0, 30 * time.Millisecond})
+	if sent != 2 || flushed || time.Since(start) < 30*time.Millisecond {
+		t.Fatalf("writePacedPackets = (%d, %t) after %s; want the schedule kept", sent, flushed, time.Since(start))
+	}
+}
+
+func TestNextFrameSendsShortBacklogInOrder(t *testing.T) {
+	now := time.Now()
+	current := pFrame(1)
+	current.receivedAt = now.Add(-maxRelayBacklog / 2)
+	ch := make(chan frameMsg, 2)
+	ch <- pFrame(2)
+	ch <- idrFrame(3)
+	got, idr, dropped := nextFrame(ch, current, now)
+	if got.tsMicros != 1 || idr || dropped || len(ch) != 2 {
+		t.Fatalf("nextFrame = (ts=%d, %t, %t) queue=%d; want the oldest frame and nothing dropped", got.tsMicros, idr, dropped, len(ch))
+	}
+}
+
+func TestNextFrameSkipsStaleBacklogToNewestKeyframe(t *testing.T) {
+	now := time.Now()
+	stale := pFrame(1)
+	stale.receivedAt = now.Add(-2 * maxRelayBacklog)
+	ch := make(chan frameMsg, 3)
+	ch <- pFrame(2)
+	ch <- idrFrame(3)
+	ch <- pFrame(4)
+	got, idr, dropped := nextFrame(ch, stale, now)
+	if got.tsMicros != 3 || !idr || !dropped || len(ch) != 0 {
+		t.Fatalf("nextFrame = (ts=%d, %t, %t) queue=%d; want the newest keyframe", got.tsMicros, idr, dropped, len(ch))
+	}
+	got, _, dropped = nextFrame(make(chan frameMsg), stale, now)
+	if got.tsMicros != 1 || dropped {
+		t.Fatal("a stale frame with nothing newer queued was dropped")
 	}
 }
 
@@ -779,13 +850,13 @@ func TestIDRStatsSeparatesGrantedFromSuppressedByReason(t *testing.T) {
 	u := newMachineUpstream("", "", nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 
-	u.requestIDR(idrReasonViewerPLI)  // granted
-	u.requestIDR(idrReasonAbandoned)  // gated
-	u.requestIDR(idrReasonStaleQueue) // gated
-	u.requestIDR(idrReasonStaleQueue) // gated
+	u.requestIDR(idrReasonViewerPLI)   // granted
+	u.requestIDR(idrReasonAwaitingIDR) // gated
+	u.requestIDR(idrReasonStaleQueue)  // gated
+	u.requestIDR(idrReasonStaleQueue)  // gated
 
 	summary := u.idrStats.drain()
-	want := "viewer-pli=1(+0 suppressed) stale-queue-discard=0(+2 suppressed) abandoned-packets=0(+1 suppressed)"
+	want := "viewer-pli=1(+0 suppressed) stale-queue-discard=0(+2 suppressed) awaiting-idr=0(+1 suppressed)"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}
@@ -796,12 +867,12 @@ func TestIDRStatsSeparatesGrantedFromSuppressedByReason(t *testing.T) {
 
 func TestStageStatsReportsWorstCaseSeparatelyFromAverage(t *testing.T) {
 	var stats stageStats
-	stats.observe(1, 2*time.Millisecond, 4*time.Millisecond, false, 10_000)
-	stats.observe(9, 20*time.Millisecond, 40*time.Millisecond, true, 700_000)
+	stats.observe(1, 2*time.Millisecond, 4*time.Millisecond, false, 10_000, false)
+	stats.observe(9, 20*time.Millisecond, 40*time.Millisecond, true, 700_000, true)
 
 	summary := stats.summary()
 	want := "frames=2 queue avg=5.0 max=9 | relay wait avg=11.0ms max=20.0ms | " +
-		"pacing avg=22.0ms max=40.0ms | idr n=1 max=700000 bytes max pacing=40.0ms"
+		"pacing avg=22.0ms max=40.0ms | idr n=1 max=700000 bytes max pacing=40.0ms | flushed=1"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}
