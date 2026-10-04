@@ -630,7 +630,7 @@ async fn frame_server(
         let _ = &privacy_connection;
 
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncReadExt;
             let (mut reader, mut writer) = stream.into_split();
             let mut frames_sent: u64 = 0;
 
@@ -760,17 +760,13 @@ async fn frame_server(
                     Vec::new()
                 }
             };
-            if !initial_payload.is_empty() {
-                let mut header = [0u8; 13];
-                header[0] = 0x02;
-                header[1..9].copy_from_slice(&initial_cursor.0.to_be_bytes());
-                header[9..13].copy_from_slice(&(initial_payload.len() as u32).to_be_bytes());
-                if writer.write_all(&header).await.is_err()
-                    || writer.write_all(&initial_payload).await.is_err()
-                {
-                    reader_handle.abort();
-                    return;
-                }
+            if !initial_payload.is_empty()
+                && write_frame_message(&mut writer, 0x02, initial_cursor.0, &initial_payload)
+                    .await
+                    .is_err()
+            {
+                reader_handle.abort();
+                return;
             }
 
             loop {
@@ -787,12 +783,9 @@ async fn frame_server(
                         let Ok(payload) = serde_json::to_vec(&cursor.1) else {
                             continue;
                         };
-                        let mut header = [0u8; 13];
-                        header[0] = 0x02;
-                        header[1..9].copy_from_slice(&cursor.0.to_be_bytes());
-                        header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-                        if writer.write_all(&header).await.is_err()
-                            || writer.write_all(&payload).await.is_err()
+                        if write_frame_message(&mut writer, 0x02, cursor.0, &payload)
+                            .await
+                            .is_err()
                         {
                             break;
                         }
@@ -812,12 +805,9 @@ async fn frame_server(
                         Err(_) => break,
                     },
                 };
-                let mut header = [0u8; 13];
-                header[0] = message_type;
-                header[1..9].copy_from_slice(&msg.0.to_be_bytes());
-                header[9..13].copy_from_slice(&(msg.1.len() as u32).to_be_bytes());
-                if writer.write_all(&header).await.is_err()
-                    || writer.write_all(&msg.1).await.is_err()
+                if write_frame_message(&mut writer, message_type, msg.0, &msg.1)
+                    .await
+                    .is_err()
                 {
                     break;
                 }
@@ -828,6 +818,40 @@ async fn frame_server(
             tracing::info!("Frame client disconnected: {} ({} frames sent)", addr, frames_sent);
         });
     }
+}
+
+/// Writes one frame-server message (13-byte header: type, timestamp u64 BE,
+/// payload length u32 BE; then the payload) using vectored writes, so with
+/// Nagle disabled the header is not sent as its own TCP segment.
+async fn write_frame_message<W>(writer: &mut W, message_type: u8, timestamp: u64, payload: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let mut header = [0u8; 13];
+    header[0] = message_type;
+    header[1..9].copy_from_slice(&timestamp.to_be_bytes());
+    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+    let total = header.len() + payload.len();
+    let mut written = 0;
+    while written < total {
+        let n = if written < header.len() {
+            let bufs = [
+                std::io::IoSlice::new(&header[written..]),
+                std::io::IoSlice::new(payload),
+            ];
+            writer.write_vectored(&bufs).await?
+        } else {
+            writer.write(&payload[written - header.len()..]).await?
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        written += n;
+    }
+    Ok(())
 }
 
 /// The ordered H.264 encoder backends to try for this build/platform: the
@@ -2229,5 +2253,109 @@ mod capture_restart_tests {
             *capture.starts.lock().unwrap(),
             vec![(Some(9), Resolution::new(1280, 720))]
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_message_tests {
+    use super::write_frame_message;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Accepts at most `limit` bytes per write call and counts calls.
+    struct ChunkedWriter {
+        out: Vec<u8>,
+        limit: usize,
+        calls: usize,
+    }
+
+    impl ChunkedWriter {
+        fn new(limit: usize) -> Self {
+            Self {
+                out: Vec::new(),
+                limit,
+                calls: 0,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ChunkedWriter {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.poll_write_vectored(cx, &[IoSlice::new(buf)])
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.calls += 1;
+            let mut n = 0;
+            for buf in bufs {
+                let take = buf.len().min(self.limit - n);
+                self.out.extend_from_slice(&buf[..take]);
+                n += take;
+                if n == self.limit {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(n))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn expected(message_type: u8, timestamp: u64, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![message_type];
+        v.extend_from_slice(&timestamp.to_be_bytes());
+        v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[tokio::test]
+    async fn header_and_payload_go_out_in_one_write() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let mut w = ChunkedWriter::new(usize::MAX);
+        write_frame_message(&mut w, 0x01, 0x0102_0304_0506_0708, &payload)
+            .await
+            .unwrap();
+        assert_eq!(w.out, expected(0x01, 0x0102_0304_0506_0708, &payload));
+        assert_eq!(w.calls, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_writes_produce_identical_bytes() {
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        for limit in [1, 5, 12, 13, 14, 100, 1012, 1013] {
+            let mut w = ChunkedWriter::new(limit);
+            write_frame_message(&mut w, 0x03, 42, &payload).await.unwrap();
+            assert_eq!(w.out, expected(0x03, 42, &payload), "limit {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_payload_writes_header_only() {
+        let mut w = ChunkedWriter::new(usize::MAX);
+        write_frame_message(&mut w, 0x02, 7, &[]).await.unwrap();
+        assert_eq!(w.out, expected(0x02, 7, &[]));
+    }
+
+    #[tokio::test]
+    async fn zero_length_write_is_an_error() {
+        let mut w = ChunkedWriter::new(0);
+        let err = write_frame_message(&mut w, 0x01, 0, b"x").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
     }
 }
