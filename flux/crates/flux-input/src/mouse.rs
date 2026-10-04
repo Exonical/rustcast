@@ -99,18 +99,18 @@ impl MouseSink {
 
         #[cfg(not(target_os = "windows"))]
         {
-            tracing::trace!("Input injection not implemented for this OS: {:?}", event);
-            Ok(())
+            tracing::trace!("Mouse injection not implemented for this OS: {:?}", event);
+            Err(crate::inject::not_implemented("mouse"))
         }
     }
 
     #[cfg(target_os = "windows")]
     fn inject_windows(&self, event: &MouseEvent) -> flux_core::Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-            MOUSEEVENTF_XUP, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+            MOUSEINPUT,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
             GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -173,9 +173,7 @@ impl MouseSink {
                             },
                         },
                     };
-                    unsafe {
-                        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-                    }
+                    crate::inject::send_input("mouse", &[input])?;
                 }
                 if *dy == 0 {
                     return Ok(());
@@ -198,11 +196,7 @@ impl MouseSink {
             },
         };
 
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
-
-        Ok(())
+        crate::inject::send_input("mouse", &[input])
     }
 }
 

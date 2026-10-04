@@ -233,7 +233,11 @@ mod tests {
     fn clearing_the_backend_stops_routing() {
         let (sink, rec) = sink_with_recorder();
         sink.set_backend(None);
-        sink.handle_event(&key_down(0x1E)).unwrap();
+        let result = sink.handle_event(&key_down(0x1E));
+        #[cfg(not(target_os = "windows"))]
+        assert!(matches!(result, Err(flux_core::FluxError::UnsupportedPlatform(_))));
+        #[cfg(target_os = "windows")]
+        let _ = result;
         assert!(rec.take().is_empty());
     }
 }
