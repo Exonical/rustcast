@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use flux_core::error::{FluxError, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// Manages PIN-based pairing and client trust.
 pub struct PinAuthenticator {
@@ -28,7 +30,7 @@ pub struct PairedClient {
     /// SHA-256 fingerprint of the client's TLS certificate.
     pub cert_fingerprint: String,
 
-    /// When this client was first paired.
+    /// When this client was first paired (UTC, RFC 3339).
     pub paired_at: String,
 }
 
@@ -103,7 +105,7 @@ impl PinAuthenticator {
             PairedClient {
                 name,
                 cert_fingerprint,
-                paired_at: chrono_now_stub(),
+                paired_at: utc_now_rfc3339(),
             },
         );
     }
@@ -135,9 +137,10 @@ pub fn cert_fingerprint(cert_der: &[u8]) -> String {
         .join(":")
 }
 
-fn chrono_now_stub() -> String {
-    // TODO: Replace with proper timestamp (chrono or time crate)
-    "2025-01-01T00:00:00Z".to_string()
+fn utc_now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("UTC OffsetDateTime is always RFC 3339 formattable")
 }
 
 #[cfg(test)]
@@ -171,5 +174,20 @@ mod tests {
         assert!(auth.is_paired(&fp));
         assert!(auth.remove_paired_client(&fp));
         assert!(!auth.is_paired(&fp));
+    }
+
+    #[test]
+    fn paired_at_is_current_utc_rfc3339() {
+        let mut auth = PinAuthenticator::new();
+        let fp = "AA:BB:CC:DD".to_string();
+
+        let before = OffsetDateTime::now_utc();
+        auth.add_paired_client("Test Client".into(), fp.clone());
+        let after = OffsetDateTime::now_utc();
+
+        let client = auth.paired_clients().find(|c| c.cert_fingerprint == fp).unwrap();
+        let paired_at = OffsetDateTime::parse(&client.paired_at, &Rfc3339).unwrap();
+        assert!(client.paired_at.ends_with('Z'));
+        assert!(before <= paired_at && paired_at <= after);
     }
 }
