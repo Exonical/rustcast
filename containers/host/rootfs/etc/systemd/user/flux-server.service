@@ -1,0 +1,16 @@
+[Unit]
+Description=Flux host server
+Wants=flux-gnome-session.service pipewire.service wireplumber.service
+After=flux-gnome-session.service pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/flux/env
+ExecStartPre=/usr/local/bin/flux-gen-config
+ExecStartPre=/usr/local/bin/flux-wait-mutter
+ExecStart=/usr/local/bin/flux-server --config %h/.config/flux/flux.toml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

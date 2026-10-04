@@ -46,6 +46,24 @@ impl ScreenCapture for PipeWireCapture {
     }
 
     fn enumerate_displays(&self) -> Result<Vec<DisplayInfo>> {
+        #[cfg(feature = "capture-mutter")]
+        if real::use_mutter() {
+            match crate::mutter::query_primary_monitor() {
+                Ok(monitor) => {
+                    return Ok(vec![DisplayInfo {
+                        id: STUB_DISPLAY_ID,
+                        adapter_luid: None,
+                        name: monitor.connector,
+                        native_resolution: monitor.resolution,
+                        desktop_rect: monitor.rect,
+                        primary: true,
+                        capture_supported: true,
+                    }]);
+                }
+                Err(e) => tracing::warn!("Mutter display query failed ({e}); using stub display"),
+            }
+        }
+
         // TODO: Query available outputs via wl_output or org.freedesktop.portal.ScreenCast.
         tracing::debug!("Enumerating PipeWire displays (stub)");
         Ok(vec![DisplayInfo {
@@ -86,6 +104,10 @@ impl ScreenCapture for PipeWireCapture {
             // `select_stream` to match a node that doesn't exist. Treat the
             // placeholder as "primary" until real per-output node ids land.
             let requested = display_id.filter(|&id| id != STUB_DISPLAY_ID);
+            #[cfg(feature = "capture-mutter")]
+            if real::use_mutter() {
+                return real::start_mutter_capture(resolution, framerate);
+            }
             real::start_portal_capture(requested, resolution, framerate)
         }
 
@@ -174,6 +196,109 @@ mod real {
             _portal: portal,
             _runtime: runtime,
         }))
+    }
+
+    /// Whether capture should go through Mutter's direct D-Bus API:
+    /// `FLUX_CAPTURE_API=mutter` forces it, `portal` disables it, and when unset
+    /// it is used if Mutter's RemoteDesktop service is on the session bus.
+    #[cfg(feature = "capture-mutter")]
+    pub(super) fn use_mutter() -> bool {
+        match std::env::var("FLUX_CAPTURE_API").ok().as_deref() {
+            Some("mutter") => true,
+            Some("portal") => false,
+            _ => crate::mutter::is_available(),
+        }
+    }
+
+    /// Capture the primary monitor through a direct Mutter ScreenCast +
+    /// RemoteDesktop session, reading the stream from the local PipeWire daemon.
+    #[cfg(feature = "capture-mutter")]
+    pub(super) fn start_mutter_capture(resolution: Resolution, framerate: u32) -> Result<Box<dyn CaptureSession>> {
+        use crate::mutter::MutterSession;
+
+        let prefs = FormatPrefs {
+            resolution,
+            framerate,
+            ..Default::default()
+        };
+        let mutter = MutterSession::start(PortalOptions::default().cursor_mode, resolution)?;
+        let mut source = PipewireStreamSource::new();
+        source.connect_local(mutter.node_id(), prefs)?;
+        Ok(Box::new(MutterPipewireSession {
+            inner: FrameSourceSession::new(source, Duration::from_millis(100)),
+            mutter,
+        }))
+    }
+
+    /// Map "Mutter closed the session" to the error the host uses to recreate capture.
+    #[cfg(feature = "capture-mutter")]
+    pub(super) fn session_lost_if_closed(closed: bool) -> Result<()> {
+        if closed {
+            Err(FluxError::CaptureSessionLost(
+                "Mutter closed the ScreenCast/RemoteDesktop session".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(test, feature = "capture-mutter"))]
+    mod mutter_tests {
+        use super::*;
+
+        #[test]
+        fn closed_session_maps_to_capture_session_lost() {
+            assert!(session_lost_if_closed(false).is_ok());
+            assert!(matches!(
+                session_lost_if_closed(true),
+                Err(FluxError::CaptureSessionLost(_))
+            ));
+        }
+    }
+
+    /// A [`CaptureSession`] backed by a direct Mutter session; also exposes the
+    /// session's RemoteDesktop input.
+    #[cfg(feature = "capture-mutter")]
+    pub(super) struct MutterPipewireSession {
+        inner: FrameSourceSession<PipewireStreamSource>,
+        mutter: crate::mutter::MutterSession,
+    }
+
+    #[cfg(feature = "capture-mutter")]
+    impl MutterPipewireSession {
+        fn sync_stream_size(&self, frame: &CapturedFrame) {
+            self.mutter.set_stream_size(frame.resolution);
+        }
+    }
+
+    #[cfg(feature = "capture-mutter")]
+    impl CaptureSession for MutterPipewireSession {
+        fn next_frame(&mut self) -> Result<CapturedFrame> {
+            loop {
+                session_lost_if_closed(self.mutter.is_closed())?;
+                if let Some(frame) = self.inner.recv_timeout(Duration::from_millis(100))? {
+                    self.sync_stream_size(&frame);
+                    return Ok(frame);
+                }
+            }
+        }
+
+        fn try_next_frame(&mut self) -> Result<Option<CapturedFrame>> {
+            session_lost_if_closed(self.mutter.is_closed())?;
+            let frame = self.inner.try_next_frame()?;
+            if let Some(frame) = &frame {
+                self.sync_stream_size(frame);
+            }
+            Ok(frame)
+        }
+
+        fn input_backend(&self) -> Option<std::sync::Arc<dyn flux_input::InputBackend>> {
+            Some(self.mutter.input_backend())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
     }
 
     /// A [`CaptureSession`] that keeps the portal session (and its Tokio

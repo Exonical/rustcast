@@ -1,0 +1,14 @@
+#!/bin/bash
+# Persist FLUX_* / RUST_LOG from the container's PID 1 environment for the systemd units.
+set -eu
+mkdir -p /etc/flux
+env_of_init() { tr '\0' '\n' < /proc/1/environ; }
+get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
+{
+  echo "FLUX_DISPLAY_SIZE=$(get FLUX_DISPLAY_SIZE | grep . || echo 1920x1080)"
+  echo "FLUX_RELAY_URL=$(get FLUX_RELAY_URL | grep . || echo http://127.0.0.1:8080)"
+  echo "FLUX_ADVERTISE_HOST=$(get FLUX_ADVERTISE_HOST | grep . || echo 127.0.0.1)"
+  echo "RUST_LOG=$(get RUST_LOG | grep . || echo info)"
+  api=$(get FLUX_CAPTURE_API || true)
+  if [ -n "$api" ]; then echo "FLUX_CAPTURE_API=$api"; fi
+} > /etc/flux/env

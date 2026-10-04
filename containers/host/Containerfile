@@ -1,0 +1,52 @@
+# Build context: repository root.
+ARG ROCKY_IMAGE=docker.io/rockylinux/rockylinux:10
+ARG FLUX_FEATURES=capture-mutter,encoder-ffmpeg
+
+FROM ${ROCKY_IMAGE} AS repos
+RUN dnf -y install dnf-plugins-core epel-release \
+ && dnf config-manager --set-enabled crb \
+ && dnf -y install https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-10.noarch.rpm \
+ && dnf clean all
+
+FROM repos AS builder
+RUN dnf -y --setopt=install_weak_deps=False install \
+      gcc gcc-c++ make clang clang-devel llvm-devel pkgconf-pkg-config curl \
+      pipewire-devel ffmpeg-devel x264-devel \
+ && dnf clean all
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+WORKDIR /src/flux
+COPY flux/rust-toolchain.toml ./
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none \
+ && rustup show active-toolchain || rustup toolchain install
+COPY flux/ ./
+ARG FLUX_FEATURES
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    --mount=type=cache,target=/src/flux/target \
+    cargo build --release -p flux-server --no-default-features --features ${FLUX_FEATURES} \
+ && install -D target/release/flux-server /out/flux-server
+
+FROM repos AS runtime
+RUN dnf -y --setopt=install_weak_deps=False install \
+      systemd dbus-daemon dbus-tools procps-ng iproute which glib2 dconf polkit xdg-user-dirs \
+      gnome-shell mutter gnome-session gnome-session-wayland-session gnome-settings-daemon \
+      xdg-desktop-portal-gnome nautilus ptyxis firefox \
+      pipewire pipewire-utils wireplumber \
+      mesa-dri-drivers mesa-libEGL mesa-libgbm \
+      google-noto-sans-fonts google-noto-sans-mono-fonts dejavu-sans-fonts \
+      ffmpeg-libs x264-libs \
+ && dnf clean all
+COPY containers/host/rootfs/ /
+RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
+ && useradd --create-home --uid 1000 --groups systemd-journal flux \
+ && mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/flux \
+ && dconf update \
+ && systemctl --global enable pipewire.socket pipewire.service wireplumber.service \
+      flux-gnome-session.service flux-server.service \
+ && systemctl enable flux-env.service \
+ && systemctl mask systemd-resolved.service polkit.service rtkit-daemon.service geoclue.service \
+      systemd-networkd.service systemd-firstboot.service getty@tty1.service
+COPY --from=builder /out/flux-server /usr/local/bin/flux-server
+ENV container=podman
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

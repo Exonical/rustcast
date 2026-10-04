@@ -31,7 +31,9 @@ pub trait InputBackend: Send + Sync {
     /// Press or release a mouse button.
     fn pointer_button(&self, button: MouseButton, down: bool) -> Result<()>;
 
-    /// Scroll axis motion (`dx` horizontal, `dy` vertical).
+    /// Scroll axis motion (`dx` horizontal, `dy` vertical) in wheel notches
+    /// (fractions allowed). Positive `dy` scrolls down and positive `dx`
+    /// scrolls right, matching the Wayland axis convention.
     fn pointer_axis(&self, dx: f64, dy: f64) -> Result<()>;
 
     /// Press or release a key by Linux evdev keycode.

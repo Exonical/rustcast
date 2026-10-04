@@ -1,0 +1,13 @@
+#!/bin/bash
+# Generate ~/.config/flux/flux.toml for the host from the container environment.
+set -eu
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/flux/flux.toml"
+mkdir -p "$(dirname "$cfg")"
+flux-server --generate-config -c "$cfg" >/dev/null 2>&1
+sed -i '/^\[relay\]/,$d' "$cfg"
+sed -i 's/^bind_address = .*/bind_address = "0.0.0.0"/' "$cfg"
+cat >> "$cfg" <<EOF
+[relay]
+base_url = "${FLUX_RELAY_URL}"
+advertise_host = "${FLUX_ADVERTISE_HOST}"
+EOF

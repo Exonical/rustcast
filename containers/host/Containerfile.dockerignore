@@ -1,0 +1,7 @@
+**/target
+**/node_modules
+**/.next
+**/out
+flux-web
+.git
+flux/flux_capture_test.h264

@@ -214,6 +214,14 @@ impl<S: PipewireFrameSource> FrameSourceSession<S> {
         }
     }
 
+    /// Poll the source once for up to `timeout`; `Ok(None)` means no frame yet.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+        if !self.running {
+            return Err(FluxError::Capture("session stopped".into()));
+        }
+        self.source.recv_frame(timeout)
+    }
+
     /// The format the underlying source negotiated, if known.
     pub fn negotiated_format(&self) -> Option<NegotiatedFormat> {
         self.source.negotiated_format()

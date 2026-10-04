@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -242,6 +243,24 @@ func newMediaEngineAndInterceptors(initialBitrateBps int) (
 	return m, i, func() cc.BandwidthEstimator { return estimator }, nil
 }
 
+// parseICEPublicIPs splits a comma-separated list of IPs to advertise as ICE
+// host candidates, dropping empty and invalid entries.
+func parseICEPublicIPs(raw string) []string {
+	var ips []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if net.ParseIP(part) == nil {
+			log.Printf("[webrtc] ignoring invalid FLUX_ICE_PUBLIC_IPS entry %q", part)
+			continue
+		}
+		ips = append(ips, part)
+	}
+	return ips
+}
+
 func newSession(initialBitrateBps int) (*Session, error) {
 	m, i, bandwidthEstimator, err := newMediaEngineAndInterceptors(initialBitrateBps)
 	if err != nil {
@@ -251,6 +270,9 @@ func newSession(initialBitrateBps int) (*Session, error) {
 	se := webrtc.SettingEngine{}
 	if iceUDPMux != nil {
 		se.SetICEUDPMux(iceUDPMux)
+	}
+	if ips := parseICEPublicIPs(os.Getenv("FLUX_ICE_PUBLIC_IPS")); len(ips) > 0 {
+		se.SetNAT1To1IPs(ips, webrtc.ICECandidateTypeHost)
 	}
 
 	api := webrtc.NewAPI(

@@ -49,6 +49,19 @@ pub enum MouseButton {
     Forward,
 }
 
+impl MouseButton {
+    /// Linux evdev button code (`BTN_*` in `linux/input-event-codes.h`).
+    pub fn evdev_code(self) -> u32 {
+        match self {
+            MouseButton::Left => 0x110,
+            MouseButton::Right => 0x111,
+            MouseButton::Middle => 0x112,
+            MouseButton::Back => 0x113,
+            MouseButton::Forward => 0x114,
+        }
+    }
+}
+
 /// Injects mouse events into the host OS.
 pub struct MouseSink {
     /// Capture target output rectangle in virtual-desktop coordinates.

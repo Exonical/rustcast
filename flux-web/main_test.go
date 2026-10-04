@@ -153,3 +153,30 @@ func TestMediaEngineInterceptorsSendTWCCLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestParseICEPublicIPs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"unset", "", nil},
+		{"single", "127.0.0.1", []string{"127.0.0.1"}},
+		{"trimmed and empties dropped", " 10.0.0.1 , ,192.168.1.2,", []string{"10.0.0.1", "192.168.1.2"}},
+		{"invalid skipped", "not-an-ip,203.0.113.7,300.1.1.1", []string{"203.0.113.7"}},
+		{"ipv6", "::1", []string{"::1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseICEPublicIPs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

@@ -13,6 +13,8 @@ pub mod traits;
 // Real Linux backends: xdg-desktop-portal negotiation (ashpd) and the live
 // PipeWire stream. Gated on Linux + the `capture-pipewire` feature so default
 // and Windows builds don't pull in the portal/PipeWire system dependencies.
+#[cfg(all(target_os = "linux", feature = "capture-mutter"))]
+pub mod mutter;
 #[cfg(all(target_os = "linux", feature = "capture-pipewire"))]
 pub mod pipewire_source;
 #[cfg(all(target_os = "linux", feature = "capture-pipewire"))]

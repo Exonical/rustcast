@@ -75,18 +75,17 @@ impl PipewireStreamSource {
             thread: None,
         }
     }
-}
 
-impl PipewireFrameSource for PipewireStreamSource {
-    fn connect(&mut self, pipewire_fd: RawFd, node_id: u32, prefs: FormatPrefs) -> Result<()> {
+    /// Connect to `node_id` through the local PipeWire daemon (no portal fd),
+    /// for compositors whose stream nodes live on the user's own daemon.
+    pub fn connect_local(&mut self, node_id: u32, prefs: FormatPrefs) -> Result<()> {
+        self.spawn(None, node_id, prefs)
+    }
+
+    fn spawn(&mut self, fd: Option<OwnedFd>, node_id: u32, prefs: FormatPrefs) -> Result<()> {
         if self.thread.is_some() {
             return Err(FluxError::Capture("PipeWire stream already connected".into()));
         }
-
-        // The portal owns the fd it handed us; `dup` it so this stream owns an
-        // independent descriptor for `Context::connect_fd` (which takes/closes
-        // an `OwnedFd`).
-        let owned = dup_fd(pipewire_fd)?;
 
         let (sink, source) = FrameBridge::new();
         self.source = Some(source);
@@ -96,7 +95,7 @@ impl PipewireFrameSource for PipewireStreamSource {
         let join = std::thread::Builder::new()
             .name("flux-pipewire".into())
             .spawn(move || {
-                if let Err(e) = run_stream(owned, node_id, prefs, sink.clone(), format, quit_rx) {
+                if let Err(e) = run_stream(fd, node_id, prefs, sink.clone(), format, quit_rx) {
                     tracing::error!("PipeWire capture thread exited with error: {e}");
                 }
                 // Make sure a consumer blocked in `recv` wakes up on exit.
@@ -106,6 +105,16 @@ impl PipewireFrameSource for PipewireStreamSource {
 
         self.thread = Some(ThreadHandle { quit: quit_tx, join });
         Ok(())
+    }
+}
+
+impl PipewireFrameSource for PipewireStreamSource {
+    fn connect(&mut self, pipewire_fd: RawFd, node_id: u32, prefs: FormatPrefs) -> Result<()> {
+        // The portal owns the fd it handed us; `dup` it so this stream owns an
+        // independent descriptor for `Context::connect_fd` (which takes/closes
+        // an `OwnedFd`).
+        let owned = dup_fd(pipewire_fd)?;
+        self.spawn(Some(owned), node_id, prefs)
     }
 
     fn recv_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
@@ -138,7 +147,7 @@ impl Drop for PipewireStreamSource {
 
 /// Body of the dedicated PipeWire loop thread.
 fn run_stream(
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     node_id: u32,
     prefs: FormatPrefs,
     sink: FrameSink,
@@ -149,9 +158,14 @@ fn run_stream(
 
     let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| pw_err("create main loop", e))?;
     let context = pw::context::Context::new(&mainloop).map_err(|e| pw_err("create context", e))?;
-    let core = context
-        .connect_fd(fd, None)
-        .map_err(|e| pw_err("connect to PipeWire fd", e))?;
+    let core = match fd {
+        Some(fd) => context
+            .connect_fd(fd, None)
+            .map_err(|e| pw_err("connect to PipeWire fd", e))?,
+        None => context
+            .connect(None)
+            .map_err(|e| pw_err("connect to local PipeWire daemon", e))?,
+    };
 
     let stream = pw::stream::Stream::new(
         &core,

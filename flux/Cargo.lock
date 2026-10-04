@@ -1053,6 +1053,8 @@ dependencies = [
  "crossbeam-channel",
  "drm-fourcc",
  "flux-core",
+ "flux-input",
+ "futures",
  "libspa",
  "parking_lot",
  "pipewire",
@@ -1060,6 +1062,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+ "zbus",
 ]
 
 [[package]]

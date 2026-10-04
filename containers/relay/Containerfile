@@ -1,0 +1,32 @@
+# Build context: repository root.
+ARG GO_IMAGE=docker.io/library/golang:1.27
+ARG NODE_IMAGE=docker.io/library/node:lts
+ARG ROCKY_IMAGE=docker.io/rockylinux/rockylinux:10-minimal
+
+FROM ${NODE_IMAGE} AS ui
+RUN corepack enable
+WORKDIR /ui
+COPY flux-web/ui/package.json flux-web/ui/pnpm-lock.yaml ./
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile --config.strict-dep-builds=false
+COPY flux-web/ui/ ./
+RUN pnpm build
+
+FROM ${GO_IMAGE} AS relay
+WORKDIR /src
+COPY flux-web/go.mod flux-web/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY flux-web/*.go ./
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/flux-web .
+
+FROM ${ROCKY_IMAGE}
+RUN useradd --system --create-home --home-dir /app flux-web
+WORKDIR /app
+COPY --from=relay /out/flux-web /app/flux-web
+COPY --from=ui /ui/out /app/ui/out
+USER flux-web
+# HTTP/WebSocket signaling + UI
+EXPOSE 8080/tcp
+# WebRTC media (single ICE UDP mux)
+EXPOSE 8443/udp
+ENTRYPOINT ["/app/flux-web"]

@@ -63,6 +63,12 @@ pub trait CaptureSession: Send {
         None
     }
 
+    /// Input injection backend tied to this capture session (e.g. the
+    /// RemoteDesktop half of a Mutter session), if the capture backend has one.
+    fn input_backend(&self) -> Option<Arc<dyn flux_input::InputBackend>> {
+        None
+    }
+
     /// Signal the capture backend to stop. The session becomes invalid after this call.
     fn stop(&mut self) -> Result<()>;
 }

@@ -1179,6 +1179,17 @@ fn replug_capture(
     Ok((target, session))
 }
 
+/// Route input through the capture session's own injection backend, when it has one.
+fn attach_input_backend(
+    input_sink: &flux_input::InputSink,
+    session: &dyn flux_capture::traits::CaptureSession,
+) {
+    #[cfg(not(target_os = "windows"))]
+    input_sink.set_backend(session.input_backend());
+    #[cfg(target_os = "windows")]
+    let _ = (input_sink, session);
+}
+
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
 /// Writes first ~5s of H.264 NALUs to a verification file.
 #[allow(clippy::too_many_arguments)]
@@ -1343,6 +1354,7 @@ fn capture_loop(
             return;
         }
     };
+    attach_input_backend(&input_sink, session.as_ref());
 
     // ── Encoder is initialized lazily from the first captured frame ──
     // The capture server fixates the real resolution at negotiation time,
@@ -1673,6 +1685,7 @@ fn capture_loop(
                     ) {
                         Ok(new_session) => {
                             session = new_session;
+                            attach_input_backend(&input_sink, session.as_ref());
                             if let Err(error) = input_sink.set_target_rect(refreshed.desktop_rect) {
                                 tracing::warn!("Failed to update input target rectangle: {}", error);
                             }
@@ -1769,6 +1782,7 @@ fn capture_loop(
                 ) {
                     Ok(s) => {
                         session = s;
+                        attach_input_backend(&input_sink, session.as_ref());
                         if let Ok(mut dimensions) = cursor_dimensions.write() {
                             dimensions.0 = encode_resolution.width;
                             dimensions.1 = encode_resolution.height;
@@ -1799,6 +1813,7 @@ fn capture_loop(
                                 return;
                             }
                         };
+                        attach_input_backend(&input_sink, session.as_ref());
                         if let Ok(mut dimensions) = cursor_dimensions.write() {
                             dimensions.0 = primary.native_resolution.width;
                             dimensions.1 = primary.native_resolution.height;

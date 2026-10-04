@@ -1,0 +1,37 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>flux-webrtc-test</title>
+<pre id="out">running</pre>
+<script>
+// Headless WebRTC check against the relay: negotiates, then reports ICE state,
+// the relay's candidates and received video stats after ~10s.
+const out = document.getElementById('out');
+const log = [];
+const pc = new RTCPeerConnection({ iceServers: [] });
+pc.addTransceiver('video', { direction: 'recvonly' });
+pc.oniceconnectionstatechange = () => log.push('ice=' + pc.iceConnectionState);
+const ws = new WebSocket('ws://localhost:8080/ws/signaling');
+pc.onicecandidate = e => { if (e.candidate && ws.readyState === 1) ws.send(JSON.stringify({ type: 'new-ice-candidate', data: e.candidate.toJSON() })); };
+ws.onopen = async () => {
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ type: 'offer', data: { sd: offer.sdp, width: 1920, height: 1080 } }));
+};
+ws.onmessage = async evt => {
+  const msg = JSON.parse(evt.data);
+  const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
+  if (msg.type === 'answer') {
+    log.push('answer-candidates=' + (data.sd.match(/a=candidate:.*/g) || []).join(' | '));
+    await pc.setRemoteDescription({ type: 'answer', sdp: data.sd });
+  } else if (msg.type === 'new-ice-candidate' && data.candidate) {
+    log.push('remote-cand=' + data.candidate);
+    await pc.addIceCandidate(data);
+  }
+};
+setTimeout(async () => {
+  const stats = await pc.getStats();
+  stats.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') log.push(`bytes=${s.bytesReceived} framesDecoded=${s.framesDecoded}`); });
+  out.textContent = log.join('\n');
+  document.title = 'done';
+}, 10000);
+</script>

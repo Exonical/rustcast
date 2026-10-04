@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 flux-core = { workspace = true }
+flux-input = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -24,11 +25,18 @@ mock = []
 # so they are optional and only meaningful on Linux.
 capture-pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:drm-fourcc"]
 capture-drm = []
+# Unattended GNOME capture + input via Mutter's private ScreenCast/RemoteDesktop
+# D-Bus API (no portal consent dialog). Streams the node from the local PipeWire
+# daemon.
+capture-mutter = ["capture-pipewire", "dep:zbus", "dep:futures"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # XDG desktop portal (ScreenCast + RemoteDesktop) bindings over zbus. Use the
 # tokio reactor to match the workspace async runtime.
 ashpd = { version = "0.9", default-features = false, features = ["tokio"], optional = true }
+# Direct D-Bus access to Mutter's ScreenCast / RemoteDesktop / DisplayConfig.
+zbus = { version = "4.4", default-features = false, features = ["tokio"], optional = true }
+futures = { workspace = true, optional = true }
 # Official PipeWire / SPA Rust bindings for the live capture stream.
 pipewire = { version = "0.8", optional = true }
 libspa = { version = "0.8", optional = true }

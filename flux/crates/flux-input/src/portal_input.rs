@@ -32,14 +32,6 @@ use flux_core::error::{FluxError, Result};
 use crate::backend::InputBackend;
 use crate::mouse::MouseButton;
 
-// Linux evdev pointer button codes (`BTN_*` in `linux/input-event-codes.h`);
-// the portal's `NotifyPointerButton` expects these.
-const BTN_LEFT: i32 = 0x110;
-const BTN_RIGHT: i32 = 0x111;
-const BTN_MIDDLE: i32 = 0x112;
-const BTN_SIDE: i32 = 0x113;
-const BTN_EXTRA: i32 = 0x114;
-
 /// A command forwarded from [`PortalInputBackend`] to the session thread.
 enum Cmd {
     Motion { dx: f64, dy: f64 },
@@ -154,13 +146,7 @@ impl Drop for PortalInputBackend {
 
 /// Map a [`MouseButton`] to its Linux evdev button code.
 fn evdev_button(button: MouseButton) -> i32 {
-    match button {
-        MouseButton::Left => BTN_LEFT,
-        MouseButton::Right => BTN_RIGHT,
-        MouseButton::Middle => BTN_MIDDLE,
-        MouseButton::Back => BTN_SIDE,
-        MouseButton::Forward => BTN_EXTRA,
-    }
+    button.evdev_code() as i32
 }
 
 /// Map a press/release flag to the portal's [`KeyState`].

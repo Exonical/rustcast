@@ -1,0 +1,13 @@
+[Unit]
+Description=Headless GNOME session
+After=pipewire.service wireplumber.service
+
+[Service]
+EnvironmentFile=-/etc/flux/env
+Type=simple
+Environment=XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_DESKTOP=gnome XDG_MENU_PREFIX=gnome-
+ExecStart=/usr/bin/gnome-session --session=gnome
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

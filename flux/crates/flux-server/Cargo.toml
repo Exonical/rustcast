@@ -18,6 +18,7 @@ tray = ["dep:tray-icon", "dep:muda"]
 # Forward the Linux-only real capture/encode backends so the pipeline can probe
 # live portal + VA-API capabilities (otherwise it runs on the base probe).
 capture-pipewire = ["flux-capture/capture-pipewire"]
+capture-mutter = ["flux-capture/capture-mutter"]
 encoder-vaapi = ["flux-encode/encoder-vaapi"]
 encoder-ffmpeg = ["flux-encode/encoder-ffmpeg"]
 encoder-vulkan = ["flux-encode/encoder-vulkan"]

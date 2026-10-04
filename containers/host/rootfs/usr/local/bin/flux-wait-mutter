@@ -1,0 +1,11 @@
+#!/bin/bash
+# Block until Mutter's ScreenCast and RemoteDesktop services are on the session bus.
+for _ in $(seq 1 120); do
+  if busctl --user status org.gnome.Mutter.ScreenCast >/dev/null 2>&1 \
+     && busctl --user status org.gnome.Mutter.RemoteDesktop >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 1
+done
+echo "Mutter D-Bus services did not appear" >&2
+exit 1

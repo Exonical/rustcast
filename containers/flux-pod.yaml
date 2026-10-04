@@ -1,0 +1,39 @@
+# podman kube play containers/flux-pod.yaml
+# Both containers share the pod's network namespace, so the host registers with
+# the relay over 127.0.0.1. Only the relay's ports are published.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: flux
+  labels:
+    app: flux
+spec:
+  containers:
+    - name: relay
+      image: localhost/flux-relay:latest
+      imagePullPolicy: Never
+      env:
+        # Advertised as the WebRTC host candidate: what a browser on the
+        # podman-machine host reaches through the published UDP port.
+        - name: FLUX_ICE_PUBLIC_IPS
+          value: "127.0.0.1"
+      ports:
+        - containerPort: 8080
+          hostPort: 8080
+          protocol: TCP
+        - containerPort: 8443
+          hostPort: 8443
+          protocol: UDP
+    - name: host
+      image: localhost/flux-host:latest
+      imagePullPolicy: Never
+      command: ["/sbin/init"]
+      env:
+        - name: FLUX_DISPLAY_SIZE
+          value: "1920x1080"
+        - name: FLUX_RELAY_URL
+          value: "http://127.0.0.1:8080"
+        - name: FLUX_ADVERTISE_HOST
+          value: "127.0.0.1"
+        - name: RUST_LOG
+          value: "info"
