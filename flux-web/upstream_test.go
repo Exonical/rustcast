@@ -81,7 +81,7 @@ func TestLatestFrameReleasesOnlyDiscardedPayloads(t *testing.T) {
 			for _, frame := range test.queued {
 				ch <- pooledFrame(&pool, frame)
 			}
-			latest, _ := latestFrame(ch, current)
+			latest, _, _ := latestFrame(ch, current)
 			if latest.tsMicros != test.wantTs || len(latest.data) == 0 {
 				t.Fatalf("selected frame = %+v, want ts=%d", latest, test.wantTs)
 			}
@@ -268,6 +268,36 @@ func TestFramePusherReleasesConsumedAndSkippedFrames(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type stopAfterPacketizing struct {
+	rtp.Packetizer
+	stop func()
+}
+
+func (p *stopAfterPacketizing) Packetize(data []byte, samples uint32) []*rtp.Packet {
+	packets := p.Packetizer.Packetize(data, samples)
+	p.stop()
+	return packets
+}
+
+func TestFramePusherReleasesPayloadWhenPacingStops(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.bindSession(&Session{VideoTrack: track, Packetizer: &stopAfterPacketizing{
+		Packetizer: rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000),
+		stop:       u.stop,
+	}})
+	data := bytes.Repeat([]byte{3}, 4096)
+	copy(data, pFrame(1).data)
+	u.queueFrame(pooledFrame(&u.frameBuffers, frameMsg{data: data}))
+	u.framePusher()
+	if u.frameBuffers.count != 1 || len(u.frameChan) != 0 {
+		t.Fatal("stopped pacing retained or released the payload twice")
 	}
 }
 
