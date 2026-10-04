@@ -230,6 +230,14 @@ mod tests {
     }
 
     #[test]
+    fn gamepad_events_surface_the_unimplemented_error() {
+        let (sink, rec) = sink_with_recorder();
+        let event = InputEvent::Gamepad(crate::gamepad::GamepadEvent::Connected { gamepad_id: 0 });
+        assert!(matches!(sink.handle_event(&event), Err(flux_core::FluxError::Input(_))));
+        assert!(rec.take().is_empty());
+    }
+
+    #[test]
     fn clearing_the_backend_stops_routing() {
         let (sink, rec) = sink_with_recorder();
         sink.set_backend(None);
