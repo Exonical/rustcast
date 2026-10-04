@@ -33,7 +33,7 @@ func TestSessionMachineAccessIsSynchronized(t *testing.T) {
 }
 
 func TestMediaEngineInterceptorsSendTWCCLoopback(t *testing.T) {
-	mediaEngine, interceptors, _, err := newMediaEngineAndInterceptors()
+	mediaEngine, interceptors, _, err := newMediaEngineAndInterceptors(abrGCCInitialBitrateBps)
 	if err != nil {
 		t.Fatalf("create media engine and interceptors: %v", err)
 	}

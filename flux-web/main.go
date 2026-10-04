@@ -192,7 +192,7 @@ func naluTypeName(t byte) string {
 // WebRTC session management
 // ---------------------------------------------------------------------------
 
-func newMediaEngineAndInterceptors() (
+func newMediaEngineAndInterceptors(initialBitrateBps int) (
 	*webrtc.MediaEngine,
 	*interceptor.Registry,
 	func() cc.BandwidthEstimator,
@@ -219,7 +219,7 @@ func newMediaEngineAndInterceptors() (
 	var estimator cc.BandwidthEstimator
 	ccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
 		return gcc.NewSendSideBWE(
-			gcc.SendSideBWEInitialBitrate(abrGCCInitialBitrateBps),
+			gcc.SendSideBWEInitialBitrate(initialBitrateBps),
 			gcc.SendSideBWEMinBitrate(abrMinKbps*1000),
 			gcc.SendSideBWEMaxBitrate(abrGCCMaxBitrateBps),
 			gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
@@ -242,8 +242,8 @@ func newMediaEngineAndInterceptors() (
 	return m, i, func() cc.BandwidthEstimator { return estimator }, nil
 }
 
-func newSession() (*Session, error) {
-	m, i, bandwidthEstimator, err := newMediaEngineAndInterceptors()
+func newSession(initialBitrateBps int) (*Session, error) {
+	m, i, bandwidthEstimator, err := newMediaEngineAndInterceptors(initialBitrateBps)
 	if err != nil {
 		return nil, err
 	}
@@ -594,7 +594,7 @@ func handleSignaling(c *gin.Context, registry *machineRegistry) {
 				continue
 			}
 
-			next, err := newSession()
+			next, err := newSession(upstream.abr.gccInitialBitrateBps())
 			if err != nil {
 				registry.release(upstream)
 				sendWSError(writer, "Failed to create session")
