@@ -45,10 +45,15 @@ impl Packetizer {
 
         let chunks: Vec<&[u8]> = frame_data.chunks(max_payload).collect();
         let total_data_packets = chunks.len() as u16;
-        let fec_count = self.fec_encoder.parity_count(chunks.len());
+
+        let data_payloads: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        let parity_packets = self.fec_encoder.encode(&data_payloads).unwrap_or_else(|e| {
+            tracing::warn!("Sending frame {} without FEC: {}", frame_number, e);
+            vec![]
+        });
+        let fec_count = parity_packets.len();
 
         let mut packets = Vec::with_capacity(chunks.len() + fec_count);
-        let mut data_payloads = Vec::with_capacity(chunks.len());
 
         for (index, chunk) in chunks.iter().enumerate() {
             let is_last = index == chunks.len() - 1;
@@ -74,37 +79,34 @@ impl Packetizer {
             video_ext.serialize(&mut buf);
             buf.extend_from_slice(chunk);
 
-            data_payloads.push(chunk.to_vec());
             packets.push(buf.to_vec());
             *sequence_number = sequence_number.wrapping_add(1);
         }
 
-        if let Ok(parity_packets) = self.fec_encoder.encode(&data_payloads) {
-            for (index, parity) in parity_packets.iter().enumerate() {
-                let rtp_header = RtpHeader {
-                    payload_type: crate::rtp::payload_types::FEC,
-                    sequence_number: *sequence_number,
-                    timestamp: rtp_timestamp,
-                    ssrc: self.ssrc,
-                    marker: false,
-                };
+        for (index, parity) in parity_packets.iter().enumerate() {
+            let rtp_header = RtpHeader {
+                payload_type: crate::rtp::payload_types::FEC,
+                sequence_number: *sequence_number,
+                timestamp: rtp_timestamp,
+                ssrc: self.ssrc,
+                marker: false,
+            };
 
-                let video_ext = FluxVideoExtension {
-                    frame_number,
-                    total_data_packets,
-                    packet_index: (total_data_packets as usize + index) as u16,
-                    fec_packet_count: fec_count as u16,
-                    is_idr: is_keyframe,
-                };
+            let video_ext = FluxVideoExtension {
+                frame_number,
+                total_data_packets,
+                packet_index: (total_data_packets as usize + index) as u16,
+                fec_packet_count: fec_count as u16,
+                is_idr: is_keyframe,
+            };
 
-                let mut buf = BytesMut::with_capacity(header_overhead + parity.len());
-                rtp_header.serialize(&mut buf);
-                video_ext.serialize(&mut buf);
-                buf.extend_from_slice(parity);
+            let mut buf = BytesMut::with_capacity(header_overhead + parity.len());
+            rtp_header.serialize(&mut buf);
+            video_ext.serialize(&mut buf);
+            buf.extend_from_slice(parity);
 
-                packets.push(buf.to_vec());
-                *sequence_number = sequence_number.wrapping_add(1);
-            }
+            packets.push(buf.to_vec());
+            *sequence_number = sequence_number.wrapping_add(1);
         }
 
         tracing::trace!(
@@ -201,5 +203,42 @@ impl Depacketizer {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtp::payload_types;
+
+    fn packetize(fec_percentage: u8, frame: &[u8]) -> Vec<Vec<u8>> {
+        let mut seq = 0u16;
+        Packetizer::new(fec_percentage, 1).packetize(frame, true, 7, &mut seq, 0, 34, payload_types::H264)
+    }
+
+    fn fec_counts(packets: &[Vec<u8>]) -> Vec<u16> {
+        packets
+            .iter()
+            .map(|p| {
+                FluxVideoExtension::parse(&p[RtpHeader::SIZE..])
+                    .unwrap()
+                    .fec_packet_count
+            })
+            .collect()
+    }
+
+    #[test]
+    fn advertises_single_xor_parity_packet() {
+        let packets = packetize(50, &[0xAB; 20]);
+        assert_eq!(packets.len(), 3);
+        assert_eq!(fec_counts(&packets), vec![1, 1, 1]);
+        assert_eq!(RtpHeader::parse(&packets[2]).unwrap().payload_type, payload_types::FEC);
+    }
+
+    #[test]
+    fn advertises_no_fec_when_multi_parity_is_unavailable() {
+        let packets = packetize(20, &[0xAB; 100]);
+        assert_eq!(packets.len(), 10);
+        assert_eq!(fec_counts(&packets), vec![0; 10]);
     }
 }

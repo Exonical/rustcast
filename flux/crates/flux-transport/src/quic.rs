@@ -11,10 +11,19 @@
 //!   - 0-RTT connection establishment
 //!   - Multiplexed streams without head-of-line blocking
 //!   - Unreliable datagrams (RFC 9221) for media
+//!
+//! Status: placeholder. No QUIC I/O is implemented yet; every constructor and
+//! I/O method returns a "not yet implemented" [`FluxError::Network`] rather
+//! than reporting success. The live host stream uses `quinn` directly in
+//! `flux-server/src/quic_frames.rs`.
 
 use std::net::SocketAddr;
 
 use flux_core::error::{FluxError, Result};
+
+fn not_implemented(operation: &str) -> FluxError {
+    FluxError::Network(format!("QUIC {operation} not yet implemented"))
+}
 
 /// Configuration for the QUIC transport.
 #[derive(Debug, Clone)]
@@ -60,8 +69,6 @@ impl QuicServer {
         _cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
         _private_key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<Self> {
-        tracing::info!("Binding QUIC server on {}", config.bind_addr);
-
         // TODO: Full quinn server setup:
         //
         //   1. Build rustls ServerConfig:
@@ -84,15 +91,13 @@ impl QuicServer {
         //   3. Bind endpoint:
         //      let endpoint = quinn::Endpoint::server(server_config, config.bind_addr)?;
 
-        Ok(Self { _config: config })
+        Err(not_implemented(&format!("server bind on {}", config.bind_addr)))
     }
 
     /// Accept the next incoming QUIC connection.
     pub async fn accept(&self) -> Result<QuicConnection> {
         // TODO: endpoint.accept().await → connecting.await → connection
-        tracing::debug!("Waiting for incoming QUIC connection");
-
-        Err(FluxError::Network("QUIC accept not yet implemented".into()))
+        Err(not_implemented("accept"))
     }
 }
 
@@ -104,8 +109,6 @@ pub struct QuicClient {
 impl QuicClient {
     /// Create a QUIC client endpoint.
     pub async fn new(config: QuicConfig) -> Result<Self> {
-        tracing::info!("Creating QUIC client endpoint");
-
         // TODO: quinn client endpoint setup:
         //
         //   let mut tls_config = rustls::ClientConfig::builder()
@@ -118,15 +121,13 @@ impl QuicClient {
         //   let mut endpoint = quinn::Endpoint::client(config.bind_addr)?;
         //   endpoint.set_default_client_config(client_config);
 
-        Ok(Self { _config: config })
+        Err(not_implemented(&format!("client endpoint on {}", config.bind_addr)))
     }
 
     /// Connect to a remote Flux server.
     pub async fn connect(&self, server_addr: SocketAddr, server_name: &str) -> Result<QuicConnection> {
-        tracing::info!("Connecting to {} ({})", server_addr, server_name);
-
         // TODO: endpoint.connect(server_addr, server_name)?.await
-        Err(FluxError::Network("QUIC connect not yet implemented".into()))
+        Err(not_implemented(&format!("connect to {server_addr} ({server_name})")))
     }
 }
 
@@ -140,26 +141,25 @@ impl QuicConnection {
     /// Open a new bidirectional stream for reliable ordered data.
     pub async fn open_stream(&self) -> Result<QuicStream> {
         // TODO: connection.open_bi().await
-        Err(FluxError::Network("open_stream not yet implemented".into()))
+        Err(not_implemented("open_stream"))
     }
 
     /// Accept an incoming bidirectional stream from the peer.
     pub async fn accept_stream(&self) -> Result<QuicStream> {
         // TODO: connection.accept_bi().await
-        Err(FluxError::Network("accept_stream not yet implemented".into()))
+        Err(not_implemented("accept_stream"))
     }
 
     /// Send an unreliable datagram (for media packets).
-    pub fn send_datagram(&self, data: &[u8]) -> Result<()> {
+    pub fn send_datagram(&self, _data: &[u8]) -> Result<()> {
         // TODO: connection.send_datagram(Bytes::copy_from_slice(data))
-        tracing::trace!("Sending QUIC datagram: {} bytes", data.len());
-        Ok(())
+        Err(not_implemented("send_datagram"))
     }
 
     /// Receive an unreliable datagram from the peer.
     pub async fn recv_datagram(&self) -> Result<Vec<u8>> {
         // TODO: connection.read_datagram().await
-        Err(FluxError::Network("recv_datagram not yet implemented".into()))
+        Err(not_implemented("recv_datagram"))
     }
 
     /// Get the remote address of the peer.
@@ -185,18 +185,51 @@ impl QuicStream {
     /// Write data to the stream.
     pub async fn write(&mut self, _data: &[u8]) -> Result<()> {
         // TODO: send_stream.write_all(data).await
-        Ok(())
+        Err(not_implemented("stream write"))
     }
 
     /// Read data from the stream.
     pub async fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
         // TODO: recv_stream.read(buf).await
-        Ok(0)
+        Err(not_implemented("stream read"))
     }
 
     /// Gracefully finish the send side.
     pub async fn finish(&mut self) -> Result<()> {
         // TODO: send_stream.finish()
-        Ok(())
+        Err(not_implemented("stream finish"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_not_implemented<T>(result: Result<T>) {
+        match result {
+            Err(FluxError::Network(msg)) => assert!(msg.contains("not yet implemented"), "{msg}"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("placeholder QUIC API reported success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn placeholder_endpoints_fail_instead_of_succeeding() {
+        let cert = rustls::pki_types::CertificateDer::from(vec![0u8]);
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(vec![0u8].into());
+        assert_not_implemented(QuicServer::bind(QuicConfig::default(), vec![cert], key).await);
+        assert_not_implemented(QuicClient::new(QuicConfig::default()).await);
+    }
+
+    #[tokio::test]
+    async fn placeholder_io_fails_instead_of_succeeding() {
+        let conn = QuicConnection { _private: () };
+        assert_not_implemented(conn.send_datagram(b"frame"));
+        assert_not_implemented(conn.recv_datagram().await);
+
+        let mut stream = QuicStream { _private: () };
+        assert_not_implemented(stream.write(b"data").await);
+        assert_not_implemented(stream.read(&mut [0u8; 16]).await);
+        assert_not_implemented(stream.finish().await);
     }
 }
