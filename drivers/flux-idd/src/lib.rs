@@ -678,7 +678,13 @@ extern "C" fn evt_monitor_assign_swapchain(
             state.processor = Some(processor);
             STATUS_SUCCESS
         }
-        Err(_) => STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN,
+        Err(code) => {
+            wdk::println!(
+                "[FluxIdd] Swap-chain processor start failed: 0x{:08X}",
+                code as u32
+            );
+            STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN
+        }
     }
 }
 

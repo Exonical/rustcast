@@ -68,16 +68,16 @@ impl KeyboardSink {
 
         #[cfg(not(target_os = "windows"))]
         {
-            tracing::trace!("Input injection not implemented for this OS: {:?}", event);
-            Ok(())
+            tracing::trace!("Keyboard injection not implemented for this OS: {:?}", event);
+            Err(crate::inject::not_implemented("keyboard"))
         }
     }
 
     #[cfg(target_os = "windows")]
     fn inject_windows(&self, event: &KeyboardEvent) -> flux_core::Result<()> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-            KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+            VIRTUAL_KEY,
         };
 
         let mut dw_flags = windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0);
@@ -138,10 +138,6 @@ impl KeyboardSink {
             },
         };
 
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
-
-        Ok(())
+        crate::inject::send_input("keyboard", &[input])
     }
 }

@@ -28,6 +28,13 @@ use windows::Win32::UI::HiDpi::{
 use windows::core::Interface;
 
 const DXGI_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Most recently delivered ring slots that may still be read by the async
+/// encoder and must not be rewritten.
+const IN_FLIGHT_DEPTH: usize = 2;
+const _: () = assert!(
+    DXGI_SHARED_TEXTURE_RING_SIZE > IN_FLIGHT_DEPTH,
+    "shared texture ring needs a spare surface beyond the in-flight slots"
+);
 
 /// DXGI Desktop Duplication capture backend.
 pub struct DxgiCapture {
@@ -598,7 +605,7 @@ struct DxgiCaptureSession {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     surfaces: Vec<SharedSurface>,
-    delivered: [Option<usize>; 2],
+    delivered: [Option<usize>; IN_FLIGHT_DEPTH],
     pending: Option<usize>,
     display_id: u32,
     resolution: Resolution,
@@ -763,7 +770,7 @@ impl DxgiCaptureSession {
                 context: context.clone(),
                 duplication,
                 surfaces,
-                delivered: [None; 2],
+                delivered: [None; IN_FLIGHT_DEPTH],
                 pending: None,
                 display_id,
                 resolution: output,
@@ -873,7 +880,8 @@ impl DxgiCaptureSession {
 
     fn deliver(&mut self, slot: usize) -> CapturedFrame {
         let now = Instant::now();
-        self.delivered = [Some(slot), self.delivered[0]];
+        self.delivered.rotate_right(1);
+        self.delivered[0] = Some(slot);
         self.pending = None;
         self.pacer.mark_delivered(now);
         self.frame_sequence += 1;

@@ -1,5 +1,6 @@
 //! Gamepad / controller input events and virtual gamepad injection.
 
+use flux_core::FluxError;
 use serde::{Deserialize, Serialize};
 
 /// A gamepad event from the remote client.
@@ -59,6 +60,9 @@ pub enum GamepadAxis {
 }
 
 /// Injects gamepad events into the host OS as a virtual controller.
+///
+/// No platform backend exists yet, so [`GamepadSink::inject`] rejects every
+/// event with [`FluxError::Input`] instead of reporting a successful no-op.
 pub struct GamepadSink {
     // TODO:
     //   Windows: ViGEmBus client (virtual Xbox 360 / DS4 controller)
@@ -68,7 +72,7 @@ pub struct GamepadSink {
 
 impl GamepadSink {
     pub fn new() -> flux_core::Result<Self> {
-        tracing::debug!("Initializing gamepad input sink");
+        tracing::debug!("Initializing gamepad input sink (injection not implemented on this platform)");
 
         // TODO:
         //   Windows:
@@ -89,32 +93,46 @@ impl GamepadSink {
     }
 
     /// Inject a gamepad event.
+    ///
+    /// Always fails with [`FluxError::Input`] until a virtual-controller
+    /// backend (ViGEmBus on Windows, uinput on Linux) is implemented.
     pub fn inject(&self, event: &GamepadEvent) -> flux_core::Result<()> {
-        match event {
-            GamepadEvent::Button { gamepad_id, button, pressed } => {
-                tracing::trace!(
-                    "Gamepad {} button {:?} {}",
-                    gamepad_id,
-                    button,
-                    if *pressed { "down" } else { "up" }
-                );
-                // TODO:
-                //   Windows: vigem_target_x360_update with XUSB_REPORT
-                //   Linux:   write EV_KEY event
-            }
-            GamepadEvent::Axis { gamepad_id, axis, value } => {
-                tracing::trace!("Gamepad {} axis {:?} = {:.3}", gamepad_id, axis, value);
-                // TODO:
-                //   Windows: vigem_target_x360_update with axis values
-                //   Linux:   write EV_ABS event
-            }
-            GamepadEvent::Connected { gamepad_id } => {
-                tracing::info!("Virtual gamepad {} connected", gamepad_id);
-            }
-            GamepadEvent::Disconnected { gamepad_id } => {
-                tracing::info!("Virtual gamepad {} disconnected", gamepad_id);
+        // TODO:
+        //   Button: Windows vigem_target_x360_update with XUSB_REPORT; Linux EV_KEY
+        //   Axis:   Windows vigem_target_x360_update with axis values; Linux EV_ABS
+        tracing::trace!("Dropping gamepad event (injection not implemented): {:?}", event);
+        Err(FluxError::Input(GAMEPAD_UNIMPLEMENTED.into()))
+    }
+}
+
+const GAMEPAD_UNIMPLEMENTED: &str = "gamepad injection not implemented on this platform";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_reports_unimplemented_for_every_event_kind() {
+        let sink = GamepadSink::new().unwrap();
+        let events = [
+            GamepadEvent::Button {
+                gamepad_id: 0,
+                button: GamepadButton::A,
+                pressed: true,
+            },
+            GamepadEvent::Axis {
+                gamepad_id: 0,
+                axis: GamepadAxis::LeftStickX,
+                value: 0.5,
+            },
+            GamepadEvent::Connected { gamepad_id: 0 },
+            GamepadEvent::Disconnected { gamepad_id: 0 },
+        ];
+        for event in &events {
+            match sink.inject(event) {
+                Err(FluxError::Input(msg)) => assert_eq!(msg, GAMEPAD_UNIMPLEMENTED),
+                other => panic!("expected FluxError::Input for {event:?}, got {other:?}"),
             }
         }
-        Ok(())
     }
 }
