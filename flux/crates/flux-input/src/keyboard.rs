@@ -36,6 +36,7 @@ impl KeyboardEvent {
 
 bitflags::bitflags! {
     /// Active keyboard modifier flags.
+    /// Mirrored by `ModifierFlags` in `flux-web/ui/lib/protocol.ts`; its parity test parses these values.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ModifierFlags: u16 {
         const SHIFT     = 0x0001;

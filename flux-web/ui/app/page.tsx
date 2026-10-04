@@ -8,6 +8,7 @@ import { WebRTCClient, type ConnectionState, type CursorMetadata, type Resolutio
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget } from "@/lib/local-controls";
+import { modifierFlags, targetBitrateKbps } from "@/lib/protocol";
 
 // ── Helper Functions ────────────────────────────────────────────────────────
 
@@ -15,12 +16,9 @@ function formatBitrate(kbps: number): string {
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(1)} Mbps` : `${kbps} kbps`;
 }
 
-// Estimate mirror of quality_bpp() in flux/crates/flux-server/src/main.rs.
 // Sender-reported target bitrate is not part of the live viewer state yet.
-const qualityBpp = [0, 0.025, 0.035, 0.05, 0.065, 0.08, 0.1, 0.12, 0.14, 0.16, 0.2];
-
 function qualityMbps(level: number, width: number, height: number, fps: number): number {
-  return (width * height * fps * qualityBpp[level]) / 1_000_000;
+  return targetBitrateKbps(level, width, height, fps) / 1000;
 }
 
 function formatBytes(bytes: number): string {
@@ -38,18 +36,6 @@ function mapMouseButton(button: number): "Left" | "Right" | "Middle" | "Back" | 
     case 4: return "Forward";
     default: return undefined;
   }
-}
-
-function getModifiers(e: KeyboardEvent): number {
-  let modifiers = 0;
-  if (e.shiftKey) modifiers |= 0x0001; // SHIFT
-  if (e.ctrlKey) modifiers |= 0x0002;  // CTRL
-  if (e.altKey) modifiers |= 0x0004;   // ALT
-  if (e.metaKey) modifiers |= 0x0008;  // META/WIN
-  // CAPS_LOCK (0x0010) and NUM_LOCK (0x0020) are harder to detect reliably on keydown/up without getModifierState
-  if (e.getModifierState("CapsLock")) modifiers |= 0x0010;
-  if (e.getModifierState("NumLock")) modifiers |= 0x0020;
-  return modifiers;
 }
 
 function CursorOverlay({
@@ -623,7 +609,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
             KeyDown: {
               scan_code: scanCode,
               key_code: e.keyCode,
-              modifiers: getModifiers(e)
+              modifiers: modifierFlags(e)
             }
           }
         });
@@ -648,7 +634,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
             KeyUp: {
               scan_code: held.scan_code,
               key_code: held.key_code,
-              modifiers: getModifiers(e)
+              modifiers: modifierFlags(e)
             }
           }
         });
