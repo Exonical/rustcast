@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/quic-go/quic-go"
 )
 
@@ -23,24 +25,26 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id          string
-	addr        string
-	frameChan   chan frameMsg
-	cursorChan  chan cursorMsg
-	commandChan chan []byte
-	abr         *abrState
-	stopChan    chan struct{}
-	stopOnce    sync.Once
-	viewers     int // Protected by machineRegistry.mu.
-	viewerCount atomic.Uint32
-	mu          sync.Mutex
-	session     *Session
-	lastCursor  *cursorMsg
-	conn        net.Conn
-	cancel      context.CancelFunc
-	status      func(string)
-	idrGate     idrRequestGate
-	idrStats    idrStats
+	id           string
+	addr         string
+	frameChan    chan frameMsg
+	frameQueueMu sync.Mutex
+	frameBuffers frameBufferPool
+	cursorChan   chan cursorMsg
+	commandChan  chan []byte
+	abr          *abrState
+	stopChan     chan struct{}
+	stopOnce     sync.Once
+	viewers      int // Protected by machineRegistry.mu.
+	viewerCount  atomic.Uint32
+	mu           sync.Mutex
+	session      *Session
+	lastCursor   *cursorMsg
+	conn         net.Conn
+	cancel       context.CancelFunc
+	status       func(string)
+	idrGate      idrRequestGate
+	idrStats     idrStats
 }
 
 const (
@@ -53,7 +57,104 @@ const (
 	pacingIDRMinCeiling     = 10_000_000            // bits/s IDR pacing ceiling when the target is low or unknown
 	idrRequestInterval      = 2 * time.Second
 	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
+	maxFramePayloadSize     = 10 * 1024 * 1024
+	maxCachedFrameBuffers   = 4
 )
+
+// Keep only a small, bounded free list per upstream, rather than retaining the
+// entire queue's high-water mark. Active frames never share a cached buffer.
+type frameBufferPool struct {
+	mu      sync.Mutex
+	buffers [maxCachedFrameBuffers][]byte
+	count   int
+}
+
+func (p *frameBufferPool) get(size int) []byte {
+	p.mu.Lock()
+	best := -1
+	for i := 0; i < p.count; i++ {
+		if cap(p.buffers[i]) >= size && (best < 0 || cap(p.buffers[i]) < cap(p.buffers[best])) {
+			best = i
+		}
+	}
+	if best < 0 && p.count > 0 {
+		best = p.count - 1
+	}
+	if best >= 0 {
+		data := p.buffers[best]
+		p.count--
+		p.buffers[best] = p.buffers[p.count]
+		p.buffers[p.count] = nil
+		p.mu.Unlock()
+		if cap(data) >= size {
+			return data[:size]
+		}
+		return make([]byte, size)
+	}
+	p.mu.Unlock()
+	return make([]byte, size)
+}
+
+func (p *frameBufferPool) put(data []byte) {
+	if cap(data) == 0 || cap(data) > maxFramePayloadSize {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.count < len(p.buffers) {
+		p.buffers[p.count] = data[:0]
+		p.count++
+	}
+}
+
+// Pion copies RTP payloads, but retains SPS/PPS slices across Payload calls.
+// Give it owned parameter sets so returning a frame buffer cannot corrupt them.
+type framePayloader struct {
+	h264 codecs.H264Payloader
+}
+
+func (p *framePayloader) Payload(mtu uint16, data []byte) [][]byte {
+	var payloads [][]byte
+	emit := func(nalu []byte) {
+		if len(nalu) == 0 {
+			return
+		}
+		if kind := nalu[0] & 0x1f; kind == 7 || kind == 8 {
+			nalu = bytes.Clone(nalu)
+		}
+		packets := p.h264.Payload(mtu, nalu)
+		if payloads == nil {
+			payloads = packets
+		} else {
+			payloads = append(payloads, packets...)
+		}
+	}
+	// Match Pion's Annex B splitting, including mixed 3/4-byte start codes
+	// and raw NAL units with no start code.
+	startCode := []byte{0, 0, 1}
+	start := bytes.Index(data, startCode)
+	if start < 0 {
+		emit(data)
+		return payloads
+	}
+	offset := 3
+	for start < len(data) {
+		end := bytes.Index(data[start+offset:], startCode)
+		if end < 0 {
+			emit(data[start+offset:])
+			break
+		}
+		next := start + offset + end
+		nextOffset := 3
+		if data[next-1] == 0 {
+			next--
+			nextOffset = 4
+		}
+		emit(data[start+offset : next])
+		start, offset = next, nextOffset
+	}
+	return payloads
+}
 
 // Why a keyframe was asked for. Every request path is tagged so the logs show
 // whether keyframes are driven by the viewer's decoder (real loss on the path)
@@ -293,8 +394,11 @@ func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool, bool) {
 			dropped = true
 			newerIsIDR := isIDRFrame(newer.data)
 			if newerIsIDR || !currentIsIDR {
+				current.release()
 				current = newer
 				currentIsIDR = newerIsIDR
+			} else {
+				newer.release()
 			}
 		default:
 			return current, currentIsIDR, dropped
@@ -358,7 +462,58 @@ func (u *machineUpstream) stop() {
 			u.cancel()
 		}
 		u.mu.Unlock()
+		u.frameQueueMu.Lock()
+		defer u.frameQueueMu.Unlock()
+		for {
+			select {
+			case frame := <-u.frameChan:
+				frame.release()
+			default:
+				return
+			}
+		}
 	})
+}
+
+// queueFrame consumes frame even when stopping. Serializing the two producers
+// (reader and pacing requeue) keeps eviction + enqueue atomic and nonblocking.
+func (u *machineUpstream) queueFrame(frame frameMsg) (dropped bool) {
+	u.frameQueueMu.Lock()
+	defer u.frameQueueMu.Unlock()
+	select {
+	case <-u.stopChan:
+		frame.release()
+		return false
+	default:
+	}
+	select {
+	case u.frameChan <- frame:
+		return false
+	default:
+	}
+	select {
+	case old := <-u.frameChan:
+		old.release()
+		dropped = true
+	default:
+	}
+	u.frameChan <- frame
+	return dropped
+}
+
+func (u *machineUpstream) readPayload(reader io.Reader, messageType byte, size int) (frameMsg, error) {
+	var frame frameMsg
+	if messageType == 0x01 {
+		frame.buffers = &u.frameBuffers
+		frame.data = u.frameBuffers.get(size)
+	} else {
+		frame.data = make([]byte, size)
+	}
+	if _, err := io.ReadFull(reader, frame.data); err != nil {
+		frame.release()
+		return frameMsg{}, err
+	}
+	return frame, nil
 }
 
 func (u *machineUpstream) send(cmd []byte) bool {
@@ -571,13 +726,14 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 		messageType := hdr[0]
 		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
 		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
-		if payloadLen == 0 || payloadLen > 10*1024*1024 {
+		if payloadLen == 0 || payloadLen > maxFramePayloadSize {
 			return fmt.Errorf("invalid frame length: %d", payloadLen)
 		}
-		data := make([]byte, payloadLen)
-		if _, err := io.ReadFull(conn, data); err != nil {
+		frame, err := u.readPayload(conn, messageType, int(payloadLen))
+		if err != nil {
 			return fmt.Errorf("read frame data: %w", err)
 		}
+		data := frame.data
 		switch messageType {
 		case 0x01:
 			frameCount++
@@ -585,16 +741,9 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
-			frame := frameMsg{tsMicros: tsMicros, data: data, receivedAt: time.Now()}
-			select {
-			case u.frameChan <- frame:
-			default:
-				select {
-				case <-u.frameChan:
-				default:
-				}
+			frame.tsMicros, frame.receivedAt = tsMicros, time.Now()
+			if u.queueFrame(frame) {
 				u.requestIDR(idrReasonUpstreamDrop)
-				u.frameChan <- frame
 			}
 		case 0x02:
 			if !json.Valid(data) {
@@ -678,13 +827,14 @@ func (u *machineUpstream) connectQUIC() error {
 		messageType := hdr[0]
 		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
 		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
-		if payloadLen == 0 || payloadLen > 10*1024*1024 {
+		if payloadLen == 0 || payloadLen > maxFramePayloadSize {
 			continue
 		}
-		data := make([]byte, payloadLen)
-		if _, err := io.ReadFull(stream, data); err != nil {
+		frame, err := u.readPayload(stream, messageType, int(payloadLen))
+		if err != nil {
 			continue
 		}
+		data := frame.data
 		switch messageType {
 		case 0x01:
 			frameCount++
@@ -692,16 +842,9 @@ func (u *machineUpstream) connectQUIC() error {
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, payloadLen)
 			}
-			frame := frameMsg{tsMicros: tsMicros, data: data, receivedAt: time.Now()}
-			select {
-			case u.frameChan <- frame:
-			default:
-				select {
-				case <-u.frameChan:
-				default:
-				}
+			frame.tsMicros, frame.receivedAt = tsMicros, time.Now()
+			if u.queueFrame(frame) {
 				u.requestIDR(idrReasonUpstreamDrop)
-				u.frameChan <- frame
 			}
 		case 0x02:
 			if json.Valid(data) {
@@ -746,6 +889,7 @@ func (u *machineUpstream) framePusher() {
 			msg, idr, dropped = latestFrame(u.frameChan, msg)
 			sess := u.currentSession()
 			if sess == nil || sess.VideoTrack == nil {
+				msg.release()
 				continue
 			}
 			if dropped {
@@ -759,6 +903,7 @@ func (u *machineUpstream) framePusher() {
 			// P-frames can't be decoded without their preceding frames.
 			if sess.needsIDR {
 				if u.skipFrameUntilIDR(sess, idr) {
+					msg.release()
 					continue
 				}
 				if sess.hasStarted {
@@ -784,7 +929,9 @@ func (u *machineUpstream) framePusher() {
 			}
 			curTicks, remainder := consumeRTPDuration(frameDuration, sess.rtpRemainder)
 			sess.rtpRemainder = remainder
+			frameBytes := len(msg.data)
 			packets := sess.Packetizer.Packetize(msg.data, curTicks)
+			msg.release()
 			packetSizes := make([]int, len(packets))
 			for i, packet := range packets {
 				packetSizes[i] = packet.MarshalSize()
@@ -797,7 +944,7 @@ func (u *machineUpstream) framePusher() {
 			if !msg.receivedAt.IsZero() {
 				relayWait = pacingStart.Sub(msg.receivedAt)
 			}
-			stats.observe(queueLen, relayWait, pacingElapsed, idr, len(msg.data))
+			stats.observe(queueLen, relayWait, pacingElapsed, idr, frameBytes)
 			if idr {
 				log.Printf("[webrtc:%s] IDR paced: %d packets, waited %.1fms in relay, sent over %.1fms",
 					u.id, len(packets), relayWait.Seconds()*1000, pacingElapsed.Seconds()*1000)
@@ -812,18 +959,7 @@ func (u *machineUpstream) framePusher() {
 						log.Printf("[webrtc:%s] abandoned %d paced RTP packets for newer frame; requesting IDR", u.id, remaining)
 					}
 				}
-				msg = *next
-				droppedQueued := false
-				select {
-				case u.frameChan <- msg:
-				default:
-					select {
-					case <-u.frameChan:
-						droppedQueued = true
-					default:
-					}
-					u.frameChan <- msg
-				}
+				droppedQueued := u.queueFrame(*next)
 				if droppedQueued {
 					sess.needsIDR = true
 					if u.requestIDR(idrReasonRequeueDrop) {

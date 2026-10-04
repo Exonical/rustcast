@@ -1,11 +1,414 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v4"
 )
+
+func pooledFrame(pool *frameBufferPool, frame frameMsg) frameMsg {
+	data := pool.get(len(frame.data))
+	copy(data, frame.data)
+	frame.data, frame.buffers = data, pool
+	return frame
+}
+
+func cachedFrameBuffers(pool *frameBufferPool) int {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	return pool.count
+}
+
+func TestFrameBufferPoolReuseAndBound(t *testing.T) {
+	var pool frameBufferPool
+	frame := pooledFrame(&pool, pFrame(1))
+	original := &frame.data[0]
+	frame.release()
+	frame.release()
+	if pool.count != 1 {
+		t.Fatalf("release cached %d buffers, want exactly 1", pool.count)
+	}
+	smaller := pool.get(3)
+	if len(smaller) != 3 || &smaller[0] != original {
+		t.Fatal("smaller frame did not reuse the same backing array")
+	}
+	other := pool.get(3)
+	if &other[0] == original {
+		t.Fatal("in-flight frames shared a buffer")
+	}
+	pool.put(smaller)
+	pool.put(other)
+	large := pool.get(1024)
+	pool.put(large)
+	if got := pool.get(1024); &got[0] != &large[0] {
+		t.Fatal("larger buffer was not reused after growing")
+	}
+	for i := 0; i < maxCachedFrameBuffers+2; i++ {
+		pool.put(make([]byte, 5))
+	}
+	if pool.count != maxCachedFrameBuffers {
+		t.Fatalf("cache size = %d, want %d", pool.count, maxCachedFrameBuffers)
+	}
+}
+
+func TestLatestFrameReleasesOnlyDiscardedPayloads(t *testing.T) {
+	tests := []struct {
+		name    string
+		current frameMsg
+		queued  []frameMsg
+		wantTs  uint64
+	}{
+		{"replace P-frame", pFrame(1), []frameMsg{pFrame(2)}, 2},
+		{"preserve IDR", idrFrame(1), []frameMsg{pFrame(2), pFrame(3)}, 1},
+		{"replace IDR", idrFrame(1), []frameMsg{pFrame(2), idrFrame(3), pFrame(4)}, 3},
+		{"no backlog", pFrame(1), nil, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var pool frameBufferPool
+			current := pooledFrame(&pool, test.current)
+			ch := make(chan frameMsg, len(test.queued))
+			for _, frame := range test.queued {
+				ch <- pooledFrame(&pool, frame)
+			}
+			latest, _ := latestFrame(ch, current)
+			if latest.tsMicros != test.wantTs || len(latest.data) == 0 {
+				t.Fatalf("selected frame = %+v, want ts=%d", latest, test.wantTs)
+			}
+			if pool.count != len(test.queued) {
+				t.Fatalf("returned %d buffers, want %d discarded buffers", pool.count, len(test.queued))
+			}
+			for i := 0; i < pool.count; i++ {
+				if &pool.buffers[i][:1][0] == &latest.data[0] {
+					t.Fatal("selected buffer was returned before consumption")
+				}
+				for j := 0; j < i; j++ {
+					if &pool.buffers[i][:1][0] == &pool.buffers[j][:1][0] {
+						t.Fatal("discarded buffer returned twice")
+					}
+				}
+			}
+			latest.release()
+			if pool.count != len(test.queued)+1 {
+				t.Fatal("selected buffer was not returned after consumption")
+			}
+		})
+	}
+}
+
+func TestReadPayloadReturnsTruncatedVideoBuffer(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	frame, err := u.readPayload(bytes.NewReader([]byte{1, 2}), 0x01, 5)
+	if !errors.Is(err, io.ErrUnexpectedEOF) || frame.data != nil || u.frameBuffers.count != 1 {
+		t.Fatalf("readPayload = (%+v, %v), cached=%d", frame, err, u.frameBuffers.count)
+	}
+	for _, messageType := range []byte{0x02, 0x03, 0xff} {
+		frame, err := u.readPayload(bytes.NewReader([]byte("{}")), messageType, 2)
+		if err != nil || frame.buffers != nil || string(frame.data) != "{}" {
+			t.Fatalf("metadata payload pooled or changed: (%+v, %v)", frame, err)
+		}
+		frame.release()
+	}
+	if u.frameBuffers.count != 1 {
+		t.Fatal("non-video metadata entered the video buffer pool")
+	}
+}
+
+func TestReadFramesPoolsVideoButRetainsCursor(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	go func() {
+		defer writer.Close()
+		for _, message := range []struct {
+			kind byte
+			data []byte
+		}{{0x02, []byte(`{"visible":true}`)}, {0x01, pFrame(1).data}} {
+			var header [13]byte
+			header[0] = message.kind
+			binary.BigEndian.PutUint64(header[1:9], 42)
+			binary.BigEndian.PutUint32(header[9:13], uint32(len(message.data)))
+			if _, err := writer.Write(append(header[:], message.data...)); err != nil {
+				return
+			}
+		}
+	}()
+	if err := u.readFrames(reader); !errors.Is(err, io.EOF) {
+		t.Fatalf("readFrames = %v, want EOF", err)
+	}
+	frame := <-u.frameChan
+	if frame.buffers != &u.frameBuffers || frame.tsMicros != 42 || !bytes.Equal(frame.data, pFrame(1).data) {
+		t.Fatalf("video payload or ownership changed: %+v", frame)
+	}
+	frame.release()
+	reused := u.frameBuffers.get(5)
+	clear(reused)
+	u.frameBuffers.put(reused)
+	if string(u.lastCursor.data) != `{"visible":true}` {
+		t.Fatal("retained cursor data was overwritten by buffer reuse")
+	}
+}
+
+func TestQueueFrameReleasesEvictedAndStoppedFrames(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	u.frameChan = make(chan frameMsg, 1)
+	first := pooledFrame(&u.frameBuffers, pFrame(1))
+	second := pooledFrame(&u.frameBuffers, pFrame(2))
+	third := pooledFrame(&u.frameBuffers, pFrame(3))
+	if u.queueFrame(first) || !u.queueFrame(second) {
+		t.Fatal("queue did not report eviction")
+	}
+	if u.frameBuffers.count != 1 {
+		t.Fatal("evicted buffer was not returned exactly once")
+	}
+	u.stop()
+	u.queueFrame(third)
+	if len(u.frameChan) != 0 || u.frameBuffers.count != 3 {
+		t.Fatalf("shutdown retained frames: queue=%d cached=%d", len(u.frameChan), u.frameBuffers.count)
+	}
+}
+
+func TestConcurrentQueueAndStop(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	u.frameChan = make(chan frameMsg, 1)
+	var producers sync.WaitGroup
+	started := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(0)))
+			started <- struct{}{}
+			for j := 0; j < 1000; j++ {
+				u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(uint64(j))))
+			}
+		}()
+	}
+	<-started
+	<-started
+	u.stop()
+	done := make(chan struct{})
+	go func() { producers.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent reader/requeue producers blocked after shutdown")
+	}
+	if len(u.frameChan) != 0 {
+		t.Fatal("producer queued a frame after shutdown drain")
+	}
+}
+
+func TestPacingRequeueTransfersBufferOwnership(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	u.frameChan = make(chan frameMsg, 1)
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{VideoTrack: track}
+	u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(1)))
+	next, sent := u.writePacedPackets(session, []*rtp.Packet{{}}, []time.Duration{time.Hour}, false)
+	if next == nil || sent != 0 || u.frameBuffers.count != 0 {
+		t.Fatalf("pacing released the selected frame: next=%+v sent=%d cached=%d", next, sent, u.frameBuffers.count)
+	}
+	u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(2)))
+	if !u.queueFrame(*next) || u.frameBuffers.count != 1 {
+		t.Fatal("requeue did not return the evicted buffer exactly once")
+	}
+	selected := <-u.frameChan
+	if selected.tsMicros != 1 || u.frameBuffers.count != 1 {
+		t.Fatal("requeued frame was released before consumption")
+	}
+	selected.release()
+	if u.frameBuffers.count != 2 {
+		t.Fatal("consumed requeued frame was not returned")
+	}
+}
+
+func TestFramePusherReleasesConsumedAndSkippedFrames(t *testing.T) {
+	for _, scenario := range []string{"no session", "no video track", "awaiting IDR", "packetized"} {
+		t.Run(scenario, func(t *testing.T) {
+			u := newMachineUpstream("", "", func(string) {})
+			if scenario != "no session" {
+				session := &Session{needsIDR: scenario == "awaiting IDR"}
+				if scenario != "no video track" {
+					track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
+					if err != nil {
+						t.Fatal(err)
+					}
+					session.VideoTrack = track
+					session.Packetizer = rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000)
+				}
+				u.bindSession(session)
+			}
+			u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(1)))
+			done := make(chan struct{})
+			go func() { u.framePusher(); close(done) }()
+			defer func() { u.stop(); <-done }()
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			for cachedFrameBuffers(&u.frameBuffers) != 1 {
+				select {
+				case <-deadline.C:
+					t.Fatal("pusher did not release frame")
+				case <-ticker.C:
+				}
+			}
+		})
+	}
+}
+
+func TestFramePayloaderMatchesPion(t *testing.T) {
+	for _, mtu := range []uint16{0, 2, 16, 1200} {
+		var safe framePayloader
+		var original codecs.H264Payloader
+		for _, data := range [][]byte{
+			nil, {0x41, 1, 2}, {0, 0, 1},
+			{0, 0, 0, 1, 0x67, 3, 0, 0, 1, 0x68, 4, 0, 0, 0, 1, 0x65, 5},
+			{0, 0, 1, 0x67, 8}, {0x68, 9}, {0, 0, 1, 0x09},
+			append([]byte{0, 0, 1, 0x65}, bytes.Repeat([]byte{3}, 4096)...),
+			{0, 0, 1, 0, 0, 0, 1, 0x41, 4},
+		} {
+			got, want := safe.Payload(mtu, data), original.Payload(mtu, data)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("mtu=%d data=%x: got %x, want %x", mtu, data, got, want)
+			}
+		}
+	}
+}
+
+func TestPacketizerDoesNotRetainPooledPayload(t *testing.T) {
+	var pool frameBufferPool
+	packetizer := rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000)
+	var reference codecs.H264Payloader
+	// Parameter sets may arrive separately and survive multiple Packetize calls.
+	for _, data := range [][]byte{{0, 0, 1, 0x67, 1}, {0, 0, 1, 0x68, 2}, {0, 0, 1, 0x65, 3}} {
+		frame := pooledFrame(&pool, frameMsg{data: data})
+		packets := packetizer.Packetize(frame.data, 1440)
+		want := reference.Payload(1188, data)
+		frame.release()
+		reused := pool.get(len(data))
+		clear(reused)
+		pool.put(reused)
+		if len(packets) != len(want) {
+			t.Fatalf("packets=%d, want %d", len(packets), len(want))
+		}
+		for i, packet := range packets {
+			if !bytes.Equal(packet.Payload, want[i]) {
+				t.Fatalf("packet payload corrupted after reuse: got %x, want %x", packet.Payload, want[i])
+			}
+		}
+	}
+}
+
+func FuzzFramePayloaderMatchesPion(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 1, 0x67, 3, 0, 0, 1, 0x68, 4, 0, 0, 0, 1, 0x65, 5}, uint16(1200))
+	f.Add([]byte{0x41, 1, 2}, uint16(16))
+	f.Fuzz(func(t *testing.T, data []byte, mtu uint16) {
+		var safe framePayloader
+		var original codecs.H264Payloader
+		for _, part := range [][]byte{data[:len(data)/2], data[len(data)/2:]} {
+			got, want := safe.Payload(mtu, part), original.Payload(mtu, part)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("mtu=%d data=%x: got %x, want %x", mtu, part, got, want)
+			}
+		}
+	})
+}
+
+var benchmarkFrameData []byte
+
+func BenchmarkFramePayloadBuffer(b *testing.B) {
+	for _, size := range []int{256 * 1024, 1024 * 1024, maxFramePayloadSize} {
+		b.Run(stringSize(size), func(b *testing.B) {
+			b.Run("allocate", func(b *testing.B) {
+				b.ReportAllocs()
+				for i := 0; i < b.N; i++ {
+					benchmarkFrameData = make([]byte, size)
+				}
+			})
+			b.Run("reuse", func(b *testing.B) {
+				var pool frameBufferPool
+				pool.put(pool.get(size))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					benchmarkFrameData = pool.get(size)
+					pool.put(benchmarkFrameData)
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkFrameReadAndPacketize(b *testing.B) {
+	data := bytes.Repeat([]byte{3}, 1024*1024)
+	copy(data, []byte{0, 0, 0, 1, 0x65})
+	for _, reuse := range []bool{false, true} {
+		name := "allocate"
+		var payloader rtp.Payloader = &codecs.H264Payloader{}
+		if reuse {
+			name = "reuse"
+			payloader = &framePayloader{}
+		}
+		b.Run(name, func(b *testing.B) {
+			u := newMachineUpstream("", "", func(string) {})
+			packetizer := rtp.NewPacketizer(1200, 96, 1, payloader, rtp.NewFixedSequencer(0), 90000)
+			reader := bytes.NewReader(data)
+			if reuse {
+				u.frameBuffers.put(u.frameBuffers.get(len(data)))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				reader.Reset(data)
+				var frame frameMsg
+				if reuse {
+					var err error
+					frame, err = u.readPayload(reader, 0x01, len(data))
+					if err != nil {
+						b.Fatal(err)
+					}
+				} else {
+					frame.data = make([]byte, len(data))
+					if _, err := io.ReadFull(reader, frame.data); err != nil {
+						b.Fatal(err)
+					}
+				}
+				packets := packetizer.Packetize(frame.data, 1440)
+				if len(packets) == 0 {
+					b.Fatal("no packets")
+				}
+				benchmarkFrameData = packets[0].Payload
+				frame.release()
+			}
+		})
+	}
+}
+
+func stringSize(size int) string {
+	switch size {
+	case 256 * 1024:
+		return "256KiB"
+	case 1024 * 1024:
+		return "1MiB"
+	default:
+		return "10MiB"
+	}
+}
 
 func TestCaptureFrameDuration(t *testing.T) {
 	tests := []struct {
