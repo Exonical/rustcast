@@ -6,6 +6,14 @@
 //!   (optional) Server → PinRequired → Client → PinSubmit → Server → PairResult
 //!   Client → SessionRequest → Server
 //!   Server → SessionAccepted / SessionRejected → Client
+//!
+//! **Unverified scaffolding — not wired into any live path.** Only the Hello
+//! version check is implemented. PIN verification (`PinAuthenticator`),
+//! paired-certificate lookup, codec intersection, capability/resource
+//! validation and session key generation (`flux-crypto`) are missing, so the
+//! security-relevant steps fail closed: [`SessionNegotiation::process`]
+//! returns [`FluxError::Negotiation`] for `PinSubmit` and `SessionRequest`
+//! instead of reporting a successful pairing or minting a session.
 
 use flux_core::error::{FluxError, Result};
 use flux_core::types::Resolution;
@@ -92,61 +100,18 @@ impl SessionNegotiation {
         Ok(vec![MessagePayload::Welcome(welcome)])
     }
 
-    fn handle_pin_submit(&mut self, pin_msg: &PinSubmitMessage) -> Result<Vec<MessagePayload>> {
-        // TODO: Verify PIN via PinAuthenticator
-        tracing::info!("Client submitted PIN for pairing");
-
-        let result = PairResultMessage {
-            success: true,
-            message: "Paired successfully".into(),
-        };
-
-        self.state = NegotiationState::AwaitingSessionRequest {
-            client_hello: HelloMessage {
-                protocol_version: version::PROTOCOL_VERSION,
-                client_name: pin_msg.client_name.clone(),
-                supported_codecs: vec![],
-                max_resolution: Resolution::new(1920, 1080),
-                max_fps: 60,
-                supports_hdr: false,
-            },
-        };
-
-        Ok(vec![MessagePayload::PairResult(result)])
+    fn handle_pin_submit(&mut self, _pin_msg: &PinSubmitMessage) -> Result<Vec<MessagePayload>> {
+        self.fail_not_implemented("PIN pairing verification")
     }
 
-    fn handle_session_request(
-        &mut self,
-        req: &SessionRequestMessage,
-    ) -> Result<Vec<MessagePayload>> {
-        tracing::info!(
-            "Session requested: {} {}@{}fps {}kbps",
-            req.video_codec,
-            req.resolution,
-            req.fps,
-            req.video_bitrate_kbps,
-        );
+    fn handle_session_request(&mut self, _req: &SessionRequestMessage) -> Result<Vec<MessagePayload>> {
+        self.fail_not_implemented("session acceptance (capability validation and session key generation)")
+    }
 
-        // TODO: Validate against server capabilities and resource limits.
-        // TODO: Allocate encoder, capture session, ports.
-        // TODO: Generate session encryption key.
-
-        let session_id = uuid::Uuid::new_v4();
-        let accepted = SessionAcceptedMessage {
-            session_id,
-            video_codec: req.video_codec,
-            resolution: req.resolution,
-            fps: req.fps,
-            video_bitrate_kbps: req.video_bitrate_kbps,
-            video_rtp_port: 47998,
-            audio_rtp_port: 48000,
-            input_port: 47999,
-            control_key: hex_encode(&flux_crypto_key_stub()),
-        };
-
-        self.state = NegotiationState::Established;
-
-        Ok(vec![MessagePayload::SessionAccepted(accepted)])
+    fn fail_not_implemented(&mut self, step: &str) -> Result<Vec<MessagePayload>> {
+        let reason = format!("{step} is not implemented");
+        self.state = NegotiationState::Failed(reason.clone());
+        Err(FluxError::Negotiation(reason))
     }
 
     /// Whether negotiation has reached the Established state.
@@ -155,19 +120,69 @@ impl SessionNegotiation {
     }
 }
 
-/// Stub: generate a 16-byte key. Real impl uses flux-crypto.
-fn flux_crypto_key_stub() -> [u8; 16] {
-    let mut key = [0u8; 16];
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::Instant::now().hash(&mut hasher);
-    let hash = hasher.finish();
-    key[0..8].copy_from_slice(&hash.to_le_bytes());
-    key[8..16].copy_from_slice(&hash.to_be_bytes());
-    key
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_core::types::{AudioCodec, ChromaSampling, DynamicRange, VideoCodec};
 
-fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    fn hello(protocol_version: u32) -> MessagePayload {
+        MessagePayload::Hello(HelloMessage {
+            protocol_version,
+            client_name: "test-client".into(),
+            supported_codecs: vec![VideoCodec::H264],
+            max_resolution: Resolution::new(1920, 1080),
+            max_fps: 60,
+            supports_hdr: false,
+        })
+    }
+
+    #[test]
+    fn compatible_hello_gets_welcome() {
+        let mut negotiation = SessionNegotiation::new();
+        let replies = negotiation.process(&hello(version::PROTOCOL_VERSION)).unwrap();
+        assert!(matches!(replies.as_slice(), [MessagePayload::Welcome(_)]));
+        assert!(!negotiation.is_established());
+    }
+
+    #[test]
+    fn incompatible_hello_is_rejected() {
+        let mut negotiation = SessionNegotiation::new();
+        let replies = negotiation.process(&hello(0)).unwrap();
+        assert!(matches!(replies.as_slice(), [MessagePayload::SessionRejected(_)]));
+    }
+
+    #[test]
+    fn session_request_fails_closed_instead_of_minting_a_session() {
+        let mut negotiation = SessionNegotiation::new();
+        negotiation.process(&hello(version::PROTOCOL_VERSION)).unwrap();
+        let request = MessagePayload::SessionRequest(SessionRequestMessage {
+            video_codec: VideoCodec::H264,
+            resolution: Resolution::new(1920, 1080),
+            fps: 60,
+            video_bitrate_kbps: 20_000,
+            dynamic_range: DynamicRange::Sdr,
+            chroma_sampling: ChromaSampling::Yuv420,
+            audio_codec: AudioCodec::Opus,
+            audio_bitrate_kbps: 128,
+            enable_input: true,
+        });
+        let err = negotiation.process(&request).unwrap_err();
+        assert!(matches!(err, FluxError::Negotiation(_)), "{err}");
+        assert!(!negotiation.is_established());
+        assert!(negotiation.process(&request).is_err());
+    }
+
+    #[test]
+    fn pin_submit_fails_closed_instead_of_reporting_paired() {
+        let mut negotiation = SessionNegotiation {
+            state: NegotiationState::AwaitingPin,
+        };
+        let pin = MessagePayload::PinSubmit(PinSubmitMessage {
+            pin: "0000".into(),
+            client_name: "test-client".into(),
+        });
+        let err = negotiation.process(&pin).unwrap_err();
+        assert!(matches!(err, FluxError::Negotiation(_)), "{err}");
+        assert!(!negotiation.is_established());
+    }
 }
