@@ -21,7 +21,6 @@ import (
 	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -107,6 +106,17 @@ type frameMsg struct {
 	// receivedAt is when the relay finished reading the frame off the wire, so
 	// the time it then spends queued behind the pusher can be measured.
 	receivedAt time.Time
+	buffers    *frameBufferPool
+}
+
+// release ends ownership of the payload. Sending a frame through frameChan
+// transfers ownership; the sender must not access or release it afterwards.
+func (f *frameMsg) release() {
+	if f.buffers != nil {
+		f.buffers.put(f.data)
+	}
+	f.data = nil
+	f.buffers = nil
 }
 
 type cursorMsg struct {
@@ -308,7 +318,7 @@ func newSession(initialBitrateBps int) (*Session, error) {
 		1200,
 		0,
 		0,
-		&codecs.H264Payloader{},
+		&framePayloader{},
 		rtp.NewRandomSequencer(),
 		90000,
 	)
