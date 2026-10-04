@@ -1085,11 +1085,9 @@ fn build_encode_session_for(
 
 #[cfg(target_os = "windows")]
 fn replug_capture(
-    capture: &dyn flux_capture::traits::ScreenCapture,
+    starter: &CaptureStarter<'_>,
     display: &mut VirtualDisplayHandle,
     mode: ModeRequest,
-    cursor_sink: flux_capture::traits::CursorUpdateSink,
-    target_fps: u32,
 ) -> Result<
     (
         flux_capture::traits::DisplayInfo,
@@ -1097,6 +1095,7 @@ fn replug_capture(
     ),
     String,
 > {
+    let capture = starter.capture;
     let before = capture
         .enumerate_displays()
         .map_err(|error| format!("enumerate displays before replug: {error}"))?;
@@ -1168,8 +1167,8 @@ fn replug_capture(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let session = capture
-        .start_capture(Some(target.id), target.native_resolution, target_fps, Some(cursor_sink))
+    let session = starter
+        .restart_on(&target)
         .map_err(|error| format!("restart capture after resolution transition: {error}"))?;
     tracing::info!(
         "Resolution transition: capture restarted at {}x{}",
@@ -1188,6 +1187,233 @@ fn attach_input_backend(
     input_sink.set_backend(session.input_backend());
     #[cfg(target_os = "windows")]
     let _ = (input_sink, session);
+}
+
+/// Starts capture sessions for `capture_loop`, wiring each new session to the
+/// shared cursor and input sinks.
+struct CaptureStarter<'a> {
+    capture: &'a dyn flux_capture::traits::ScreenCapture,
+    cursor_sink: &'a flux_capture::traits::CursorUpdateSink,
+    input_sink: &'a flux_input::InputSink,
+    target_fps: u32,
+}
+
+impl CaptureStarter<'_> {
+    /// Start capturing `display` at `resolution` and route input through the new session.
+    fn start(
+        &self,
+        display: &flux_capture::traits::DisplayInfo,
+        resolution: flux_core::types::Resolution,
+    ) -> flux_core::Result<Box<dyn flux_capture::traits::CaptureSession>> {
+        let session = self.capture.start_capture(
+            Some(display.id),
+            resolution,
+            self.target_fps,
+            Some(self.cursor_sink.clone()),
+        )?;
+        attach_input_backend(self.input_sink, session.as_ref());
+        Ok(session)
+    }
+
+    /// Start capturing a (possibly re-enumerated) `display` at its native
+    /// resolution and point absolute input at its desktop rectangle.
+    fn restart_on(
+        &self,
+        display: &flux_capture::traits::DisplayInfo,
+    ) -> flux_core::Result<Box<dyn flux_capture::traits::CaptureSession>> {
+        let session = self.start(display, display.native_resolution)?;
+        if let Err(error) = self.input_sink.set_target_rect(display.desktop_rect) {
+            tracing::warn!("Failed to update input target rectangle: {}", error);
+        }
+        Ok(session)
+    }
+}
+
+/// Stop and drop a capture session. DXGI allows only one active
+/// IDXGIOutputDuplication per output per process, so the old session must be
+/// gone before its replacement can start.
+fn release_capture_session(mut session: Box<dyn flux_capture::traits::CaptureSession>) {
+    let _ = session.stop();
+}
+
+/// Record the capture and encode sizes the cursor sink scales positions and bitmaps between.
+fn set_cursor_dimensions(
+    dimensions: &std::sync::RwLock<(u32, u32, u32, u32)>,
+    capture: flux_core::types::Resolution,
+    encode: flux_core::types::Resolution,
+) {
+    if let Ok(mut dimensions) = dimensions.write() {
+        *dimensions = (capture.width, capture.height, encode.width, encode.height);
+    }
+}
+
+/// Apply a requested virtual-display mode. If it does not apply, roll back to
+/// `old_mode`, then keep retrying the rollback with exponential backoff until
+/// capture is restored. The caller must already have released its session.
+#[cfg(target_os = "windows")]
+fn transition_resolution(
+    starter: &CaptureStarter<'_>,
+    display: &mut VirtualDisplayHandle,
+    request: ModeRequest,
+    old_mode: ModeRequest,
+    resolution_status_tx: &tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
+) -> (
+    flux_capture::traits::DisplayInfo,
+    Box<dyn flux_capture::traits::CaptureSession>,
+) {
+    let publish = |state: &'static str, error: Option<String>| {
+        publish_resolution_status(
+            resolution_status_tx,
+            ResolutionStatus {
+                state,
+                width: request.width,
+                height: request.height,
+                previous_width: Some(old_mode.width),
+                previous_height: Some(old_mode.height),
+                error,
+            },
+        );
+    };
+    let error = match replug_capture(starter, display, request) {
+        Ok(restored) => {
+            tracing::info!("Resolution transition succeeded: {}x{}", request.width, request.height);
+            publish("succeeded", None);
+            return restored;
+        }
+        Err(error) => error,
+    };
+    tracing::error!(
+        "Resolution transition failed: {}; starting rollback to {}x{}",
+        error,
+        old_mode.width,
+        old_mode.height
+    );
+    let rollback_error = match replug_capture(starter, display, old_mode) {
+        Ok(restored) => {
+            tracing::warn!(
+                "Resolution transition rollback succeeded; continuing at {}x{}",
+                old_mode.width,
+                old_mode.height
+            );
+            publish(
+                "failed",
+                Some(format!(
+                    "requested mode did not apply; still streaming at {}x{}",
+                    old_mode.width, old_mode.height
+                )),
+            );
+            return restored;
+        }
+        Err(rollback_error) => rollback_error,
+    };
+    tracing::error!("Resolution transition rollback failed: {}", rollback_error);
+    publish(
+        "failed",
+        Some(format!("transition and rollback failed: {rollback_error}")),
+    );
+    let mut retry_delay = std::time::Duration::from_secs(1);
+    loop {
+        std::thread::sleep(retry_delay);
+        match replug_capture(starter, display, old_mode) {
+            Ok(restored) => {
+                tracing::warn!(
+                    "Resolution transition recovery succeeded; continuing at {}x{}",
+                    old_mode.width,
+                    old_mode.height
+                );
+                return restored;
+            }
+            Err(recovery_error) => {
+                tracing::error!(
+                    "Resolution transition recovery retry failed: {}; retrying in {:?}",
+                    recovery_error,
+                    retry_delay
+                );
+                retry_delay = std::cmp::min(retry_delay.saturating_mul(2), std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+/// Wait for the `lost` display (same name and adapter LUID) to reappear and
+/// restart capture on it, retrying every second. Never falls back to a
+/// different display. The caller must already have released its session.
+fn recover_lost_capture(
+    starter: &CaptureStarter<'_>,
+    lost: &flux_capture::traits::DisplayInfo,
+) -> (
+    flux_capture::traits::DisplayInfo,
+    Box<dyn flux_capture::traits::CaptureSession>,
+) {
+    loop {
+        let displays = match starter.capture.enumerate_displays() {
+            Ok(displays) => displays,
+            Err(error) => {
+                tracing::warn!(
+                    "Waiting for target display {} on adapter LUID {:?} after capture loss; display enumeration failed: {}",
+                    lost.name,
+                    lost.adapter_luid,
+                    error
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let refreshed = displays
+            .into_iter()
+            .find(|display| display.name == lost.name && display.adapter_luid == lost.adapter_luid);
+        let Some(refreshed) = refreshed else {
+            tracing::warn!(
+                "Waiting for target display {} on adapter LUID {:?} after capture loss; refusing to capture another display",
+                lost.name,
+                lost.adapter_luid
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        };
+        match starter.restart_on(&refreshed) {
+            Ok(session) => {
+                tracing::info!("Capture session recreated after capture loss");
+                return (refreshed, session);
+            }
+            Err(restart_error) => {
+                tracing::warn!("Capture session recreation failed: {}; retrying", restart_error);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Capture session obtained by [`restart_for_downscale`].
+enum DownscaleRestart {
+    /// Capture delivers frames already scaled to the encode resolution on the GPU.
+    Gpu(Box<dyn flux_capture::traits::CaptureSession>),
+    /// GPU scaling was unavailable; capture resumed at the display's native
+    /// resolution and frames must be downscaled on the CPU.
+    Cpu(Box<dyn flux_capture::traits::CaptureSession>),
+}
+
+/// Restart capture on `display` at `encode_resolution` so the backend scales
+/// on the GPU, falling back to native-resolution capture. The caller must
+/// already have released its session.
+fn restart_for_downscale(
+    starter: &CaptureStarter<'_>,
+    display: &flux_capture::traits::DisplayInfo,
+    encode_resolution: flux_core::types::Resolution,
+) -> flux_core::Result<DownscaleRestart> {
+    match starter.start(display, encode_resolution) {
+        Ok(session) => Ok(DownscaleRestart::Gpu(session)),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to restart capture at {}: {} — falling back to CPU downscale",
+                encode_resolution,
+                error
+            );
+            starter
+                .start(display, display.native_resolution)
+                .map(DownscaleRestart::Cpu)
+        }
+    }
 }
 
 /// Background thread: capture → hardware H.264 encode → broadcast channel.
@@ -1342,19 +1568,19 @@ fn capture_loop(
         tracing::info!("Input dispatch thread stopped");
     });
 
-    let mut session = match capture.start_capture(
-        Some(primary.id),
-        primary.native_resolution,
+    let starter = CaptureStarter {
+        capture: capture.as_ref(),
+        cursor_sink: &cursor_sink,
+        input_sink: &input_sink,
         target_fps,
-        Some(cursor_sink.clone()),
-    ) {
+    };
+    let mut session = match starter.start(&primary, primary.native_resolution) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to start capture session: {}", e);
             return;
         }
     };
-    attach_input_backend(&input_sink, session.as_ref());
 
     // ── Encoder is initialized lazily from the first captured frame ──
     // The capture server fixates the real resolution at negotiation time,
@@ -1388,29 +1614,25 @@ fn capture_loop(
         if let Ok(request) = resolution_rx.try_recv() {
             #[cfg(target_os = "windows")]
             {
-                match validate_mode_request(request) {
-                    Err(error) => tracing::warn!(
+                let current_mode = ModeRequest {
+                    width: primary.native_resolution.width,
+                    height: primary.native_resolution.height,
+                };
+                match (validate_mode_request(request), virtual_display.as_mut()) {
+                    (Err(error), _) => tracing::warn!(
                         "Ignoring invalid resolution request {}x{}: {}",
                         request.width,
                         request.height,
                         error
                     ),
-                    Ok(request) if virtual_display.is_none() => {
+                    (Ok(request), None) => {
                         tracing::warn!(
                             "Ignoring resolution request {}x{} because no virtual display is active",
                             request.width,
                             request.height
                         );
                     }
-                    Ok(request)
-                        if !mode_change_needed(
-                            ModeRequest {
-                                width: primary.native_resolution.width,
-                                height: primary.native_resolution.height,
-                            },
-                            request,
-                        ) =>
-                    {
+                    (Ok(request), Some(_)) if !mode_change_needed(current_mode, request) => {
                         tracing::info!(
                             "Resolution transition: requested mode {}x{} already active; no-op",
                             request.width,
@@ -1428,146 +1650,20 @@ fn capture_loop(
                             },
                         );
                     }
-                    Ok(request) => {
-                        let old_mode = ModeRequest {
-                            width: primary.native_resolution.width,
-                            height: primary.native_resolution.height,
-                        };
+                    (Ok(request), Some(display)) => {
                         tracing::info!(
                             "Resolution transition: requested {}x{}, current {}x{}",
                             request.width,
                             request.height,
-                            old_mode.width,
-                            old_mode.height
+                            current_mode.width,
+                            current_mode.height
                         );
                         encode_session = None;
                         capture_resolution = flux_core::types::Resolution::new(0, 0);
                         encode_resolution = flux_core::types::Resolution::new(0, 0);
-                        let _ = session.stop();
-                        drop(session);
-                        let transition = replug_capture(
-                            capture.as_ref(),
-                            virtual_display.as_mut().expect("checked above"),
-                            request,
-                            cursor_sink.clone(),
-                            target_fps,
-                        );
-                        match transition {
-                            Ok((target, new_session)) => {
-                                primary = target;
-                                session = new_session;
-                                let _ = input_sink.set_target_rect(primary.desktop_rect);
-                                tracing::info!(
-                                    "Resolution transition succeeded: {}x{}",
-                                    request.width,
-                                    request.height
-                                );
-                                publish_resolution_status(
-                                    &resolution_status_tx,
-                                    ResolutionStatus {
-                                        state: "succeeded",
-                                        width: request.width,
-                                        height: request.height,
-                                        previous_width: Some(old_mode.width),
-                                        previous_height: Some(old_mode.height),
-                                        error: None,
-                                    },
-                                );
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    "Resolution transition failed: {}; starting rollback to {}x{}",
-                                    error,
-                                    old_mode.width,
-                                    old_mode.height
-                                );
-                                match replug_capture(
-                                    capture.as_ref(),
-                                    virtual_display.as_mut().expect("checked above"),
-                                    old_mode,
-                                    cursor_sink.clone(),
-                                    target_fps,
-                                ) {
-                                    Ok((target, restored_session)) => {
-                                        primary = target;
-                                        session = restored_session;
-                                        let _ = input_sink.set_target_rect(primary.desktop_rect);
-                                        tracing::warn!(
-                                            "Resolution transition rollback succeeded; continuing at {}x{}",
-                                            old_mode.width,
-                                            old_mode.height
-                                        );
-                                        publish_resolution_status(
-                                            &resolution_status_tx,
-                                            ResolutionStatus {
-                                                state: "failed",
-                                                width: request.width,
-                                                height: request.height,
-                                                previous_width: Some(old_mode.width),
-                                                previous_height: Some(old_mode.height),
-                                                error: Some(format!(
-                                                    "requested mode did not apply; still streaming at {}x{}",
-                                                    old_mode.width, old_mode.height
-                                                )),
-                                            },
-                                        );
-                                    }
-                                    Err(rollback_error) => {
-                                        tracing::error!(
-                                            "Resolution transition rollback failed: {}",
-                                            rollback_error
-                                        );
-                                        publish_resolution_status(
-                                            &resolution_status_tx,
-                                            ResolutionStatus {
-                                                state: "failed",
-                                                width: request.width,
-                                                height: request.height,
-                                                previous_width: Some(old_mode.width),
-                                                previous_height: Some(old_mode.height),
-                                                error: Some(format!(
-                                                    "transition and rollback failed: {rollback_error}"
-                                                )),
-                                            },
-                                        );
-                                        let mut retry_delay = std::time::Duration::from_secs(1);
-                                        loop {
-                                            std::thread::sleep(retry_delay);
-                                            match replug_capture(
-                                                capture.as_ref(),
-                                                virtual_display.as_mut().expect("checked above"),
-                                                old_mode,
-                                                cursor_sink.clone(),
-                                                target_fps,
-                                            ) {
-                                                Ok((target, restored_session)) => {
-                                                    primary = target;
-                                                    session = restored_session;
-                                                    let _ = input_sink.set_target_rect(primary.desktop_rect);
-                                                    tracing::warn!(
-                                                        "Resolution transition recovery succeeded; continuing at {}x{}",
-                                                        old_mode.width,
-                                                        old_mode.height
-                                                    );
-                                                    break;
-                                                }
-                                                Err(recovery_error) => {
-                                                    tracing::error!(
-                                                        "Resolution transition recovery retry failed: {}; retrying in {:?}",
-                                                        recovery_error,
-                                                        retry_delay
-                                                    );
-                                                    retry_delay = std::cmp::min(
-                                                        retry_delay.saturating_mul(2),
-                                                        std::time::Duration::from_secs(30),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        release_capture_session(session);
+                        (primary, session) =
+                            transition_resolution(&starter, display, request, current_mode, &resolution_status_tx);
                     }
                 }
             }
@@ -1648,60 +1744,8 @@ fn capture_loop(
                 encode_session = None;
                 capture_resolution = flux_core::types::Resolution::new(0, 0);
                 encode_resolution = flux_core::types::Resolution::new(0, 0);
-                let _ = session.stop();
-                drop(session);
-                loop {
-                    let displays = match capture.enumerate_displays() {
-                        Ok(displays) => displays,
-                        Err(error) => {
-                            tracing::warn!(
-                                "Waiting for target display {} on adapter LUID {:?} after capture loss; display enumeration failed: {}",
-                                primary.name,
-                                primary.adapter_luid,
-                                error
-                            );
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            continue;
-                        }
-                    };
-                    let refreshed = displays.into_iter().find(|display| {
-                        display.name == primary.name
-                            && display.adapter_luid == primary.adapter_luid
-                    });
-                    let Some(refreshed) = refreshed else {
-                        tracing::warn!(
-                            "Waiting for target display {} on adapter LUID {:?} after capture loss; refusing to capture another display",
-                            primary.name,
-                            primary.adapter_luid
-                        );
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        continue;
-                    };
-                    match capture.start_capture(
-                        Some(refreshed.id),
-                        refreshed.native_resolution,
-                        target_fps,
-                        Some(cursor_sink.clone()),
-                    ) {
-                        Ok(new_session) => {
-                            session = new_session;
-                            attach_input_backend(&input_sink, session.as_ref());
-                            if let Err(error) = input_sink.set_target_rect(refreshed.desktop_rect) {
-                                tracing::warn!("Failed to update input target rectangle: {}", error);
-                            }
-                            primary = refreshed;
-                            tracing::info!("Capture session recreated after capture loss");
-                            break;
-                        }
-                        Err(restart_error) => {
-                            tracing::warn!(
-                                "Capture session recreation failed: {}; retrying",
-                                restart_error
-                            );
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                        }
-                    }
-                }
+                release_capture_session(session);
+                (primary, session) = recover_lost_capture(&starter, &primary);
                 continue;
             }
         };
@@ -1746,12 +1790,7 @@ fn capture_loop(
                     let _ = notify.send(());
                 }
             }
-            if let Ok(mut dimensions) = cursor_dimensions.write() {
-                dimensions.0 = capture_resolution.width;
-                dimensions.1 = capture_resolution.height;
-                dimensions.2 = encode_resolution.width;
-                dimensions.3 = encode_resolution.height;
-            }
+            set_cursor_dimensions(&cursor_dimensions, capture_resolution, encode_resolution);
             tracing::info!(
                 "Capture+encode loop: {}x{} captured → {}x{}@{}fps {:?} H.264",
                 capture_resolution.width, capture_resolution.height,
@@ -1767,59 +1806,26 @@ fn capture_loop(
             // on the GPU (DXGI video-processor blit) and frames arrive
             // already sized for the encoder.
             if encode_session.is_some() && encode_resolution != capture_resolution {
-                // Release the current session first: DXGI allows only one
-                // active IDXGIOutputDuplication per output per process, so
-                // DuplicateOutput fails while the old one is alive.
                 encode_session = None;
                 capture_resolution = flux_core::types::Resolution::new(0, 0);
-                let _ = session.stop();
-                drop(session);
-                match capture.start_capture(
-                    Some(primary.id),
-                    encode_resolution,
-                    target_fps,
-                    Some(cursor_sink.clone()),
-                ) {
-                    Ok(s) => {
-                        session = s;
-                        attach_input_backend(&input_sink, session.as_ref());
-                        if let Ok(mut dimensions) = cursor_dimensions.write() {
-                            dimensions.0 = encode_resolution.width;
-                            dimensions.1 = encode_resolution.height;
-                            dimensions.2 = encode_resolution.width;
-                            dimensions.3 = encode_resolution.height;
-                        }
+                release_capture_session(session);
+                match restart_for_downscale(&starter, &primary, encode_resolution) {
+                    Ok(DownscaleRestart::Gpu(restarted)) => {
+                        session = restarted;
+                        set_cursor_dimensions(&cursor_dimensions, encode_resolution, encode_resolution);
                         // The encoder was released with the old capture
                         // session; rebuild it from the restarted session's
                         // device on the next frame.
-                        capture_resolution = flux_core::types::Resolution::new(0, 0);
                         tracing::info!("Capture restarted with GPU downscale to {}", encode_resolution);
                         continue;
                     }
+                    Ok(DownscaleRestart::Cpu(restored)) => {
+                        session = restored;
+                        set_cursor_dimensions(&cursor_dimensions, primary.native_resolution, encode_resolution);
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to restart capture at {}: {} — falling back to CPU downscale",
-                            encode_resolution, e
-                        );
-                        session = match capture.start_capture(
-                            Some(primary.id),
-                            primary.native_resolution,
-                            target_fps,
-                            Some(cursor_sink.clone()),
-                        ) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Failed to restore capture session: {}", e);
-                                return;
-                            }
-                        };
-                        attach_input_backend(&input_sink, session.as_ref());
-                        if let Ok(mut dimensions) = cursor_dimensions.write() {
-                            dimensions.0 = primary.native_resolution.width;
-                            dimensions.1 = primary.native_resolution.height;
-                            dimensions.2 = encode_resolution.width;
-                            dimensions.3 = encode_resolution.height;
-                        }
+                        tracing::error!("Failed to restore capture session: {}", e);
+                        return;
                     }
                 }
             }
@@ -2063,5 +2069,156 @@ mod mode_request_tests {
     fn default_fps_cap_is_used_for_startup_and_auto() {
         assert_eq!(effective_default_fps_cap(60, 48), 48);
         assert_eq!(effective_default_fps_cap(30, 48), 30);
+    }
+}
+
+#[cfg(test)]
+mod capture_restart_tests {
+    use super::*;
+    use flux_capture::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
+    use flux_core::frame::CapturedFrame;
+    use flux_core::types::{DesktopRect, Resolution};
+    use std::sync::Mutex;
+
+    struct FakeSession;
+
+    impl CaptureSession for FakeSession {
+        fn next_frame(&mut self) -> flux_core::Result<CapturedFrame> {
+            Err(FluxError::Capture("fake".into()))
+        }
+
+        fn try_next_frame(&mut self) -> flux_core::Result<Option<CapturedFrame>> {
+            Ok(None)
+        }
+
+        fn stop(&mut self) -> flux_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCapture {
+        displays: Vec<DisplayInfo>,
+        failing_resolutions: Vec<Resolution>,
+        starts: Mutex<Vec<(Option<u32>, Resolution)>>,
+    }
+
+    impl ScreenCapture for FakeCapture {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn enumerate_displays(&self) -> flux_core::Result<Vec<DisplayInfo>> {
+            Ok(self.displays.clone())
+        }
+
+        fn start_capture(
+            &self,
+            display_id: Option<u32>,
+            resolution: Resolution,
+            _framerate: u32,
+            _cursor_sink: Option<CursorUpdateSink>,
+        ) -> flux_core::Result<Box<dyn CaptureSession>> {
+            self.starts.lock().unwrap().push((display_id, resolution));
+            if self.failing_resolutions.contains(&resolution) {
+                return Err(FluxError::Capture("unsupported resolution".into()));
+            }
+            Ok(Box::new(FakeSession))
+        }
+    }
+
+    fn display(id: u32, name: &str, width: u32, height: u32) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            adapter_luid: Some(7),
+            name: name.into(),
+            native_resolution: Resolution::new(width, height),
+            desktop_rect: DesktopRect {
+                left: 0,
+                top: 0,
+                width,
+                height,
+            },
+            primary: false,
+            capture_supported: true,
+        }
+    }
+
+    fn with_starter(capture: &FakeCapture, f: impl FnOnce(&CaptureStarter<'_>)) {
+        let cursor_sink: CursorUpdateSink = Arc::new(|_| {});
+        let input_sink = flux_input::InputSink::new(DesktopRect {
+            left: 0,
+            top: 0,
+            width: 1,
+            height: 1,
+        })
+        .expect("input sink");
+        f(&CaptureStarter {
+            capture,
+            cursor_sink: &cursor_sink,
+            input_sink: &input_sink,
+            target_fps: 60,
+        });
+    }
+
+    #[test]
+    fn downscale_restart_prefers_gpu_scaled_capture() {
+        let capture = FakeCapture::default();
+        let target = display(3, "out", 5120, 2160);
+        let encode = Resolution::new(4096, 1728);
+        with_starter(&capture, |starter| {
+            let restart = restart_for_downscale(starter, &target, encode).expect("restart");
+            assert!(matches!(restart, DownscaleRestart::Gpu(_)));
+        });
+        assert_eq!(*capture.starts.lock().unwrap(), vec![(Some(3), encode)]);
+    }
+
+    #[test]
+    fn downscale_restart_falls_back_to_native_capture() {
+        let encode = Resolution::new(4096, 1728);
+        let capture = FakeCapture {
+            failing_resolutions: vec![encode],
+            ..Default::default()
+        };
+        let target = display(3, "out", 5120, 2160);
+        with_starter(&capture, |starter| {
+            let restart = restart_for_downscale(starter, &target, encode).expect("restart");
+            assert!(matches!(restart, DownscaleRestart::Cpu(_)));
+        });
+        assert_eq!(
+            *capture.starts.lock().unwrap(),
+            vec![(Some(3), encode), (Some(3), target.native_resolution)]
+        );
+    }
+
+    #[test]
+    fn downscale_restart_reports_failed_native_restore() {
+        let encode = Resolution::new(4096, 1728);
+        let target = display(3, "out", 5120, 2160);
+        let capture = FakeCapture {
+            failing_resolutions: vec![encode, target.native_resolution],
+            ..Default::default()
+        };
+        with_starter(&capture, |starter| {
+            assert!(restart_for_downscale(starter, &target, encode).is_err());
+        });
+    }
+
+    #[test]
+    fn lost_capture_recovers_on_the_same_display_only() {
+        let lost = display(1, "virtual", 1920, 1080);
+        let capture = FakeCapture {
+            displays: vec![display(5, "other", 2560, 1440), display(9, "virtual", 1280, 720)],
+            ..Default::default()
+        };
+        with_starter(&capture, |starter| {
+            let (refreshed, _session) = recover_lost_capture(starter, &lost);
+            assert_eq!(refreshed.id, 9);
+            assert_eq!(refreshed.native_resolution, Resolution::new(1280, 720));
+        });
+        assert_eq!(
+            *capture.starts.lock().unwrap(),
+            vec![(Some(9), Resolution::new(1280, 720))]
+        );
     }
 }
