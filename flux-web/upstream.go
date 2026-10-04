@@ -281,7 +281,10 @@ func commitSequenceNumber(next *uint16, writeSucceeded bool) {
 	}
 }
 
-func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool) {
+// latestFrame drains ch, preferring the newest IDR frame over newer P-frames.
+// It returns the chosen frame, whether it is an IDR frame, and whether any
+// queued frames were discarded.
+func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool, bool) {
 	dropped := false
 	currentIsIDR := isIDRFrame(current.data)
 	for {
@@ -294,7 +297,7 @@ func latestFrame(ch <-chan frameMsg, current frameMsg) (frameMsg, bool) {
 				currentIsIDR = newerIsIDR
 			}
 		default:
-			return current, dropped
+			return current, currentIsIDR, dropped
 		}
 	}
 }
@@ -739,9 +742,8 @@ func (u *machineUpstream) framePusher() {
 			stats = stageStats{}
 		case msg := <-u.frameChan:
 			queueLen := len(u.frameChan)
-			var dropped bool
-			msg, dropped = latestFrame(u.frameChan, msg)
-			idr := isIDRFrame(msg.data)
+			var idr, dropped bool
+			msg, idr, dropped = latestFrame(u.frameChan, msg)
 			sess := u.currentSession()
 			if sess == nil || sess.VideoTrack == nil {
 				continue
@@ -873,7 +875,7 @@ func (u *machineUpstream) writePacedPackets(
 						default:
 						}
 					}
-					latest, _ := latestFrame(u.frameChan, next)
+					latest, _, _ := latestFrame(u.frameChan, next)
 					return &latest, i
 				case <-timer.C:
 				}
