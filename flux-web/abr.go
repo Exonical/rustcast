@@ -83,6 +83,22 @@ func (a *abrState) targetBitrateKbps() uint32 {
 	return a.targetKbps
 }
 
+func (a *abrState) gccInitialBitrateBps() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ceilingKbps == 0 {
+		return abrGCCInitialBitrateBps
+	}
+	bps := int(a.ceilingKbps) * 1000
+	if bps < abrMinKbps*1000 {
+		bps = abrMinKbps * 1000
+	}
+	if bps > abrGCCMaxBitrateBps {
+		bps = abrGCCMaxBitrateBps
+	}
+	return bps
+}
+
 // onRTTSample records a round-trip-time measurement derived from RTCP receiver
 // reports. GCC owns bitrate changes; these samples remain for diagnostics.
 func (a *abrState) onRTTSample(rtt time.Duration) {

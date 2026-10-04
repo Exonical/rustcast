@@ -99,8 +99,16 @@ func TestPacingScheduleIDRUsesEmissionTargetAfterLongGap(t *testing.T) {
 	if got, want := schedule[1], 40*time.Millisecond; got != want {
 		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
 	}
-	if got, want := schedule[1]+30_000*8*time.Second/time.Duration(pacingIDRMaxRate), 64*time.Millisecond; got != want {
+	if got, want := schedule[1]+30_000*8*time.Second/time.Duration(pacingIDRMinCeiling), 64*time.Millisecond; got != want {
 		t.Fatalf("IDR emission time = %s, want %s", got, want)
+	}
+}
+
+func TestPacingScheduleIDRCeilingScalesWithTarget(t *testing.T) {
+	schedule := pacingScheduleForFrame([]int{200_000, 200_000}, 12_000, 16*time.Millisecond, true)
+	bitsPerSecond := float64(48_000_000)
+	if got, want := schedule[1], time.Duration(float64(200_000*8)/bitsPerSecond*float64(time.Second)); got != want {
+		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
 	}
 }
 

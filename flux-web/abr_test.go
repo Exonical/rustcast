@@ -8,6 +8,27 @@ import (
 	"github.com/pion/rtcp"
 )
 
+func TestABRGCCInitialBitrateBps(t *testing.T) {
+	tests := []struct {
+		name        string
+		ceilingKbps uint32
+		want        int
+	}{
+		{name: "default", ceilingKbps: 0, want: 5_000_000},
+		{name: "sender target", ceilingKbps: 12_000, want: 12_000_000},
+		{name: "maximum", ceilingKbps: 100_000, want: 50_000_000},
+		{name: "minimum", ceilingKbps: 1_000, want: 1_500_000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &abrState{ceilingKbps: tt.ceilingKbps}
+			if got := state.gccInitialBitrateBps(); got != tt.want {
+				t.Fatalf("initial bitrate = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestABRGCCEstimateClampsToFloorAndCeiling(t *testing.T) {
 	commands := make(chan []byte, 4)
 	state := &abrState{commandChan: commands, ceilingKbps: 10_000, lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval)}
