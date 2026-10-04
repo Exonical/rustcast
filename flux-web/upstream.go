@@ -50,7 +50,7 @@ const (
 	pacingMultiplier        = 2                     // smooth bursts at 2x target bitrate
 	maxPacingMultiplier     = 4                     // cap frame-size floor at 4x target
 	pacingIDRTargetEmission = 40 * time.Millisecond // emit a keyframe within ~2 frame intervals
-	pacingIDRMaxRate        = 10_000_000            // bits/s ceiling so that bound can't become a burst
+	pacingIDRMinCeiling     = 10_000_000            // bits/s IDR pacing ceiling when the target is low or unknown
 	idrRequestInterval      = 2 * time.Second
 	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
 )
@@ -255,8 +255,12 @@ func pacingScheduleForFrame(
 		if idrBitsPerSecond > bitsPerSecond {
 			bitsPerSecond = idrBitsPerSecond
 		}
-		if bitsPerSecond > pacingIDRMaxRate {
-			bitsPerSecond = pacingIDRMaxRate
+		idrCeiling := float64(pacingIDRMinCeiling)
+		if scaled := float64(targetKbps) * 1000 * maxPacingMultiplier; scaled > idrCeiling {
+			idrCeiling = scaled
+		}
+		if bitsPerSecond > idrCeiling {
+			bitsPerSecond = idrCeiling
 		}
 	}
 	var elapsedSeconds float64
