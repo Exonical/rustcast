@@ -18,6 +18,9 @@ use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture
 /// treats it as "no specific monitor" (i.e. primary).
 const STUB_DISPLAY_ID: u32 = 0;
 
+/// Name of the display reported when capture owns a Mutter virtual monitor.
+pub const VIRTUAL_MONITOR_NAME: &str = "Rustcast virtual monitor";
+
 /// PipeWire screen-cast capture backend.
 pub struct PipeWireCapture {
     // Will hold PipeWire main-loop, core proxy, etc.
@@ -48,6 +51,24 @@ impl ScreenCapture for PipeWireCapture {
     fn enumerate_displays(&self) -> Result<Vec<DisplayInfo>> {
         #[cfg(feature = "capture-mutter")]
         if real::use_mutter() {
+            if crate::mutter::MutterSource::from_env() == crate::mutter::MutterSource::Virtual {
+                // No monitor exists until the virtual stream is created; the
+                // caller supplies the mode it wants captured.
+                return Ok(vec![DisplayInfo {
+                    id: STUB_DISPLAY_ID,
+                    adapter_luid: None,
+                    name: VIRTUAL_MONITOR_NAME.into(),
+                    native_resolution: Resolution::new(1920, 1080),
+                    desktop_rect: flux_core::types::DesktopRect {
+                        left: 0,
+                        top: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                    primary: true,
+                    capture_supported: true,
+                }]);
+            }
             match crate::mutter::query_primary_monitor() {
                 Ok(monitor) => {
                     return Ok(vec![DisplayInfo {
@@ -87,8 +108,10 @@ impl ScreenCapture for PipeWireCapture {
         display_id: Option<u32>,
         resolution: Resolution,
         framerate: u32,
-        _cursor_sink: Option<CursorUpdateSink>,
+        cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>> {
+        #[cfg(not(feature = "capture-mutter"))]
+        let _ = &cursor_sink;
         tracing::info!(
             "Starting PipeWire capture on display {:?} at {}@{}fps",
             display_id,
@@ -106,7 +129,7 @@ impl ScreenCapture for PipeWireCapture {
             let requested = display_id.filter(|&id| id != STUB_DISPLAY_ID);
             #[cfg(feature = "capture-mutter")]
             if real::use_mutter() {
-                return real::start_mutter_capture(resolution, framerate);
+                return real::start_mutter_capture(resolution, framerate, cursor_sink);
             }
             real::start_portal_capture(requested, resolution, framerate)
         }
@@ -210,19 +233,30 @@ mod real {
         }
     }
 
-    /// Capture the primary monitor through a direct Mutter ScreenCast +
-    /// RemoteDesktop session, reading the stream from the local PipeWire daemon.
+    /// Capture through a direct Mutter ScreenCast + RemoteDesktop session
+    /// (a virtual monitor sized `resolution`, or the primary monitor when
+    /// `FLUX_MUTTER_SOURCE=monitor`), reading the stream from the local
+    /// PipeWire daemon. The pointer is delivered as cursor metadata to
+    /// `cursor_sink`.
     #[cfg(feature = "capture-mutter")]
-    pub(super) fn start_mutter_capture(resolution: Resolution, framerate: u32) -> Result<Box<dyn CaptureSession>> {
-        use crate::mutter::MutterSession;
+    pub(super) fn start_mutter_capture(
+        resolution: Resolution,
+        framerate: u32,
+        cursor_sink: Option<CursorUpdateSink>,
+    ) -> Result<Box<dyn CaptureSession>> {
+        use crate::mutter::{MutterSession, MutterSource};
+        use crate::session::CursorMode;
 
+        let mutter_source = MutterSource::from_env();
         let prefs = FormatPrefs {
             resolution,
             framerate,
+            exact_size: mutter_source == MutterSource::Virtual,
             ..Default::default()
         };
-        let mutter = MutterSession::start(PortalOptions::default().cursor_mode, resolution)?;
+        let mutter = MutterSession::start(mutter_source, CursorMode::Metadata, resolution)?;
         let mut source = PipewireStreamSource::new();
+        source.set_cursor_sink(cursor_sink);
         source.connect_local(mutter.node_id(), prefs)?;
         Ok(Box::new(MutterPipewireSession {
             inner: FrameSourceSession::new(source, Duration::from_millis(100)),
@@ -290,6 +324,25 @@ mod real {
                 self.sync_stream_size(frame);
             }
             Ok(frame)
+        }
+
+        fn next_frame_timeout(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+            session_lost_if_closed(self.mutter.is_closed())?;
+            let frame = self.inner.recv_timeout(timeout)?;
+            if let Some(frame) = &frame {
+                self.sync_stream_size(frame);
+            }
+            Ok(frame)
+        }
+
+        fn request_mode(&mut self, resolution: Resolution, refresh_hz: u32) -> Result<()> {
+            if self.mutter.source() != crate::mutter::MutterSource::Virtual {
+                return Err(FluxError::Capture(
+                    "the captured monitor's mode is controlled by the compositor, not by capture".into(),
+                ));
+            }
+            session_lost_if_closed(self.mutter.is_closed())?;
+            self.inner.source().request_size(resolution, refresh_hz)
         }
 
         fn input_backend(&self) -> Option<std::sync::Arc<dyn flux_input::InputBackend>> {

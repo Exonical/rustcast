@@ -94,6 +94,55 @@ pub(crate) fn mode_change_needed(current: ModeRequest, requested: ModeRequest) -
     current.width != requested.width || current.height != requested.height
 }
 
+/// How long a compositor-side mode change may take to show up in the frames.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+const MODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A mode change that was handed to the capture backend and is waiting for
+/// frames at the requested size.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingMode {
+    requested: flux_core::types::Resolution,
+    previous: flux_core::types::Resolution,
+    deadline: std::time::Instant,
+}
+
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingModeState {
+    Waiting,
+    Applied,
+    TimedOut,
+}
+
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+impl PendingMode {
+    fn new(
+        requested: flux_core::types::Resolution,
+        previous: flux_core::types::Resolution,
+        now: std::time::Instant,
+    ) -> Self {
+        Self {
+            requested,
+            previous,
+            deadline: now + MODE_REQUEST_TIMEOUT,
+        }
+    }
+
+    /// Where the request stands given the resolution of the latest frame (if
+    /// any arrived) at `now`. A frame at the requested size wins over the deadline.
+    fn state(&self, frame: Option<flux_core::types::Resolution>, now: std::time::Instant) -> PendingModeState {
+        if frame == Some(self.requested) {
+            PendingModeState::Applied
+        } else if now >= self.deadline {
+            PendingModeState::TimedOut
+        } else {
+            PendingModeState::Waiting
+        }
+    }
+}
+
 fn effective_default_fps_cap(configured: u32, requested_default: u32) -> u32 {
     requested_default.min(configured)
 }
@@ -425,6 +474,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_status = Arc::new(std::sync::RwLock::new(registration::RuntimeStatus::default()));
     let runtime_status_capture = runtime_status.clone();
     let resolution_status_tx_capture = resolution_status_tx.clone();
+    let initial_mode = config.video.virtual_display;
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
@@ -442,6 +492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 default_quality_level,
                 virtual_display_target,
                 virtual_display,
+                initial_mode,
                 resolution_status_tx_capture,
                 runtime_status_capture,
             );
@@ -1279,6 +1330,65 @@ fn set_cursor_dimensions(
     }
 }
 
+/// Resolve a pending compositor-side mode change against the latest frame:
+/// on success adopt the new mode as the primary display's and retarget
+/// absolute input; on timeout report the failure.
+#[cfg(not(target_os = "windows"))]
+fn settle_pending_mode(
+    pending: &mut Option<PendingMode>,
+    frame: Option<flux_core::types::Resolution>,
+    primary: &mut flux_capture::traits::DisplayInfo,
+    input_sink: &flux_input::InputSink,
+    tx: &tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
+) {
+    let Some(request) = *pending else {
+        return;
+    };
+    match request.state(frame, std::time::Instant::now()) {
+        PendingModeState::Waiting => {}
+        PendingModeState::Applied => {
+            primary.native_resolution = request.requested;
+            primary.desktop_rect.width = request.requested.width;
+            primary.desktop_rect.height = request.requested.height;
+            if let Err(error) = input_sink.set_target_rect(primary.desktop_rect) {
+                tracing::warn!("Failed to update input target rectangle: {}", error);
+            }
+            tracing::info!("Resolution request applied: now {}", request.requested);
+            publish_resolution_status(
+                tx,
+                ResolutionStatus {
+                    state: "succeeded",
+                    width: request.requested.width,
+                    height: request.requested.height,
+                    previous_width: Some(request.previous.width),
+                    previous_height: Some(request.previous.height),
+                    error: None,
+                },
+            );
+            *pending = None;
+        }
+        PendingModeState::TimedOut => {
+            tracing::warn!(
+                "Resolution request {} was not applied within {:?}",
+                request.requested,
+                MODE_REQUEST_TIMEOUT
+            );
+            publish_resolution_status(
+                tx,
+                ResolutionStatus {
+                    state: "failed",
+                    width: request.requested.width,
+                    height: request.requested.height,
+                    previous_width: Some(request.previous.width),
+                    previous_height: Some(request.previous.height),
+                    error: Some("compositor did not apply the mode".into()),
+                },
+            );
+            *pending = None;
+        }
+    }
+}
+
 /// Apply a requested virtual-display mode. If it does not apply, roll back to
 /// `old_mode`, then keep retrying the rollback with exponential backoff until
 /// capture is restored. The caller must already have released its session.
@@ -1403,6 +1513,18 @@ fn recover_lost_capture(
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
         };
+        // A compositor virtual monitor has no real geometry to re-read: keep
+        // the mode it was last running at.
+        #[cfg(target_os = "linux")]
+        let refreshed = if refreshed.name == flux_capture::backend::pipewire::VIRTUAL_MONITOR_NAME {
+            flux_capture::traits::DisplayInfo {
+                native_resolution: lost.native_resolution,
+                desktop_rect: lost.desktop_rect,
+                ..refreshed
+            }
+        } else {
+            refreshed
+        };
         match starter.restart_on(&refreshed) {
             Ok(session) => {
                 tracing::info!("Capture session recreated after capture loss");
@@ -1465,11 +1587,16 @@ fn capture_loop(
     default_quality_level: u8,
     target_display: Option<flux_capture::traits::DisplayInfo>,
     mut virtual_display: Option<VirtualDisplayHandle>,
+    initial_mode: Option<flux_core::config::VirtualDisplayConfig>,
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
     #[cfg(not(target_os = "windows"))]
     let _ = &virtual_display;
+    #[cfg(target_os = "windows")]
+    let _ = initial_mode;
+    #[cfg(not(target_os = "windows"))]
+    let mut target_fps = target_fps;
     // ── Initialize capture ──────────────────────────────────────────
     let capture = match flux_capture::create_capture(None) {
         Ok(c) => c,
@@ -1509,9 +1636,32 @@ fn capture_loop(
             .unwrap_or(&displays[0])
             .clone()
     };
+    // On Linux the capture backend may own a compositor virtual monitor whose
+    // mode is whatever we ask for; use the configured one from the start.
+    #[cfg(target_os = "linux")]
+    let owns_virtual_monitor = primary.name == flux_capture::backend::pipewire::VIRTUAL_MONITOR_NAME;
+    #[cfg(not(target_os = "linux"))]
+    let owns_virtual_monitor = false;
+    #[cfg(not(target_os = "windows"))]
+    if owns_virtual_monitor && let Some(mode) = initial_mode {
+        primary.native_resolution = flux_core::types::Resolution::new(mode.width, mode.height);
+        primary.desktop_rect = flux_core::types::DesktopRect {
+            left: 0,
+            top: 0,
+            width: mode.width,
+            height: mode.height,
+        };
+        target_fps = mode.refresh_hz.clamp(1, 144);
+        tracing::info!(
+            "Virtual monitor mode {}x{}@{}Hz",
+            mode.width,
+            mode.height,
+            target_fps
+        );
+    }
     if let Ok(mut status) = runtime_status.write() {
         status.display_name = Some(primary.name.clone());
-        status.captured_virtual_display = Some(target_display.is_some());
+        status.captured_virtual_display = Some(target_display.is_some() || owns_virtual_monitor);
     }
     
     // Initialize input using the selected output's virtual-desktop rectangle.
@@ -1642,6 +1792,8 @@ fn capture_loop(
 
     let mut frame_count: u64 = 0;
     let mut stage_timings = StageTimings::default();
+    #[cfg(not(target_os = "windows"))]
+    let mut pending_mode: Option<PendingMode> = None;
     loop {
         if let Ok(request) = resolution_rx.try_recv() {
             #[cfg(target_os = "windows")]
@@ -1701,11 +1853,72 @@ fn capture_loop(
             }
             #[cfg(not(target_os = "windows"))]
             {
-                tracing::warn!(
-                    "Ignoring resolution request {}x{} on a non-Windows capture backend",
-                    request.width,
-                    request.height
-                );
+                let publish = |state: &'static str, request: ModeRequest, error: Option<String>| {
+                    publish_resolution_status(
+                        &resolution_status_tx,
+                        ResolutionStatus {
+                            state,
+                            width: request.width,
+                            height: request.height,
+                            previous_width: None,
+                            previous_height: None,
+                            error,
+                        },
+                    );
+                };
+                match validate_mode_request(request) {
+                    Err(error) => {
+                        tracing::warn!(
+                            "Ignoring invalid resolution request {}x{}: {}",
+                            request.width,
+                            request.height,
+                            error
+                        );
+                        publish("failed", request, Some(error.to_string()));
+                    }
+                    Ok(request) => {
+                        let current_mode = ModeRequest {
+                            width: primary.native_resolution.width,
+                            height: primary.native_resolution.height,
+                        };
+                        if !mode_change_needed(current_mode, request) {
+                            tracing::info!(
+                                "Resolution request {}x{} already active; no-op",
+                                request.width,
+                                request.height
+                            );
+                            pending_mode = None;
+                            publish("succeeded", request, None);
+                        } else {
+                            let requested = flux_core::types::Resolution::new(request.width, request.height);
+                            match session.request_mode(requested, target_fps) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "Resolution request: {}x{} -> {}x{}",
+                                        current_mode.width,
+                                        current_mode.height,
+                                        request.width,
+                                        request.height
+                                    );
+                                    pending_mode = Some(PendingMode::new(
+                                        requested,
+                                        primary.native_resolution,
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "Resolution request {}x{} failed: {}",
+                                        request.width,
+                                        request.height,
+                                        error
+                                    );
+                                    publish("failed", request, Some(error.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         // Check for IDR requests
@@ -1765,8 +1978,20 @@ fn capture_loop(
 
         let t0 = std::time::Instant::now();
 
-        let frame = match session.next_frame() {
-            Ok(f) => f,
+        let frame = match session.next_frame_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                // No frame yet (idle desktop): service requests and deadlines.
+                #[cfg(not(target_os = "windows"))]
+                settle_pending_mode(
+                    &mut pending_mode,
+                    None,
+                    &mut primary,
+                    &input_sink,
+                    &resolution_status_tx,
+                );
+                continue;
+            }
             Err(e) => {
                 tracing::warn!("Capture error: {}", e);
                 if !matches!(e, FluxError::CaptureSessionLost(_)) {
@@ -1778,9 +2003,21 @@ fn capture_loop(
                 encode_resolution = flux_core::types::Resolution::new(0, 0);
                 release_capture_session(session);
                 (primary, session) = recover_lost_capture(&starter, &primary);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    pending_mode = None;
+                }
                 continue;
             }
         };
+        #[cfg(not(target_os = "windows"))]
+        settle_pending_mode(
+            &mut pending_mode,
+            Some(frame.resolution),
+            &mut primary,
+            &input_sink,
+            &resolution_status_tx,
+        );
 
         let t_capture = t0.elapsed();
         if !should_encode_frame(&mut frame_pacer, t0, fps_cap) {
@@ -2365,5 +2602,56 @@ mod frame_message_tests {
         let mut w = ChunkedWriter::new(0);
         let err = write_frame_message(&mut w, 0x01, 0, b"x").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+}
+
+#[cfg(test)]
+mod pending_mode_tests {
+    use super::*;
+    use flux_core::types::Resolution;
+    use std::time::{Duration, Instant};
+
+    fn pending(now: Instant) -> PendingMode {
+        PendingMode::new(Resolution::new(1280, 720), Resolution::new(1920, 1080), now)
+    }
+
+    #[test]
+    fn waits_while_frames_keep_the_old_size() {
+        let now = Instant::now();
+        let request = pending(now);
+        assert_eq!(request.state(None, now), PendingModeState::Waiting);
+        assert_eq!(
+            request.state(Some(Resolution::new(1920, 1080)), now + Duration::from_secs(1)),
+            PendingModeState::Waiting
+        );
+    }
+
+    #[test]
+    fn applies_on_the_first_frame_at_the_requested_size() {
+        let now = Instant::now();
+        assert_eq!(
+            pending(now).state(Some(Resolution::new(1280, 720)), now + Duration::from_millis(300)),
+            PendingModeState::Applied
+        );
+    }
+
+    #[test]
+    fn times_out_after_the_deadline_without_a_matching_frame() {
+        let now = Instant::now();
+        let request = pending(now);
+        assert_eq!(request.state(None, now + MODE_REQUEST_TIMEOUT), PendingModeState::TimedOut);
+        assert_eq!(
+            request.state(Some(Resolution::new(1920, 1080)), now + MODE_REQUEST_TIMEOUT + Duration::from_millis(1)),
+            PendingModeState::TimedOut
+        );
+    }
+
+    #[test]
+    fn a_matching_frame_at_the_deadline_still_counts_as_applied() {
+        let now = Instant::now();
+        assert_eq!(
+            pending(now).state(Some(Resolution::new(1280, 720)), now + MODE_REQUEST_TIMEOUT),
+            PendingModeState::Applied
+        );
     }
 }

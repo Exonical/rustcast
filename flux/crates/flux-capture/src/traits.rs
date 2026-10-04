@@ -63,6 +63,21 @@ pub trait CaptureSession: Send {
         None
     }
 
+    /// Wait up to `timeout` for the next frame; `Ok(None)` means none arrived
+    /// yet. Lets the caller service other work while a source is idle. The
+    /// default blocks in [`Self::next_frame`] and never returns `None`.
+    fn next_frame_timeout(&mut self, _timeout: std::time::Duration) -> Result<Option<CapturedFrame>> {
+        self.next_frame().map(Some)
+    }
+
+    /// Ask the backend to switch the captured output to a new mode. The change
+    /// is asynchronous: it has taken effect once frames arrive at the new size.
+    fn request_mode(&mut self, _resolution: Resolution, _refresh_hz: u32) -> Result<()> {
+        Err(flux_core::error::FluxError::Capture(
+            "mode changes are not supported by this capture backend".into(),
+        ))
+    }
+
     /// Input injection backend tied to this capture session (e.g. the
     /// RemoteDesktop half of a Mutter session), if the capture backend has one.
     fn input_backend(&self) -> Option<Arc<dyn flux_input::InputBackend>> {

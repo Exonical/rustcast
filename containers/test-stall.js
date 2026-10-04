@@ -55,6 +55,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       `recv ms=${d(p.recvDeltaMs)}`, `rtp ms=${d(p.rtpDeltaMs)}`, `jb=${p.jitterBufferMsPerFrame}ms`,
       `kf=${s.keyFramesDecoded} pli=${s.pliCount} nack=${s.nackCount} lost=${s.packetsLost}`,
       `freezes=${s.freezeCount}/${s.totalFreezesDuration}s dropped=${s.framesDropped}`,
+      `cursor msgs=${p.cursorMsgs} (${p.cursorPerSec}/s) bitmaps=${p.cursorBitmaps} last=${JSON.stringify(p.lastCursor)}`,
+      `video=${p.videoSize} resStatus=${(p.resolutionStatuses || []).map(r => r.state + ":" + r.width + "x" + r.height).join(",") || "-"}`,
     ].join(' | '));
   }
   console.log(report.events.filter(e => !e.startsWith('error={"error":"No active')).join('\n'));

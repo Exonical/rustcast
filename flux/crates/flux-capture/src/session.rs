@@ -146,6 +146,12 @@ pub struct FormatPrefs {
     pub resolution: Resolution,
     /// Target framerate hint.
     pub framerate: u32,
+    /// Offer `resolution` as the only acceptable size instead of a range with
+    /// it as the default (virtual monitors derive their mode from the size).
+    pub exact_size: bool,
+    /// DRM format modifiers to offer for DMA-BUF buffers. Empty (the default)
+    /// offers shared-memory buffers only.
+    pub dmabuf_modifiers: Vec<u64>,
 }
 
 impl Default for FormatPrefs {
@@ -155,6 +161,8 @@ impl Default for FormatPrefs {
             prefer_dmabuf: true,
             resolution: Resolution::new(1920, 1080),
             framerate: 60,
+            exact_size: false,
+            dmabuf_modifiers: Vec::new(),
         }
     }
 }
@@ -226,6 +234,11 @@ impl<S: PipewireFrameSource> FrameSourceSession<S> {
             return Err(FluxError::Capture("session stopped".into()));
         }
         self.source.recv_frame(timeout)
+    }
+
+    /// The underlying frame source.
+    pub fn source(&self) -> &S {
+        &self.source
     }
 
     /// The format the underlying source negotiated, if known.

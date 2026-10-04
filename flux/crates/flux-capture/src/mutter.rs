@@ -45,6 +45,41 @@ pub fn cursor_mode_value(mode: CursorMode) -> u32 {
     }
 }
 
+/// What the ScreenCast session records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutterSource {
+    /// A virtual monitor Rustcast owns (`RecordVirtual`); its mode follows the
+    /// size negotiated on the PipeWire stream.
+    Virtual,
+    /// The primary physical/existing monitor (`RecordMonitor`).
+    PrimaryMonitor,
+}
+
+impl MutterSource {
+    /// `FLUX_MUTTER_SOURCE=monitor` selects the primary monitor; anything else
+    /// (including unset) the virtual monitor.
+    pub fn from_env() -> Self {
+        Self::from_setting(std::env::var("FLUX_MUTTER_SOURCE").ok().as_deref())
+    }
+
+    fn from_setting(value: Option<&str>) -> Self {
+        match value {
+            Some("monitor") => Self::PrimaryMonitor,
+            _ => Self::Virtual,
+        }
+    }
+}
+
+/// Properties passed to `RecordVirtual` / `RecordMonitor`.
+fn record_options(source: MutterSource, cursor_mode: CursorMode) -> HashMap<&'static str, Value<'static>> {
+    let mut options: HashMap<&'static str, Value<'static>> = HashMap::new();
+    options.insert("cursor-mode", Value::from(cursor_mode_value(cursor_mode)));
+    if source == MutterSource::Virtual {
+        options.insert("is-platform", Value::from(true));
+    }
+    options
+}
+
 /// Map normalized `0..=1` coordinates onto stream pixels.
 pub fn normalized_to_pixels(x: f64, y: f64, width: u32, height: u32) -> (f64, f64) {
     let clamp = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
@@ -184,6 +219,7 @@ impl StreamSize {
 
 /// A live Mutter ScreenCast+RemoteDesktop session.
 pub struct MutterSession {
+    source: MutterSource,
     node_id: u32,
     tx: UnboundedSender<Cmd>,
     size: Arc<StreamSize>,
@@ -192,24 +228,31 @@ pub struct MutterSession {
 }
 
 impl MutterSession {
-    /// Create and start a session recording the primary monitor.
+    /// Create and start a session recording `source`.
     ///
     /// `initial_size` seeds absolute-pointer scaling until the PipeWire stream
     /// reports its real size via [`Self::set_stream_size`].
-    pub fn start(cursor_mode: CursorMode, initial_size: Resolution) -> Result<Self> {
+    pub fn start(source: MutterSource, cursor_mode: CursorMode, initial_size: Resolution) -> Result<Self> {
         let (tx, rx) = unbounded_channel::<Cmd>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, String)>>();
         let closed = Arc::new(AtomicBool::new(false));
         let thread_closed = Arc::clone(&closed);
         let handle = std::thread::Builder::new()
             .name("flux-mutter".into())
-            .spawn(move || run_thread(cursor_mode, rx, ready_tx, thread_closed))
+            .spawn(move || run_thread(source, cursor_mode, rx, ready_tx, thread_closed))
             .map_err(|e| FluxError::Capture(format!("failed to spawn Mutter thread: {e}")))?;
 
         match ready_rx.recv() {
             Ok(Ok((node_id, stream_path))) => {
-                tracing::info!("Mutter session created: PipeWire node {node_id}, stream {stream_path}");
+                tracing::info!(
+                    "Mutter session created ({}): PipeWire node {node_id}, stream {stream_path}",
+                    match source {
+                        MutterSource::Virtual => "RecordVirtual",
+                        MutterSource::PrimaryMonitor => "RecordMonitor",
+                    }
+                );
                 Ok(Self {
+                    source,
                     node_id,
                     tx,
                     size: Arc::new(StreamSize::new(initial_size)),
@@ -226,6 +269,10 @@ impl MutterSession {
                 Err(FluxError::Capture("Mutter thread exited before signalling readiness".into()))
             }
         }
+    }
+
+    pub fn source(&self) -> MutterSource {
+        self.source
     }
 
     pub fn node_id(&self) -> u32 {
@@ -336,6 +383,7 @@ struct Handshake {
 }
 
 fn run_thread(
+    source: MutterSource,
     cursor_mode: CursorMode,
     rx: UnboundedReceiver<Cmd>,
     ready_tx: std::sync::mpsc::Sender<Result<(u32, String)>>,
@@ -356,7 +404,7 @@ fn run_thread(
             node_id,
             mut rd_closed,
             mut sc_closed,
-        } = match handshake(cursor_mode).await {
+        } = match handshake(source, cursor_mode).await {
             Ok(v) => v,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -375,9 +423,7 @@ fn run_thread(
     });
 }
 
-async fn handshake(
-    cursor_mode: CursorMode,
-) -> Result<Handshake> {
+async fn handshake(source: MutterSource, cursor_mode: CursorMode) -> Result<Handshake> {
     let conn = Connection::session().await.map_err(cap_err)?;
 
     let rd = Proxy::new(&conn, RD_NAME, RD_PATH, RD_NAME).await.map_err(cap_err)?;
@@ -395,12 +441,12 @@ async fn handshake(
         .await
         .map_err(cap_err)?;
 
-    let mut record_opts: HashMap<&str, Value<'_>> = HashMap::new();
-    record_opts.insert("cursor-mode", Value::from(cursor_mode_value(cursor_mode)));
-    let stream_path: OwnedObjectPath = sc_session
-        .call("RecordMonitor", &("", record_opts))
-        .await
-        .map_err(cap_err)?;
+    let record_opts = record_options(source, cursor_mode);
+    let stream_path: OwnedObjectPath = match source {
+        MutterSource::Virtual => sc_session.call("RecordVirtual", &(record_opts,)).await,
+        MutterSource::PrimaryMonitor => sc_session.call("RecordMonitor", &("", record_opts)).await,
+    }
+    .map_err(cap_err)?;
     let stream = Proxy::new(&conn, SC_NAME, stream_path.clone(), SC_STREAM_IFACE)
         .await
         .map_err(cap_err)?;
@@ -524,6 +570,28 @@ mod tests {
         );
         assert!(is_object_gone(&gone));
         assert!(!is_object_gone(&zbus::Error::InvalidReply));
+    }
+
+    #[test]
+    fn record_virtual_options_request_a_platform_monitor_with_cursor_metadata() {
+        let options = record_options(MutterSource::Virtual, CursorMode::Metadata);
+        assert_eq!(options.len(), 2);
+        assert!(matches!(options["cursor-mode"], Value::U32(2)));
+        assert!(matches!(options["is-platform"], Value::Bool(true)));
+    }
+
+    #[test]
+    fn record_monitor_options_only_carry_the_cursor_mode() {
+        let options = record_options(MutterSource::PrimaryMonitor, CursorMode::Metadata);
+        assert_eq!(options.len(), 1);
+        assert!(matches!(options["cursor-mode"], Value::U32(2)));
+    }
+
+    #[test]
+    fn source_defaults_to_virtual_unless_monitor_is_requested() {
+        assert_eq!(MutterSource::from_setting(None), MutterSource::Virtual);
+        assert_eq!(MutterSource::from_setting(Some("virtual")), MutterSource::Virtual);
+        assert_eq!(MutterSource::from_setting(Some("monitor")), MutterSource::PrimaryMonitor);
     }
 
     #[test]

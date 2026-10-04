@@ -19,12 +19,15 @@
 //! shared-memory buffers fall back to a CPU copy into a buffer reused from the
 //! bridge's pool (see [`PipewireFrameSource::recycle_frame`]).
 
+use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use flux_core::error::{FluxError, Result};
+use flux_core::cursor::CursorMetadata;
 use flux_core::frame::CapturedFrame;
 #[cfg(unix)]
 use flux_core::frame::{DmaBufHandle, DmaBufPlane, GpuFrameHandle};
@@ -40,25 +43,39 @@ use spa::pod::{Pod, Property, PropertyFlags, Value};
 use spa::utils::{Direction, Id, SpaTypes};
 
 use crate::bridge::{FrameBridge, FrameSink, FrameSource};
+use crate::cursor::parse_spa_meta_cursor;
 use crate::session::{BufferKind, FormatPrefs, NegotiatedFormat, PipewireFrameSource};
+use crate::traits::CursorUpdateSink;
 
 /// DRM format modifier sentinel meaning "no/invalid modifier" (linear or
 /// unspecified). Matches `DRM_FORMAT_MOD_INVALID`.
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// Size requested for `SPA_META_Cursor`: the `spa_meta_cursor` header (28), a
+/// `spa_meta_bitmap` header (20) and a 384x384 ARGB bitmap, matching what
+/// Mutter reserves (`CURSOR_META_SIZE`).
+const CURSOR_META_SIZE: i32 = 28 + 20 + 384 * 384 * 4;
+
 /// Shared, lock-protected view of the format the stream fixated.
 type SharedFormat = Arc<Mutex<Option<NegotiatedFormat>>>;
+
+/// Commands delivered into the PipeWire loop thread.
+enum StreamCmd {
+    Quit,
+    SetSize { resolution: Resolution, framerate: u32 },
+}
 
 /// A live PipeWire capture stream feeding a [`FrameBridge`].
 pub struct PipewireStreamSource {
     source: Option<FrameSource>,
     format: SharedFormat,
     thread: Option<ThreadHandle>,
+    cursor_sink: Option<CursorUpdateSink>,
 }
 
 struct ThreadHandle {
-    /// Sends a quit signal into the PipeWire loop thread.
-    quit: pw::channel::Sender<()>,
+    /// Sends commands into the PipeWire loop thread.
+    cmd: pw::channel::Sender<StreamCmd>,
     join: JoinHandle<()>,
 }
 
@@ -74,7 +91,29 @@ impl PipewireStreamSource {
             source: None,
             format: Arc::new(Mutex::new(None)),
             thread: None,
+            cursor_sink: None,
         }
+    }
+
+    /// Receive cursor updates decoded from `SPA_META_Cursor` buffer metadata.
+    /// Must be called before connecting.
+    pub fn set_cursor_sink(&mut self, sink: Option<CursorUpdateSink>) {
+        self.cursor_sink = sink;
+    }
+
+    /// Re-offer the stream formats at a new size/framerate. Compositors that
+    /// derive the output mode from the negotiated format (Mutter virtual
+    /// monitors) resize accordingly; the change is visible once frames arrive
+    /// at the new resolution.
+    pub fn request_size(&self, resolution: Resolution, framerate: u32) -> Result<()> {
+        let handle = self
+            .thread
+            .as_ref()
+            .ok_or_else(|| FluxError::Capture("PipeWire stream not connected".into()))?;
+        handle
+            .cmd
+            .send(StreamCmd::SetSize { resolution, framerate })
+            .map_err(|_| FluxError::Capture("PipeWire stream thread is gone".into()))
     }
 
     /// Connect to `node_id` through the local PipeWire daemon (no portal fd),
@@ -92,11 +131,12 @@ impl PipewireStreamSource {
         self.source = Some(source);
         let format = Arc::clone(&self.format);
 
-        let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+        let (cmd_tx, cmd_rx) = pw::channel::channel::<StreamCmd>();
+        let cursor_sink = self.cursor_sink.clone();
         let join = std::thread::Builder::new()
             .name("flux-pipewire".into())
             .spawn(move || {
-                if let Err(e) = run_stream(fd, node_id, prefs, sink.clone(), format, quit_rx) {
+                if let Err(e) = run_stream(fd, node_id, prefs, sink.clone(), format, cmd_rx, cursor_sink) {
                     tracing::error!("PipeWire capture thread exited with error: {e}");
                 }
                 // Make sure a consumer blocked in `recv` wakes up on exit.
@@ -104,7 +144,7 @@ impl PipewireStreamSource {
             })
             .map_err(|e| FluxError::Capture(format!("failed to spawn PipeWire thread: {e}")))?;
 
-        self.thread = Some(ThreadHandle { quit: quit_tx, join });
+        self.thread = Some(ThreadHandle { cmd: cmd_tx, join });
         Ok(())
     }
 }
@@ -138,7 +178,7 @@ impl PipewireFrameSource for PipewireStreamSource {
     fn disconnect(&mut self) -> Result<()> {
         if let Some(handle) = self.thread.take() {
             // Best-effort: signal the loop to quit and join the thread.
-            let _ = handle.quit.send(());
+            let _ = handle.cmd.send(StreamCmd::Quit);
             let _ = handle.join.join();
         }
         self.source = None;
@@ -159,7 +199,8 @@ fn run_stream(
     prefs: FormatPrefs,
     sink: FrameSink,
     format: SharedFormat,
-    quit_rx: pw::channel::Receiver<()>,
+    cmd_rx: pw::channel::Receiver<StreamCmd>,
+    cursor_sink: Option<CursorUpdateSink>,
 ) -> Result<()> {
     pw::init();
 
@@ -184,6 +225,7 @@ fn run_stream(
         },
     )
     .map_err(|e| pw_err("create stream", e))?;
+    let prefs = Rc::new(RefCell::new(prefs));
 
     // Per-frame sequence counter, owned by the process callback.
     let seq = Arc::new(Mutex::new(0u64));
@@ -192,6 +234,8 @@ fn run_stream(
     let format_proc = Arc::clone(&format);
     let sink_proc = sink.clone();
     let seq_proc = Arc::clone(&seq);
+
+    let mut last_cursor: Option<CursorMetadata> = None;
 
     let _listener = stream
         .add_local_listener::<()>()
@@ -222,23 +266,33 @@ fn run_stream(
             *format_cb.lock().unwrap() = Some(negotiated);
         })
         .process(move |stream, _ud| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            let Some(mut buffer) = DequeuedBuffer::dequeue(stream) else {
                 return;
             };
+            if let Some(sink) = &cursor_sink
+                && let Some(bytes) = buffer.meta(spa::sys::SPA_META_Cursor)
+                && let Some(update) = parse_spa_meta_cursor(bytes)
+                && cursor_changed(last_cursor.as_ref(), &update)
+            {
+                sink(update.clone());
+                last_cursor = Some(update);
+            }
             let negotiated = format_proc.lock().unwrap().clone();
             let Some(negotiated) = negotiated else {
                 return;
             };
             let mut seq = seq_proc.lock().unwrap();
-            *seq += 1;
-            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, *seq, &sink_proc) {
+            // A buffer that carries no new frame (cursor-only update) must not
+            // be pushed as a stale frame; the sequence only advances for frames.
+            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, *seq + 1, &sink_proc) {
+                *seq += 1;
                 sink_proc.push(frame);
             }
         })
         .register()
         .map_err(|e| pw_err("register listener", e))?;
 
-    let params = build_format_params(&prefs)?;
+    let params = build_stream_params(&prefs.borrow())?;
     let mut param_refs: Vec<&Pod> = params.iter().map(|p| p.as_ref()).collect();
     stream
         .connect(
@@ -249,9 +303,32 @@ fn run_stream(
         )
         .map_err(|e| pw_err("connect stream", e))?;
 
-    // Quit the loop when the source is dropped / disconnect is requested.
+    // Quit the loop on disconnect and re-offer formats on size changes.
     let ml = mainloop.clone();
-    let _quit = quit_rx.attach(mainloop.loop_(), move |_| ml.quit());
+    let cmd_stream = stream.clone();
+    let cmd_prefs = Rc::clone(&prefs);
+    let _cmd = cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
+        StreamCmd::Quit => ml.quit(),
+        StreamCmd::SetSize { resolution, framerate } => {
+            {
+                let mut prefs = cmd_prefs.borrow_mut();
+                prefs.resolution = resolution;
+                prefs.framerate = framerate;
+            }
+            let params = match build_stream_params(&cmd_prefs.borrow()) {
+                Ok(params) => params,
+                Err(e) => {
+                    tracing::warn!("PipeWire: cannot rebuild stream params for {resolution}: {e}");
+                    return;
+                }
+            };
+            let mut refs: Vec<&Pod> = params.iter().map(|p| p.as_ref()).collect();
+            match cmd_stream.update_params(&mut refs) {
+                Ok(()) => tracing::info!("PipeWire: requested stream size {resolution}@{framerate}"),
+                Err(e) => tracing::warn!("PipeWire: update_params for {resolution} failed: {e}"),
+            }
+        }
+    });
 
     mainloop.run();
     Ok(())
@@ -266,22 +343,150 @@ impl OwnedPod {
     }
 }
 
+/// Everything the stream offers: the format parameters plus the cursor
+/// metadata request.
+fn build_stream_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
+    let mut params = build_format_params(prefs)?;
+    params.push(build_cursor_meta_param()?);
+    Ok(params)
+}
+
+/// `SPA_PARAM_Meta` asking for `SPA_META_Cursor` on every buffer, so
+/// compositors in cursor-metadata mode can deliver pointer position and shape
+/// out of band.
+fn build_cursor_meta_param() -> Result<OwnedPod> {
+    use spa::pod::Object;
+
+    let object = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(
+                spa::sys::SPA_PARAM_META_type,
+                Value::Id(Id(spa::sys::SPA_META_Cursor)),
+            ),
+            Property::new(spa::sys::SPA_PARAM_META_size, Value::Int(CURSOR_META_SIZE)),
+        ],
+    };
+    serialize_object(object)
+}
+
+fn serialize_object(object: spa::pod::Object) -> Result<OwnedPod> {
+    use spa::pod::serialize::PodSerializer;
+
+    let bytes = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
+        .map_err(|e| FluxError::Capture(format!("failed to serialize pod: {e}")))?
+        .0
+        .into_inner();
+    Ok(OwnedPod(bytes))
+}
+
+/// Whether a cursor update differs from the last one handed to the sink: a new
+/// shape, or a different position/hotspot (including hidden).
+fn cursor_changed(last: Option<&CursorMetadata>, new: &CursorMetadata) -> bool {
+    new.bitmap.is_some()
+        || last.is_none_or(|last| last.position != new.position || last.hotspot != new.hotspot)
+}
+
+/// Whether a buffer's first data chunk carries a captured frame. Mutter marks
+/// cursor-only buffers with an empty or `CORRUPTED` chunk.
+fn chunk_has_frame(size: u32, flags: i32) -> bool {
+    size > 0 && flags & spa::sys::SPA_CHUNK_FLAG_CORRUPTED as i32 == 0
+}
+
+/// A buffer dequeued from a stream, returned to it on drop. The `pipewire`
+/// crate's safe `Buffer` does not expose buffer metadata, so this wraps the
+/// raw `pw_buffer`.
+struct DequeuedBuffer<'s> {
+    stream: &'s pw::stream::Stream,
+    raw: *mut pw::sys::pw_buffer,
+}
+
+impl<'s> DequeuedBuffer<'s> {
+    fn dequeue(stream: &'s pw::stream::Stream) -> Option<Self> {
+        // SAFETY: called from the stream's `process` callback; a non-null
+        // pointer is returned to the same stream in `Drop`.
+        let raw = unsafe { stream.dequeue_raw_buffer() };
+        (!raw.is_null()).then_some(Self { stream, raw })
+    }
+
+    fn spa_buffer(&self) -> Option<&spa::sys::spa_buffer> {
+        // SAFETY: `raw` is a live pw_buffer until `Drop`; its `buffer` field,
+        // when non-null, points at the spa_buffer PipeWire allocated for it.
+        unsafe { (*self.raw).buffer.as_ref() }
+    }
+
+    fn datas_mut(&mut self) -> &mut [spa::buffer::Data] {
+        let Some(buffer) = self.spa_buffer() else {
+            return &mut [];
+        };
+        let (datas, n_datas) = (buffer.datas, buffer.n_datas as usize);
+        if datas.is_null() || n_datas == 0 {
+            return &mut [];
+        }
+        // SAFETY: `spa::buffer::Data` is a transparent wrapper over `spa_data`
+        // and `datas` points at `n_datas` of them, valid while the buffer is
+        // dequeued; the exclusive borrow of `self` guards against aliasing.
+        unsafe { std::slice::from_raw_parts_mut(datas as *mut spa::buffer::Data, n_datas) }
+    }
+
+    /// Bytes of the buffer's metadata block of the given `SPA_META_*` type.
+    fn meta(&self, meta_type: u32) -> Option<&[u8]> {
+        let buffer = self.spa_buffer()?;
+        if buffer.metas.is_null() {
+            return None;
+        }
+        // SAFETY: `metas` points at `n_metas` entries valid while the buffer
+        // is dequeued; each meta's `data` spans `size` bytes.
+        unsafe {
+            std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize)
+                .iter()
+                .find(|meta| meta.type_ == meta_type && !meta.data.is_null())
+                .map(|meta| std::slice::from_raw_parts(meta.data as *const u8, meta.size as usize))
+        }
+    }
+}
+
+impl Drop for DequeuedBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `raw` was dequeued from `stream` and is returned once.
+        unsafe { self.stream.queue_raw_buffer(self.raw) }
+    }
+}
+
 /// Build the `EnumFormat` parameter list offered to the server.
 ///
 /// We advertise packed 32-bit RGB formats (the encoder's CPU-upload and
 /// DMA-BUF paths both handle these) as a choice, plus size/framerate ranges
-/// hinted from [`FormatPrefs`]. The server fixates a concrete format and
-/// chooses DMA-BUF vs shared memory based on what both ends support.
+/// hinted from [`FormatPrefs`]. With `dmabuf_modifiers` set, each format also
+/// gets a DMA-BUF `EnumFormat` (modifier choice, mandatory and not fixated so
+/// the producer picks the modifier) ahead of the shared-memory fallback.
+/// DMA-BUF frames carry no CPU data, so callers must not offer modifiers until
+/// the encoder can import DMA-BUF.
 fn build_format_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
-    use spa::pod::{serialize::PodSerializer, Object};
-    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Rectangle};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
 
     let formats = preferred_video_formats(&prefs.formats);
     let default_format = formats[0];
 
-    let width = prefs.resolution.width.max(1);
-    let height = prefs.resolution.height.max(1);
-    let fps = prefs.framerate.max(1);
+    let mut params = Vec::new();
+    if !prefs.dmabuf_modifiers.is_empty() {
+        let modifiers: Vec<i64> = prefs.dmabuf_modifiers.iter().map(|m| *m as i64).collect();
+        for format in &formats {
+            let modifier_choice = Value::Choice(spa::pod::ChoiceValue::Long(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Enum {
+                    default: modifiers[0],
+                    alternatives: modifiers.clone(),
+                },
+            )));
+            params.push(serialize_object(enum_format_object(
+                prefs,
+                Value::Id(Id(format.as_raw())),
+                Some(modifier_choice),
+            ))?);
+        }
+    }
 
     let format_choice = Value::Choice(spa::pod::ChoiceValue::Id(Choice(
         ChoiceFlags::empty(),
@@ -290,16 +495,42 @@ fn build_format_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
             alternatives: formats.iter().map(|f| Id(f.as_raw())).collect(),
         },
     )));
+    params.push(serialize_object(enum_format_object(prefs, format_choice, None))?);
+    Ok(params)
+}
 
-    let size_choice = Value::Choice(spa::pod::ChoiceValue::Rectangle(Choice(
+/// One `EnumFormat` object for `format` (an Id or an Id choice), optionally
+/// with a mandatory, non-fixated DMA-BUF modifier choice.
+fn enum_format_object(prefs: &FormatPrefs, format: Value, modifier: Option<Value>) -> spa::pod::Object {
+    use spa::pod::Object;
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Rectangle};
+
+    let width = prefs.resolution.width.max(1);
+    let height = prefs.resolution.height.max(1);
+    let fps = prefs.framerate.max(1);
+
+    let size = if prefs.exact_size {
+        Value::Rectangle(Rectangle { width, height })
+    } else {
+        Value::Choice(spa::pod::ChoiceValue::Rectangle(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Range {
+                default: Rectangle { width, height },
+                min: Rectangle { width: 1, height: 1 },
+                max: Rectangle {
+                    width: 8192,
+                    height: 8192,
+                },
+            },
+        )))
+    };
+
+    let max_framerate = Value::Choice(spa::pod::ChoiceValue::Fraction(Choice(
         ChoiceFlags::empty(),
         ChoiceEnum::Range {
-            default: Rectangle { width, height },
-            min: Rectangle { width: 1, height: 1 },
-            max: Rectangle {
-                width: 8192,
-                height: 8192,
-            },
+            default: Fraction { num: fps, denom: 1 },
+            min: Fraction { num: 1, denom: 1 },
+            max: Fraction { num: fps, denom: 1 },
         },
     )));
 
@@ -315,7 +546,7 @@ fn build_format_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
         },
     )));
 
-    let object = Object {
+    let mut object = Object {
         type_: SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
         properties: vec![
@@ -327,25 +558,34 @@ fn build_format_params(prefs: &FormatPrefs) -> Result<Vec<OwnedPod>> {
                 spa::param::format::FormatProperties::MediaSubtype.as_raw(),
                 Value::Id(Id(MediaSubtype::Raw.as_raw())),
             ),
-            Property::new(
-                spa::param::format::FormatProperties::VideoFormat.as_raw(),
-                format_choice,
-            ),
-            Property::new(spa::param::format::FormatProperties::VideoSize.as_raw(), size_choice),
+            Property::new(spa::param::format::FormatProperties::VideoFormat.as_raw(), format),
+            Property::new(spa::param::format::FormatProperties::VideoSize.as_raw(), size),
             Property {
                 key: spa::param::format::FormatProperties::VideoFramerate.as_raw(),
                 flags: PropertyFlags::empty(),
                 value: framerate_choice,
             },
+            Property {
+                key: spa::param::format::FormatProperties::VideoMaxFramerate.as_raw(),
+                flags: PropertyFlags::empty(),
+                value: max_framerate,
+            },
         ],
     };
+    if let Some(modifier) = modifier {
+        object.properties.push(Property {
+            key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY | dont_fixate(),
+            value: modifier,
+        });
+    }
+    object
+}
 
-    let bytes = PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(object))
-        .map_err(|e| FluxError::Capture(format!("failed to serialize format pod: {e}")))?
-        .0
-        .into_inner();
-
-    Ok(vec![OwnedPod(bytes)])
+/// `SPA_POD_PROP_FLAG_DONT_FIXATE`, which the `libspa` crate only names behind
+/// its `v0_3_33` feature.
+fn dont_fixate() -> PropertyFlags {
+    PropertyFlags::from_bits_retain(spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE)
 }
 
 /// Map our preferred [`PixelFormat`]s to SPA video formats, always producing a
@@ -434,6 +674,10 @@ fn build_frame(
     if datas.is_empty() {
         return None;
     }
+    let chunk = datas[0].chunk();
+    if !chunk_has_frame(chunk.size(), chunk.flags().bits()) {
+        return None;
+    }
 
     let base = CapturedFrame {
         sequence,
@@ -498,14 +742,10 @@ fn build_shm_frame(
 ) -> Option<CapturedFrame> {
     let chunk_size = datas[0].chunk().size() as usize;
     let mapped = datas[0].data()?;
-    let len = if chunk_size > 0 && chunk_size <= mapped.len() {
-        chunk_size
-    } else {
-        mapped.len()
-    };
-    if len == 0 {
+    if chunk_size == 0 || chunk_size > mapped.len() {
         return None;
     }
+    let len = chunk_size;
     // PipeWire recycles the mapping, so the copy is required; the allocation
     // is reused from the bridge pool.
     let mut data = sink.take_buffer();
@@ -570,6 +810,132 @@ mod tests {
         // The serialized bytes must re-parse as a valid object pod.
         let pod = params[0].as_ref();
         assert!(pod.is_object());
+    }
+
+    fn parse_object(pod: &OwnedPod) -> spa::pod::Object {
+        use spa::pod::deserialize::PodDeserializer;
+        match PodDeserializer::deserialize_from::<Value>(&pod.0).expect("pod deserializes").1 {
+            Value::Object(object) => object,
+            other => panic!("expected an object pod, got {other:?}"),
+        }
+    }
+
+    fn property(object: &spa::pod::Object, key: u32) -> Option<&Property> {
+        object.properties.iter().find(|p| p.key == key)
+    }
+
+    #[test]
+    fn exact_size_offers_a_fixed_rectangle_and_max_framerate() {
+        use spa::param::format::FormatProperties as Fp;
+        use spa::utils::{ChoiceEnum, Fraction, Rectangle};
+
+        let prefs = FormatPrefs {
+            resolution: Resolution::new(1280, 720),
+            framerate: 60,
+            exact_size: true,
+            ..FormatPrefs::default()
+        };
+        let params = build_format_params(&prefs).unwrap();
+        assert_eq!(params.len(), 1);
+        let object = parse_object(&params[0]);
+        assert!(matches!(
+            property(&object, Fp::VideoSize.as_raw()).unwrap().value,
+            Value::Rectangle(Rectangle { width: 1280, height: 720 })
+        ));
+        match &property(&object, Fp::VideoMaxFramerate.as_raw()).unwrap().value {
+            Value::Choice(spa::pod::ChoiceValue::Fraction(spa::utils::Choice(_, ChoiceEnum::Range { default, min, max }))) => {
+                assert_eq!(*default, Fraction { num: 60, denom: 1 });
+                assert_eq!(*min, Fraction { num: 1, denom: 1 });
+                assert_eq!(*max, Fraction { num: 60, denom: 1 });
+            }
+            other => panic!("unexpected maxFramerate {other:?}"),
+        }
+
+        let ranged = FormatPrefs { exact_size: false, ..prefs };
+        let object = parse_object(&build_format_params(&ranged).unwrap()[0]);
+        assert!(matches!(
+            property(&object, Fp::VideoSize.as_raw()).unwrap().value,
+            Value::Choice(spa::pod::ChoiceValue::Rectangle(_))
+        ));
+        assert!(property(&object, Fp::VideoMaxFramerate.as_raw()).is_some());
+    }
+
+    #[test]
+    fn dmabuf_modifiers_precede_the_shm_fallback() {
+        use spa::param::format::FormatProperties as Fp;
+        use spa::utils::ChoiceEnum;
+
+        let prefs = FormatPrefs {
+            formats: vec![PixelFormat::Bgra8],
+            dmabuf_modifiers: vec![0x0100_0000_0000_0001, 0],
+            ..FormatPrefs::default()
+        };
+        let params = build_format_params(&prefs).unwrap();
+        // BGRx and BGRA each get a DMA-BUF object, then one SHM object.
+        assert_eq!(params.len(), 3);
+        for dmabuf in &params[..2] {
+            let object = parse_object(dmabuf);
+            let modifier = property(&object, Fp::VideoModifier.as_raw()).expect("modifier property");
+            assert!(modifier.flags.contains(PropertyFlags::MANDATORY));
+            assert!(modifier.flags.contains(dont_fixate()));
+            match &modifier.value {
+                Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(_, ChoiceEnum::Enum { default, alternatives }))) => {
+                    assert_eq!(*default, 0x0100_0000_0000_0001);
+                    assert_eq!(alternatives, &vec![0x0100_0000_0000_0001, 0]);
+                }
+                other => panic!("unexpected modifier value {other:?}"),
+            }
+            assert!(matches!(
+                property(&object, Fp::VideoFormat.as_raw()).unwrap().value,
+                Value::Id(_)
+            ));
+        }
+        let shm = parse_object(&params[2]);
+        assert!(property(&shm, Fp::VideoModifier.as_raw()).is_none());
+    }
+
+    #[test]
+    fn cursor_meta_param_requests_the_cursor_meta() {
+        let object = parse_object(&build_cursor_meta_param().unwrap());
+        assert_eq!(object.type_, SpaTypes::ObjectParamMeta.as_raw());
+        assert!(matches!(
+            property(&object, spa::sys::SPA_PARAM_META_type).unwrap().value,
+            Value::Id(Id(id)) if id == spa::sys::SPA_META_Cursor
+        ));
+        assert!(matches!(
+            property(&object, spa::sys::SPA_PARAM_META_size).unwrap().value,
+            Value::Int(CURSOR_META_SIZE)
+        ));
+        let all = build_stream_params(&FormatPrefs::default()).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn metadata_only_chunks_are_not_frames() {
+        let corrupted = spa::sys::SPA_CHUNK_FLAG_CORRUPTED as i32;
+        assert!(chunk_has_frame(1920 * 1080 * 4, 0));
+        assert!(!chunk_has_frame(0, 0));
+        assert!(!chunk_has_frame(0, corrupted));
+        assert!(!chunk_has_frame(4096, corrupted));
+    }
+
+    #[test]
+    fn cursor_updates_are_forwarded_only_when_changed() {
+        let at = |x, y| CursorMetadata { position: Some((x, y)), hotspot: (0, 0), bitmap: None };
+        assert!(cursor_changed(None, &at(1, 1)));
+        assert!(!cursor_changed(Some(&at(1, 1)), &at(1, 1)));
+        assert!(cursor_changed(Some(&at(1, 1)), &at(2, 1)));
+        assert!(cursor_changed(Some(&at(1, 1)), &CursorMetadata::hidden()));
+        assert!(!cursor_changed(Some(&CursorMetadata::hidden()), &CursorMetadata::hidden()));
+        let mut shaped = at(1, 1);
+        shaped.bitmap = Some(flux_core::cursor::CursorBitmap {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: flux_core::cursor::CURSOR_FORMAT_RGBA8888,
+            pixels: vec![0; 4],
+        });
+        assert!(cursor_changed(Some(&at(1, 1)), &shaped));
     }
 
     #[test]

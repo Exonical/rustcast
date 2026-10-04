@@ -6,6 +6,7 @@ env_of_init() { tr '\0' '\n' < /proc/1/environ; }
 get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
 {
   echo "FLUX_DISPLAY_SIZE=$(get FLUX_DISPLAY_SIZE | grep . || echo 1920x1080)"
+  echo "FLUX_DISPLAY_REFRESH=$(get FLUX_DISPLAY_REFRESH | grep . || echo 60)"
   echo "FLUX_RELAY_URL=$(get FLUX_RELAY_URL | grep . || echo http://127.0.0.1:8080)"
   echo "FLUX_ADVERTISE_HOST=$(get FLUX_ADVERTISE_HOST | grep . || echo 127.0.0.1)"
   echo "RUST_LOG=$(get RUST_LOG | grep . || echo info)"

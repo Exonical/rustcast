@@ -28,10 +28,18 @@ ws.onmessage = async evt => {
     await pc.addIceCandidate(data);
   }
 };
-setTimeout(async () => {
+async function sample(tag) {
   const stats = await pc.getStats();
-  stats.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') log.push(`bytes=${s.bytesReceived} framesDecoded=${s.framesDecoded}`); });
+  stats.forEach(s => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') {
+      log.push(`${tag} bytes=${s.bytesReceived} packets=${s.packetsReceived} lost=${s.packetsLost} framesDecoded=${s.framesDecoded} framesDropped=${s.framesDropped} pli=${s.pliCount} nack=${s.nackCount} size=${s.frameWidth}x${s.frameHeight}`);
+    }
+  });
+}
+setTimeout(() => sample('t5'), 6000);
+setTimeout(async () => {
+  await sample('t10');
   out.textContent = log.join('\n');
   document.title = 'done';
-}, 10000);
+}, 12000);
 </script>

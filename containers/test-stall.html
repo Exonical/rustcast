@@ -12,11 +12,17 @@
 // desktop away from the cursor) and receiver stats. Query parameters:
 //   phases=idle:15,mouse:15,...   region=x0,y0,x1,y1 (normalized)
 //   moveHz=raf|<n>                snapshot=1 (emit one full frame as PNG)
+//   width=<w>&height=<h>          ask the host for that mode in the offer
+// Per phase it also counts relay "cursor" messages (and those carrying a
+// bitmap), records the last cursor position, the video size at phase end and
+// any "resolution-status" messages received.
 const params = new URLSearchParams(location.search);
 const PHASES = (params.get('phases') || 'idle:15,mouse:15,idle:15,mouse:15,idle:10')
   .split(',').map(p => { const [name, s] = p.split(':'); return { name, ms: Number(s) * 1000 }; });
 const REGION = (params.get('region') || '0.55,0.55,0.80,0.75').split(',').map(Number);
 const MOVE_HZ = params.get('moveHz') || 'raf';
+const WANT_W = Number(params.get('width')) || 0;
+const WANT_H = Number(params.get('height')) || 0;
 const out = document.getElementById('out');
 const video = document.getElementById('v');
 const canvas = document.getElementById('c');
@@ -89,7 +95,8 @@ const COUNTERS = ['framesReceived', 'framesDecoded', 'framesDropped', 'keyFrames
 
 function startPhase(spec) {
   phase = { name: spec.name, ms: spec.ms, presentedIntervals: [], contentIntervals: [], rtpDeltas: [], recvDeltas: [],
-    lastFrame: null, lastHash: null, lastChange: null, skippedPresentations: 0, movesSent: 0, started: performance.now() };
+    lastFrame: null, lastHash: null, lastChange: null, skippedPresentations: 0, movesSent: 0, started: performance.now(),
+    cursorMsgs: 0, cursorBitmaps: 0, lastCursor: null, resolutionStatuses: [] };
 }
 
 async function finishPhase(startStats) {
@@ -107,6 +114,8 @@ async function finishPhase(startStats) {
     frozenMsTotal: Math.round(frozen.reduce((a, b) => a + b, 0)), skippedPresentations: p.skippedPresentations,
     jitterBufferMsPerFrame: delta.jitterBufferEmittedCount ? +(delta.jitterBufferDelay / delta.jitterBufferEmittedCount * 1000).toFixed(1) : null,
     stats: delta,
+    cursorMsgs: p.cursorMsgs, cursorPerSec: +(p.cursorMsgs / secs).toFixed(1), cursorBitmaps: p.cursorBitmaps, lastCursor: p.lastCursor,
+    videoSize: `${video.videoWidth}x${video.videoHeight}`, resolutionStatuses: p.resolutionStatuses,
   });
 }
 
@@ -171,14 +180,25 @@ fetch('http://localhost:8080/api/machines').then(r => r.json()).then(machines =>
   ws.onopen = async () => {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    ws.send(JSON.stringify({ type: 'offer', data: { sd: offer.sdp, ...(machine ? { machine_id: machine.id } : {}) } }));
+    ws.send(JSON.stringify({ type: 'offer', data: { sd: offer.sdp, ...(machine ? { machine_id: machine.id } : {}), ...(WANT_W && WANT_H ? { width: WANT_W, height: WANT_H } : {}) } }));
   };
   ws.onmessage = async evt => {
     const msg = JSON.parse(evt.data);
     const data = typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data;
     if (msg.type === 'answer') await pc.setRemoteDescription({ type: 'answer', sdp: data.sd });
     else if (msg.type === 'new-ice-candidate' && data.candidate) await pc.addIceCandidate(data);
-    else if (msg.type === 'error') result.events.push(`error=${JSON.stringify(data)}`);
+    else if (msg.type === 'cursor') {
+      result.cursorTotal = (result.cursorTotal || 0) + 1;
+      if (phase) {
+        phase.cursorMsgs++;
+        if (data && data.bitmap) phase.cursorBitmaps++;
+        if (data && data.position) phase.lastCursor = data.position;
+      }
+    } else if (msg.type === 'resolution-status') {
+      const entry = { at: new Date().toISOString(), size: `${video.videoWidth}x${video.videoHeight}`, ...data };
+      result.events.push(`resolution-status=${JSON.stringify(entry)}`);
+      if (phase) phase.resolutionStatuses.push(entry);
+    } else if (msg.type === 'error') result.events.push(`error=${JSON.stringify(data)}`);
   };
   run();
 });

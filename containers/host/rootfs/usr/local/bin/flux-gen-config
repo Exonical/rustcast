@@ -6,8 +6,16 @@ mkdir -p "$(dirname "$cfg")"
 flux-server --generate-config -c "$cfg" >/dev/null 2>&1
 sed -i '/^\[relay\]/,$d' "$cfg"
 sed -i 's/^bind_address = .*/bind_address = "0.0.0.0"/' "$cfg"
+size="${FLUX_DISPLAY_SIZE:-1920x1080}"
+width="${size%%x*}"
+height="${size##*x}"
 cat >> "$cfg" <<EOF
 [relay]
 base_url = "${FLUX_RELAY_URL}"
 advertise_host = "${FLUX_ADVERTISE_HOST}"
+
+[video.virtual_display]
+width = ${width}
+height = ${height}
+refresh_hz = ${FLUX_DISPLAY_REFRESH:-60}
 EOF
