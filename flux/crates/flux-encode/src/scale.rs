@@ -95,27 +95,34 @@ pub fn downscale_frame(frame: &CapturedFrame, target: Resolution) -> Result<Capt
         })
         .collect();
 
-    let mut out = vec![0u8; dw * dh * 4];
-    for dy in 0..dh {
+    // Separable filter: interpolate each needed source row horizontally once
+    // (exact in u16), then blend two such rows vertically per output row.
+    // Consecutive output rows usually share a source row, so the horizontal
+    // pass for `sy + 1` is reused as the next row's `sy`.
+    let row_len = dw * 4;
+    let mut out = vec![0u8; row_len * dh];
+    let mut top = vec![0u16; row_len];
+    let mut bot = vec![0u16; row_len];
+    let (mut top_row, mut bot_row) = (usize::MAX, usize::MAX);
+    let src_row = |y: usize| &frame.data[y * stride..y * stride + sw * 4];
+    for (dy, dst) in out.chunks_exact_mut(row_len).enumerate() {
         let fy = dy as u64 * y_ratio as u64;
         let sy = ((fy >> FP_BITS) as usize).min(sh - 2);
         let wy = (fy & (FP_ONE as u64 - 1)) as u32;
-        let row0 = &frame.data[sy * stride..sy * stride + sw * 4];
-        let row1 = &frame.data[(sy + 1) * stride..(sy + 1) * stride + sw * 4];
-        let dst = &mut out[dy * dw * 4..(dy + 1) * dw * 4];
-        for (dx, &(sx, wx)) in xs.iter().enumerate() {
-            let o = sx * 4;
-            for c in 0..4 {
-                let p00 = row0[o + c] as u32;
-                let p01 = row0[o + 4 + c] as u32;
-                let p10 = row1[o + c] as u32;
-                let p11 = row1[o + 4 + c] as u32;
-                let top = p00 * (FP_ONE - wx) + p01 * wx;
-                let bot = p10 * (FP_ONE - wx) + p11 * wx;
-                let val = (top * (FP_ONE - wy) + bot * wy) >> (2 * FP_BITS);
-                dst[dx * 4 + c] = val as u8;
+        if top_row != sy {
+            if bot_row == sy {
+                std::mem::swap(&mut top, &mut bot);
+                bot_row = usize::MAX;
+            } else {
+                interpolate_row(src_row(sy), &xs, &mut top);
             }
+            top_row = sy;
         }
+        if bot_row != sy + 1 {
+            interpolate_row(src_row(sy + 1), &xs, &mut bot);
+            bot_row = sy + 1;
+        }
+        blend_rows(&top, &bot, wy, dst);
     }
 
     Ok(CapturedFrame {
@@ -127,6 +134,52 @@ pub fn downscale_frame(frame: &CapturedFrame, target: Resolution) -> Result<Capt
         data: out,
         gpu_handle: None,
     })
+}
+
+/// Horizontal bilinear pass over one source row into `FP_BITS`-scaled
+/// intermediates. `p0 * (FP_ONE - wx) + p1 * wx <= 255 * FP_ONE` fits in u16.
+fn interpolate_row(src: &[u8], xs: &[(usize, u32)], dst: &mut [u16]) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline target features.
+    unsafe {
+        interpolate_row_sse2(src, xs, dst)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    interpolate_row_scalar(src, xs, dst)
+}
+
+/// Weights all 4 channels of a source pixel pair with one 8-lane u16 multiply.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+fn interpolate_row_sse2(src: &[u8], xs: &[(usize, u32)], dst: &mut [u16]) {
+    use std::arch::x86_64::*;
+    for (d, &(sx, wx)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(xs) {
+        let o = sx * 4;
+        let p: &[u8; 8] = src[o..o + 8].try_into().expect("8-byte pixel pair");
+        let (w0, w1) = ((FP_ONE - wx) as i16, wx as i16);
+        let v = _mm_unpacklo_epi8(_mm_cvtsi64_si128(i64::from_le_bytes(*p)), _mm_setzero_si128());
+        let m = _mm_mullo_epi16(v, _mm_set_epi16(w1, w1, w1, w1, w0, w0, w0, w0));
+        let r = _mm_cvtsi128_si64(_mm_add_epi16(m, _mm_srli_si128::<8>(m))) as u64;
+        *d = [r as u16, (r >> 16) as u16, (r >> 32) as u16, (r >> 48) as u16];
+    }
+}
+
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn interpolate_row_scalar(src: &[u8], xs: &[(usize, u32)], dst: &mut [u16]) {
+    for (d, &(sx, wx)) in dst.as_chunks_mut::<4>().0.iter_mut().zip(xs) {
+        let o = sx * 4;
+        let p: &[u8; 8] = src[o..o + 8].try_into().expect("8-byte pixel pair");
+        let (w0, w1) = ((FP_ONE - wx) as u16, wx as u16);
+        *d = std::array::from_fn(|c| p[c] as u16 * w0 + p[c + 4] as u16 * w1);
+    }
+}
+
+/// Vertical bilinear pass blending two horizontally-interpolated rows.
+fn blend_rows(top: &[u16], bot: &[u16], wy: u32, dst: &mut [u8]) {
+    let (w0, w1) = (FP_ONE - wy, wy);
+    for ((d, &t), &b) in dst.iter_mut().zip(top).zip(bot) {
+        *d = ((t as u32 * w0 + b as u32 * w1) >> (2 * FP_BITS)) as u8;
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +245,83 @@ mod tests {
     fn downscale_rejects_upscale() {
         let frame = solid_frame(32, 32, [0; 4]);
         assert!(downscale_frame(&frame, Resolution::new(64, 64)).is_err());
+    }
+
+    /// Original per-pixel scalar bilinear, kept as the bit-exact oracle.
+    fn reference_downscale(frame: &CapturedFrame, target: Resolution) -> Vec<u8> {
+        let (sw, sh) = (frame.resolution.width as usize, frame.resolution.height as usize);
+        let (dw, dh) = (target.width as usize, target.height as usize);
+        let stride = frame.stride as usize;
+        let x_ratio = ((sw - 1) as u64 * FP_ONE as u64 / dw as u64) as u32;
+        let y_ratio = ((sh - 1) as u64 * FP_ONE as u64 / dh as u64) as u32;
+        let mut out = vec![0u8; dw * dh * 4];
+        for dy in 0..dh {
+            let fy = dy as u64 * y_ratio as u64;
+            let sy = ((fy >> FP_BITS) as usize).min(sh - 2);
+            let wy = (fy & (FP_ONE as u64 - 1)) as u32;
+            for dx in 0..dw {
+                let fx = dx as u64 * x_ratio as u64;
+                let sx = ((fx >> FP_BITS) as usize).min(sw - 2);
+                let wx = (fx & (FP_ONE as u64 - 1)) as u32;
+                for c in 0..4 {
+                    let px = |y: usize, x: usize| frame.data[y * stride + x * 4 + c] as u32;
+                    let top = px(sy, sx) * (FP_ONE - wx) + px(sy, sx + 1) * wx;
+                    let bot = px(sy + 1, sx) * (FP_ONE - wx) + px(sy + 1, sx + 1) * wx;
+                    out[(dy * dw + dx) * 4 + c] = ((top * (FP_ONE - wy) + bot * wy) >> (2 * FP_BITS)) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    fn noise_frame(w: u32, h: u32, stride: u32, seed: u64) -> CapturedFrame {
+        let mut state = seed | 1;
+        let data = (0..stride as usize * h as usize)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        CapturedFrame {
+            sequence: 0,
+            timestamp: std::time::Instant::now(),
+            format: PixelFormat::Bgra8,
+            resolution: Resolution::new(w, h),
+            stride,
+            data,
+            gpu_handle: None,
+        }
+    }
+
+    #[test]
+    fn downscale_matches_reference_bilinear() {
+        let cases = [
+            ((5120, 2160, 5120 * 4), (4096, 1728)),
+            ((64, 64, 64 * 4 + 32), (31, 17)),
+            ((33, 17, 33 * 4), (20, 9)),
+            ((100, 50, 100 * 4), (100, 25)),
+            ((100, 50, 104 * 4), (51, 50)),
+            ((2, 4, 2 * 4), (2, 2)),
+        ];
+        for (i, ((sw, sh, stride), (dw, dh))) in cases.into_iter().enumerate() {
+            let frame = noise_frame(sw, sh, stride, i as u64 + 1);
+            let target = Resolution::new(dw, dh);
+            let out = downscale_frame(&frame, target).unwrap();
+            assert_eq!(out.data, reference_downscale(&frame, target), "case {i}");
+        }
+    }
+
+    #[test]
+    fn interpolate_row_kernels_agree() {
+        let frame = noise_frame(257, 1, 257 * 4, 9);
+        let xs: Vec<(usize, u32)> = (0..200)
+            .map(|dx| ((dx * 5 / 4).min(255), (dx * 37 % 256) as u32))
+            .collect();
+        let (mut a, mut b) = (vec![0u16; 800], vec![0u16; 800]);
+        interpolate_row(&frame.data, &xs, &mut a);
+        interpolate_row_scalar(&frame.data, &xs, &mut b);
+        assert_eq!(a, b);
     }
 }
