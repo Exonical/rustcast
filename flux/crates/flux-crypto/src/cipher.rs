@@ -65,14 +65,14 @@ impl AesGcmCipher {
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&nonce_val.to_be_bytes());
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = match &self.inner {
             CipherInner::Aes128(cipher) => cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| FluxError::Crypto(format!("AES-128 encrypt error: {e}")))?,
             CipherInner::Aes256(cipher) => cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| FluxError::Crypto(format!("AES-256 encrypt error: {e}")))?,
         };
 
@@ -81,26 +81,26 @@ impl AesGcmCipher {
 
     /// Encrypt with an explicit nonce (12 bytes).
     pub fn encrypt_with_nonce(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = Nonce::from(*nonce);
         match &self.inner {
             CipherInner::Aes128(cipher) => cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| FluxError::Crypto(format!("encrypt error: {e}"))),
             CipherInner::Aes256(cipher) => cipher
-                .encrypt(nonce, plaintext)
+                .encrypt(&nonce, plaintext)
                 .map_err(|e| FluxError::Crypto(format!("encrypt error: {e}"))),
         }
     }
 
     /// Decrypt ciphertext with the given nonce (12 bytes).
     pub fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = Nonce::from(*nonce);
         match &self.inner {
             CipherInner::Aes128(cipher) => cipher
-                .decrypt(nonce, ciphertext)
+                .decrypt(&nonce, ciphertext)
                 .map_err(|e| FluxError::Crypto(format!("decrypt error: {e}"))),
             CipherInner::Aes256(cipher) => cipher
-                .decrypt(nonce, ciphertext)
+                .decrypt(&nonce, ciphertext)
                 .map_err(|e| FluxError::Crypto(format!("decrypt error: {e}"))),
         }
     }

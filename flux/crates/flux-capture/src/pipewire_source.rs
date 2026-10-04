@@ -163,19 +163,19 @@ fn run_stream(
 ) -> Result<()> {
     pw::init();
 
-    let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| pw_err("create main loop", e))?;
-    let context = pw::context::Context::new(&mainloop).map_err(|e| pw_err("create context", e))?;
+    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| pw_err("create main loop", e))?;
+    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| pw_err("create context", e))?;
     let core = match fd {
         Some(fd) => context
-            .connect_fd(fd, None)
+            .connect_fd_rc(fd, None)
             .map_err(|e| pw_err("connect to PipeWire fd", e))?,
         None => context
-            .connect(None)
+            .connect_rc(None)
             .map_err(|e| pw_err("connect to local PipeWire daemon", e))?,
     };
 
-    let stream = pw::stream::Stream::new(
-        &core,
+    let stream = pw::stream::StreamRc::new(
+        core.clone(),
         "flux-capture",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",

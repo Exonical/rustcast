@@ -20,11 +20,10 @@
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
-use ashpd::desktop::screencast::{CursorMode as XdpCursorMode, Screencast, SourceType, Stream};
+use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
+use ashpd::desktop::screencast::{CursorMode as XdpCursorMode, Screencast, SelectSourcesOptions, SourceType, Stream};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
-use ashpd::WindowIdentifier;
 use async_trait::async_trait;
 use flux_core::error::{FluxError, Result};
 
@@ -41,10 +40,10 @@ pub struct XdgPortalSession {
     restore_token: Option<String>,
     // Proxies / session handles kept alive for the session's duration. They
     // share the process-wide zbus connection (hence `'static`).
-    screencast: Option<Screencast<'static>>,
-    remote_desktop: Option<RemoteDesktop<'static>>,
-    sc_session: Option<Session<'static, Screencast<'static>>>,
-    rd_session: Option<Session<'static, RemoteDesktop<'static>>>,
+    screencast: Option<Screencast>,
+    remote_desktop: Option<RemoteDesktop>,
+    sc_session: Option<Session<Screencast>>,
+    rd_session: Option<Session<RemoteDesktop>>,
     /// Owned PipeWire fd from `OpenPipeWireRemote`; `PortalGrant` borrows it.
     pipewire_fd: Option<OwnedFd>,
 }
@@ -60,7 +59,7 @@ impl XdgPortalSession {
     async fn negotiate_with_input(&mut self, opts: &PortalOptions) -> Result<PortalGrant> {
         let remote_desktop = RemoteDesktop::new().await.map_err(portal_err)?;
         let screencast = Screencast::new().await.map_err(portal_err)?;
-        let session = remote_desktop.create_session().await.map_err(portal_err)?;
+        let session = remote_desktop.create_session(Default::default()).await.map_err(portal_err)?;
 
         // RemoteDesktop sessions cannot persist (the portal rejects a restore
         // token / persist mode with `InvalidArgument: Remote desktop sessions
@@ -68,9 +67,9 @@ impl XdgPortalSession {
         remote_desktop
             .select_devices(
                 &session,
-                DeviceType::Keyboard | DeviceType::Pointer,
-                None,
-                PersistMode::DoNot,
+                SelectDevicesOptions::default()
+                    .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                    .set_persist_mode(PersistMode::DoNot),
             )
             .await
             .map_err(portal_err)?;
@@ -78,31 +77,28 @@ impl XdgPortalSession {
         screencast
             .select_sources(
                 &session,
-                to_xdp_cursor_mode(opts.cursor_mode),
-                to_source_types(&opts.source_kinds),
-                opts.multiple,
-                None,
-                PersistMode::DoNot,
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(to_xdp_cursor_mode(opts.cursor_mode))
+                    .set_sources(to_source_types(&opts.source_kinds))
+                    .set_multiple(opts.multiple)
+                    .set_persist_mode(PersistMode::DoNot),
             )
             .await
             .map_err(portal_err)?;
 
         let response = remote_desktop
-            .start(&session, &WindowIdentifier::default())
+            .start(&session, None, Default::default())
             .await
             .map_err(portal_err)?
             .response()
             .map_err(portal_err)?;
 
-        let xdp_streams = response
-            .streams()
-            .ok_or_else(|| FluxError::Capture("portal granted no screen-cast streams".into()))?;
-        let streams = map_streams(xdp_streams, &opts.source_kinds);
+        let streams = map_streams(response.streams(), &opts.source_kinds);
         if streams.is_empty() {
             return Err(FluxError::Capture("portal granted an empty stream set".into()));
         }
 
-        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session).await.map_err(portal_err)?;
+        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session, Default::default()).await.map_err(portal_err)?;
         let raw_fd = fd.as_raw_fd();
         let restore_token = response.restore_token().map(str::to_owned);
 
@@ -124,22 +120,23 @@ impl XdgPortalSession {
     /// Negotiate a ScreenCast-only session (capture, no input).
     async fn negotiate_capture_only(&mut self, opts: &PortalOptions) -> Result<PortalGrant> {
         let screencast = Screencast::new().await.map_err(portal_err)?;
-        let session = screencast.create_session().await.map_err(portal_err)?;
+        let session = screencast.create_session(Default::default()).await.map_err(portal_err)?;
 
         screencast
             .select_sources(
                 &session,
-                to_xdp_cursor_mode(opts.cursor_mode),
-                to_source_types(&opts.source_kinds),
-                opts.multiple,
-                opts.restore_token.as_deref(),
-                persist_mode(opts),
+                SelectSourcesOptions::default()
+                    .set_cursor_mode(to_xdp_cursor_mode(opts.cursor_mode))
+                    .set_sources(to_source_types(&opts.source_kinds))
+                    .set_multiple(opts.multiple)
+                    .set_restore_token(opts.restore_token.as_deref())
+                    .set_persist_mode(persist_mode(opts)),
             )
             .await
             .map_err(portal_err)?;
 
         let response = screencast
-            .start(&session, &WindowIdentifier::default())
+            .start(&session, None, Default::default())
             .await
             .map_err(portal_err)?
             .response()
@@ -150,7 +147,7 @@ impl XdgPortalSession {
             return Err(FluxError::Capture("portal granted an empty stream set".into()));
         }
 
-        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session).await.map_err(portal_err)?;
+        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session, Default::default()).await.map_err(portal_err)?;
         let raw_fd = fd.as_raw_fd();
         let restore_token = response.restore_token().map(str::to_owned);
 

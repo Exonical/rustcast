@@ -33,13 +33,13 @@ capture-mutter = ["capture-pipewire", "dep:zbus", "dep:futures"]
 [target.'cfg(target_os = "linux")'.dependencies]
 # XDG desktop portal (ScreenCast + RemoteDesktop) bindings over zbus. Use the
 # tokio reactor to match the workspace async runtime.
-ashpd = { version = "0.9", default-features = false, features = ["tokio"], optional = true }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"], optional = true }
 # Direct D-Bus access to Mutter's ScreenCast / RemoteDesktop / DisplayConfig.
-zbus = { version = "4.4", default-features = false, features = ["tokio"], optional = true }
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
 futures = { workspace = true, optional = true }
 # Official PipeWire / SPA Rust bindings for the live capture stream.
-pipewire = { version = "0.8", optional = true }
-libspa = { version = "0.8", optional = true }
+pipewire = { version = "0.10", optional = true }
+libspa = { version = "0.10", optional = true }
 # DRM FourCC + modifier constants for DMA-BUF format negotiation.
 drm-fourcc = { version = "2.2", optional = true }
 

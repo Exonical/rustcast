@@ -30,9 +30,9 @@ encoder-ffmpeg = ["dep:ffmpeg-next"]
 cros-codecs = { version = "0.0.5", default-features = false, features = ["vaapi"], optional = true }
 # Safe libva wrappers (Display / Surface / Image) for surface upload.
 libva = { package = "cros-libva", version = "0.0.7", optional = true }
-# libavcodec/libavutil bindings for the FFmpeg VA-API encoder backend. Pinned to
-# the 7.x line, which builds against the system FFmpeg (>= 4.4) via bindgen.
-ffmpeg-next = { version = "7.1", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+# libavcodec/libavutil bindings for the FFmpeg VA-API encoder backend. Builds
+# against the system FFmpeg via bindgen (verified with Rocky 10's FFmpeg 7.1).
+ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

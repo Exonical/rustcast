@@ -517,7 +517,7 @@ mod tests {
         let gone = zbus::Error::MethodError(
             zbus::names::OwnedErrorName::try_from("org.freedesktop.DBus.Error.UnknownMethod").unwrap(),
             None,
-            zbus::message::Message::method("/", "Ping")
+            zbus::message::Message::method_call("/", "Ping")
                 .unwrap()
                 .build(&())
                 .unwrap(),

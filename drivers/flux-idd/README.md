@@ -34,7 +34,7 @@ Prerequisites:
    `winget install -i LLVM.LLVM --version 17.0.6`
    If a newer LLVM is also installed, point bindgen at 17 explicitly:
    `$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"` (the 17.0.6 install path)
-4. Rustup with the pinned **1.97.1** toolchain (the repository's
+4. Rustup with the pinned **1.98.1** toolchain (the repository's
    `rust-toolchain.toml` installs/selects it, plus `rustfmt` and `clippy`)
 5. `cargo install cargo-make --no-default-features --features tls-native`
 

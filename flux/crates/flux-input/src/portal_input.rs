@@ -22,9 +22,8 @@
 
 use std::thread::{self, JoinHandle};
 
-use ashpd::desktop::remote_desktop::{DeviceType, KeyState, RemoteDesktop};
+use ashpd::desktop::remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions};
 use ashpd::desktop::{PersistMode, Session};
-use ashpd::WindowIdentifier;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use flux_core::error::{FluxError, Result};
@@ -187,22 +186,22 @@ fn run_session_thread(rx: UnboundedReceiver<Cmd>, ready_tx: std::sync::mpsc::Sen
 }
 
 /// Run `CreateSession` → `SelectDevices` → `Start` for keyboard + pointer.
-async fn negotiate() -> Result<(RemoteDesktop<'static>, Session<'static, RemoteDesktop<'static>>)> {
+async fn negotiate() -> Result<(RemoteDesktop, Session<RemoteDesktop>)> {
     let remote_desktop = RemoteDesktop::new().await.map_err(input_err)?;
-    let session = remote_desktop.create_session().await.map_err(input_err)?;
+    let session = remote_desktop.create_session(Default::default()).await.map_err(input_err)?;
 
     remote_desktop
         .select_devices(
             &session,
-            DeviceType::Keyboard | DeviceType::Pointer,
-            None,
-            PersistMode::DoNot,
+            SelectDevicesOptions::default()
+                .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                .set_persist_mode(PersistMode::DoNot),
         )
         .await
         .map_err(input_err)?;
 
     remote_desktop
-        .start(&session, &WindowIdentifier::default())
+        .start(&session, None, Default::default())
         .await
         .map_err(input_err)?
         .response()
@@ -213,28 +212,35 @@ async fn negotiate() -> Result<(RemoteDesktop<'static>, Session<'static, RemoteD
 
 /// Drain the command channel, issuing the matching portal notify call for each.
 async fn forward_commands(
-    remote_desktop: &RemoteDesktop<'_>,
-    session: &Session<'_, RemoteDesktop<'_>>,
+    remote_desktop: &RemoteDesktop,
+    session: &Session<RemoteDesktop>,
     mut rx: UnboundedReceiver<Cmd>,
 ) {
     while let Some(cmd) = rx.recv().await {
         let result = match cmd {
-            Cmd::Motion { dx, dy } => remote_desktop.notify_pointer_motion(session, dx, dy).await,
+            Cmd::Motion { dx, dy } => remote_desktop.notify_pointer_motion(session, dx, dy, Default::default()).await,
             Cmd::Button { button, down } => {
                 remote_desktop
-                    .notify_pointer_button(session, button, key_state(down))
+                    .notify_pointer_button(session, button, key_state(down), Default::default())
                     .await
             }
             // The portal spec expects the deltas to be 0 when `finish` is set,
             // so deliver the motion with `finish = false` and then a terminating
             // `(0, 0, finish = true)` to close the scroll sequence.
-            Cmd::Axis { dx, dy } => match remote_desktop.notify_pointer_axis(session, dx, dy, false).await {
-                Ok(()) => remote_desktop.notify_pointer_axis(session, 0.0, 0.0, true).await,
+            Cmd::Axis { dx, dy } => match remote_desktop
+                .notify_pointer_axis(session, dx, dy, NotifyPointerAxisOptions::default().set_finish(false))
+                .await
+            {
+                Ok(()) => {
+                    remote_desktop
+                        .notify_pointer_axis(session, 0.0, 0.0, NotifyPointerAxisOptions::default().set_finish(true))
+                        .await
+                }
                 Err(e) => Err(e),
             },
             Cmd::Key { keycode, down } => {
                 remote_desktop
-                    .notify_keyboard_keycode(session, keycode, key_state(down))
+                    .notify_keyboard_keycode(session, keycode, key_state(down), Default::default())
                     .await
             }
         };

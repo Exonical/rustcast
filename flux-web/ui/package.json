@@ -7,25 +7,25 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "trap 'rm -rf .test-build' EXIT; tsc --target ES2020 --module commonjs --moduleResolution node --esModuleInterop --outDir .test-build lib/cursor-overlay.ts lib/cursor-overlay.test.ts lib/local-controls.ts lib/local-controls.test.ts lib/protocol.ts lib/protocol.test.ts && node --test .test-build/cursor-overlay.test.js .test-build/local-controls.test.js .test-build/protocol.test.js",
-    "test:junit": "mkdir -p ../../target/junit && trap 'rm -rf .test-build' EXIT; tsc --target ES2020 --module commonjs --moduleResolution node --esModuleInterop --outDir .test-build lib/cursor-overlay.ts lib/cursor-overlay.test.ts lib/local-controls.ts lib/local-controls.test.ts lib/protocol.ts lib/protocol.test.ts && node --test --test-reporter=junit .test-build/cursor-overlay.test.js .test-build/local-controls.test.js .test-build/protocol.test.js > ../../target/junit/ui.xml"
+    "test": "trap 'rm -rf .test-build' EXIT; tsc --ignoreConfig --target ES2020 --module nodenext --types node --strict false --esModuleInterop --outDir .test-build lib/cursor-overlay.ts lib/cursor-overlay.test.ts lib/local-controls.ts lib/local-controls.test.ts lib/protocol.ts lib/protocol.test.ts && node --test .test-build/cursor-overlay.test.js .test-build/local-controls.test.js .test-build/protocol.test.js",
+    "test:junit": "mkdir -p ../../target/junit && trap 'rm -rf .test-build' EXIT; tsc --ignoreConfig --target ES2020 --module nodenext --types node --strict false --esModuleInterop --outDir .test-build lib/cursor-overlay.ts lib/cursor-overlay.test.ts lib/local-controls.ts lib/local-controls.test.ts lib/protocol.ts lib/protocol.test.ts && node --test --test-reporter=junit .test-build/cursor-overlay.test.js .test-build/local-controls.test.js .test-build/protocol.test.js > ../../target/junit/ui.xml"
   },
   "dependencies": {
     "@radix-ui/react-separator": "^1.1.15",
     "@radix-ui/react-toggle": "^1.1.18",
     "@radix-ui/react-tooltip": "^1.2.16",
-    "next": "16.3.0",
-    "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
-    "@types/node": "^26.2.0",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.4",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "eslint": "^9.39.5",
-    "eslint-config-next": "16.3.0",
+    "eslint-config-next": "16.3.6",
     "tailwindcss": "^4.3.3",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   }
 }

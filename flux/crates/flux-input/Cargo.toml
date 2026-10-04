@@ -22,7 +22,7 @@ input-portal = ["dep:ashpd", "dep:tokio"]
 [target.'cfg(target_os = "linux")'.dependencies]
 # XDG desktop portal RemoteDesktop bindings over zbus. Tokio reactor to match
 # the workspace async runtime.
-ashpd = { version = "0.9", default-features = false, features = ["tokio"], optional = true }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop"], optional = true }
 tokio = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
