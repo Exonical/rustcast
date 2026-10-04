@@ -16,7 +16,8 @@
 //!
 //! DMA-BUF buffers are emitted zero-copy as [`GpuFrameHandle::DmaBuf`] (the
 //! per-plane fds are `dup`'d so they outlive PipeWire's buffer recycling);
-//! shared-memory buffers fall back to a CPU copy.
+//! shared-memory buffers fall back to a CPU copy into a buffer reused from the
+//! bridge's pool (see [`PipewireFrameSource::recycle_frame`]).
 
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
@@ -128,6 +129,12 @@ impl PipewireFrameSource for PipewireStreamSource {
         self.format.lock().unwrap().clone()
     }
 
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        if let Some(source) = &self.source {
+            source.recycle(frame.data);
+        }
+    }
+
     fn disconnect(&mut self) -> Result<()> {
         if let Some(handle) = self.thread.take() {
             // Best-effort: signal the loop to quit and join the thread.
@@ -224,7 +231,7 @@ fn run_stream(
             };
             let mut seq = seq_proc.lock().unwrap();
             *seq += 1;
-            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, *seq) {
+            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, *seq, &sink_proc) {
                 sink_proc.push(frame);
             }
         })
@@ -418,7 +425,12 @@ fn spa_format_to_fourcc(f: VideoFormat) -> u32 {
 }
 
 /// Build a [`CapturedFrame`] from a dequeued buffer's data planes.
-fn build_frame(datas: &mut [spa::buffer::Data], negotiated: &NegotiatedFormat, sequence: u64) -> Option<CapturedFrame> {
+fn build_frame(
+    datas: &mut [spa::buffer::Data],
+    negotiated: &NegotiatedFormat,
+    sequence: u64,
+    sink: &FrameSink,
+) -> Option<CapturedFrame> {
     if datas.is_empty() {
         return None;
     }
@@ -436,7 +448,7 @@ fn build_frame(datas: &mut [spa::buffer::Data], negotiated: &NegotiatedFormat, s
     match datas[0].type_() {
         #[cfg(unix)]
         DataType::DmaBuf => build_dmabuf_frame(datas, negotiated, base),
-        DataType::MemFd | DataType::MemPtr => build_shm_frame(datas, base),
+        DataType::MemFd | DataType::MemPtr => build_shm_frame(datas, base, sink),
         other => {
             tracing::warn!("PipeWire delivered unsupported buffer type {other:?}");
             None
@@ -479,7 +491,11 @@ fn build_dmabuf_frame(
     Some(base)
 }
 
-fn build_shm_frame(datas: &mut [spa::buffer::Data], mut base: CapturedFrame) -> Option<CapturedFrame> {
+fn build_shm_frame(
+    datas: &mut [spa::buffer::Data],
+    mut base: CapturedFrame,
+    sink: &FrameSink,
+) -> Option<CapturedFrame> {
     let chunk_size = datas[0].chunk().size() as usize;
     let mapped = datas[0].data()?;
     let len = if chunk_size > 0 && chunk_size <= mapped.len() {
@@ -490,7 +506,11 @@ fn build_shm_frame(datas: &mut [spa::buffer::Data], mut base: CapturedFrame) -> 
     if len == 0 {
         return None;
     }
-    base.data = mapped[..len].to_vec();
+    // PipeWire recycles the mapping, so the copy is required; the allocation
+    // is reused from the bridge pool.
+    let mut data = sink.take_buffer();
+    data.extend_from_slice(&mapped[..len]);
+    base.data = data;
     Some(base)
 }
 

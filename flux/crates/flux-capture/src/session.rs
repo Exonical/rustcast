@@ -189,6 +189,12 @@ pub trait PipewireFrameSource: Send {
     /// The format fixated by the stream, once known.
     fn negotiated_format(&self) -> Option<NegotiatedFormat>;
 
+    /// Return a consumed frame so its CPU buffer can be reused. Sources
+    /// without a buffer pool just drop it.
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        drop(frame);
+    }
+
     /// Disconnect and stop the underlying PipeWire loop.
     fn disconnect(&mut self) -> Result<()>;
 }
@@ -245,6 +251,10 @@ impl<S: PipewireFrameSource> CaptureSession for FrameSourceSession<S> {
             return Ok(None);
         }
         self.source.recv_frame(Duration::ZERO)
+    }
+
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        self.source.recycle_frame(frame);
     }
 
     fn stop(&mut self) -> Result<()> {

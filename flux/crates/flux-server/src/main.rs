@@ -1756,6 +1756,7 @@ fn capture_loop(
 
         let t_capture = t0.elapsed();
         if !should_encode_frame(&mut frame_pacer, t0, fps_cap) {
+            session.recycle_frame(frame);
             continue;
         }
         frame_count += 1;
@@ -1838,7 +1839,9 @@ fn capture_loop(
         // CPU fallback when GPU-side scaling isn't available: downscale the
         // frame before encoding when the encoder session is smaller.
         let frame = if frame.resolution != encode_resolution {
-            match flux_encode::scale::downscale_frame(&frame, encode_resolution) {
+            let scaled = flux_encode::scale::downscale_frame(&frame, encode_resolution);
+            session.recycle_frame(frame);
+            match scaled {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!("Frame downscale failed: {}", e);
@@ -1888,6 +1891,8 @@ fn capture_loop(
             }
         }
         let t_encode = t1.elapsed();
+        // `encode` only borrows the frame, so its buffer is free for reuse.
+        session.recycle_frame(frame);
         stage_timings.observe(t_capture, t_encode, keyframe_bytes);
 
         // Periodic performance stats (every 5 seconds)

@@ -296,6 +296,10 @@ mod real {
             Some(self.mutter.input_backend())
         }
 
+        fn recycle_frame(&mut self, frame: CapturedFrame) {
+            self.inner.recycle_frame(frame);
+        }
+
         fn stop(&mut self) -> Result<()> {
             self.inner.stop()
         }
@@ -316,6 +320,10 @@ mod real {
 
         fn try_next_frame(&mut self) -> Result<Option<CapturedFrame>> {
             self.inner.try_next_frame()
+        }
+
+        fn recycle_frame(&mut self, frame: CapturedFrame) {
+            self.inner.recycle_frame(frame);
         }
 
         fn stop(&mut self) -> Result<()> {
