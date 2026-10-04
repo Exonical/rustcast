@@ -1,7 +1,7 @@
 //! Windows Desktop Duplication API (DXGI) screen capture backend.
 //!
 //! Uses the IDXGIOutputDuplication interface to capture frames directly from
-//! the GPU. Provides both a GPU zero-copy path (shared texture handle for
+//! the GPU. Provides both a GPU zero-copy path (shared texture ring for
 //! hardware encoders) and a CPU fallback path (staging texture map/read).
 
 use flux_core::cursor::{CursorBitmap, CursorMetadata};
@@ -10,10 +10,12 @@ use flux_core::frame::{CapturedFrame, GpuDeviceHandle};
 use flux_core::types::{PixelFormat, Resolution};
 
 use crate::cursor::{convert_dxgi_pointer_shape, scale_cursor_bitmap};
+use crate::pacing::CapturePacer;
 use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -26,6 +28,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::core::Interface;
 
 const DXGI_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const SHARED_TEXTURE_COUNT: usize = 3;
 
 /// DXGI Desktop Duplication capture backend.
 pub struct DxgiCapture {
@@ -426,16 +429,21 @@ impl ScreenCapture for DxgiCapture {
     }
 }
 
+struct SharedSurface {
+    texture: ID3D11Texture2D,
+    handle: u64,
+    scaler_view: Option<ID3D11VideoProcessorOutputView>,
+}
+
 /// GPU downscaler: a D3D11 video processor that blits the desktop-sized
-/// capture into a smaller shared texture, so hardware encoders with a lower
-/// maximum coded size (e.g. 4096x4096 for H.264 on AMD VCN) can consume the
-/// frame without any CPU copy.
+/// capture into a ring of smaller shared textures, so hardware encoders with
+/// a lower maximum coded size (e.g. 4096x4096 for H.264 on AMD VCN) can consume
+/// the frame without any CPU copy.
 struct GpuScaler {
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
     enumerator: ID3D11VideoProcessorEnumerator,
-    output_view: ID3D11VideoProcessorOutputView,
     /// Lazily-created desktop-sized intermediate, used only if an input view
     /// can't be created directly on the acquired duplication texture.
     fallback: std::cell::RefCell<Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>>,
@@ -446,7 +454,6 @@ impl GpuScaler {
     fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
-        shared_texture: &ID3D11Texture2D,
         input: Resolution,
         output: Resolution,
     ) -> Result<Self> {
@@ -471,18 +478,6 @@ impl GpuScaler {
             let processor = video_device.CreateVideoProcessor(&enumerator, 0)
                 .map_err(|e| FluxError::Capture(format!("CreateVideoProcessor: {}", e)))?;
 
-            let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
-                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-                },
-            };
-            let mut output_view = None;
-            video_device.CreateVideoProcessorOutputView(shared_texture, &enumerator, &output_view_desc, Some(&mut output_view))
-                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorOutputView: {}", e)))?;
-            let output_view = output_view
-                .ok_or_else(|| FluxError::Capture("Scaler output view is null".into()))?;
-
             tracing::info!("GPU scaler created: {} → {} (D3D11 video processor)", input, output);
 
             Ok(Self {
@@ -490,18 +485,39 @@ impl GpuScaler {
                 video_context,
                 processor,
                 enumerator,
-                output_view,
                 fallback: std::cell::RefCell::new(None),
                 input,
             })
         }
     }
 
+    fn create_output_view(&self, texture: &ID3D11Texture2D) -> Result<ID3D11VideoProcessorOutputView> {
+        unsafe {
+            let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut output_view = None;
+            self.video_device
+                .CreateVideoProcessorOutputView(texture, &self.enumerator, &output_view_desc, Some(&mut output_view))
+                .map_err(|e| FluxError::Capture(format!("CreateVideoProcessorOutputView: {}", e)))?;
+            output_view.ok_or_else(|| FluxError::Capture("Scaler output view is null".into()))
+        }
+    }
+
     /// Blit the acquired desktop texture, scaled, into the shared output
-    /// texture. Prefers a zero-copy blit straight from the duplication
-    /// texture; falls back to copying through a desktop-sized intermediate
-    /// if the driver refuses an input view on it.
-    fn scale(&self, device: &ID3D11Device, context: &ID3D11DeviceContext, desktop_texture: &ID3D11Texture2D) -> Result<()> {
+    /// surface. Prefers a zero-copy blit straight from the duplication texture;
+    /// falls back to copying through a desktop-sized intermediate if the driver
+    /// refuses an input view on it.
+    fn scale(
+        &self,
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        desktop_texture: &ID3D11Texture2D,
+        output_view: &ID3D11VideoProcessorOutputView,
+    ) -> Result<()> {
         let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -571,7 +587,7 @@ impl GpuScaler {
                 pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
                 ppFutureSurfacesRight: std::ptr::null_mut(),
             };
-            self.video_context.VideoProcessorBlt(&self.processor, &self.output_view, 0, &[stream])
+            self.video_context.VideoProcessorBlt(&self.processor, output_view, 0, &[stream])
                 .map_err(|e| FluxError::Capture(format!("VideoProcessorBlt: {}", e)))
         }
     }
@@ -582,22 +598,28 @@ struct DxgiCaptureSession {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    shared_texture: ID3D11Texture2D,
-    shared_handle: u64,
+    surfaces: Vec<SharedSurface>,
+    delivered: [Option<usize>; 2],
+    pending: Option<usize>,
     display_id: u32,
     resolution: Resolution,
     scaler: Option<GpuScaler>,
-    frame_interval: std::time::Duration,
+    pacer: CapturePacer,
     frame_sequence: u64,
     running: bool,
-    last_frame_time: std::time::Instant,
-    last_delivery: std::time::Instant,
+    last_delivery: Instant,
     has_copied_frame: bool,
     cursor_sink: Option<CursorUpdateSink>,
     cursor_bitmap: Option<CursorBitmap>,
     cursor_hotspot: (i32, i32),
     cursor_scale_x: f32,
     cursor_scale_y: f32,
+}
+
+enum Acquired {
+    Copied,
+    Heartbeat,
+    Nothing,
 }
 
 struct AcquiredFrame {
@@ -687,7 +709,7 @@ impl DxgiCaptureSession {
                 desktop
             };
 
-            // Create a shared texture for GPU zero-copy access
+            // Create shared textures for GPU zero-copy access
             let tex_desc = D3D11_TEXTURE2D_DESC {
                 Width: output.width,
                 Height: output.height,
@@ -701,42 +723,56 @@ impl DxgiCaptureSession {
                 MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
             };
 
-            let mut shared_texture = None;
-            device.CreateTexture2D(&tex_desc, None, Some(&mut shared_texture))
-                .map_err(|e| FluxError::Capture(format!("CreateTexture2D shared: {}", e)))?;
-            let shared_texture = shared_texture
-                .ok_or_else(|| FluxError::Capture("Shared texture is null".into()))?;
-
-            // Cache the shared handle — it's the same for the lifetime of this texture
-            let shared_resource: IDXGIResource = shared_texture.cast()
-                .map_err(|e| FluxError::Capture(format!("Cast shared texture to IDXGIResource: {}", e)))?;
-            let shared_handle = shared_resource.GetSharedHandle()
-                .map_err(|e| FluxError::Capture(format!("GetSharedHandle: {}", e)))?;
-            let shared_handle_val = shared_handle.0 as u64;
-            tracing::info!("Shared texture handle: 0x{:x}", shared_handle_val);
-
             let scaler = if output != desktop {
-                Some(GpuScaler::new(device, context, &shared_texture, desktop, output)?)
+                Some(GpuScaler::new(device, context, desktop, output)?)
             } else {
                 None
             };
 
-            let frame_interval = std::time::Duration::from_micros(1_000_000 / framerate as u64);
+            let mut surfaces = Vec::with_capacity(SHARED_TEXTURE_COUNT);
+            for index in 0..SHARED_TEXTURE_COUNT {
+                let mut shared_texture = None;
+                device
+                    .CreateTexture2D(&tex_desc, None, Some(&mut shared_texture))
+                    .map_err(|e| FluxError::Capture(format!("CreateTexture2D shared: {}", e)))?;
+                let texture = shared_texture.ok_or_else(|| FluxError::Capture("Shared texture is null".into()))?;
+
+                let shared_resource: IDXGIResource = texture
+                    .cast()
+                    .map_err(|e| FluxError::Capture(format!("Cast shared texture to IDXGIResource: {}", e)))?;
+                let handle = shared_resource
+                    .GetSharedHandle()
+                    .map_err(|e| FluxError::Capture(format!("GetSharedHandle: {}", e)))?
+                    .0 as u64;
+                let scaler_view = if let Some(scaler) = &scaler {
+                    Some(scaler.create_output_view(&texture)?)
+                } else {
+                    None
+                };
+                tracing::info!("Shared texture {index} handle: 0x{handle:x}");
+                surfaces.push(SharedSurface {
+                    texture,
+                    handle,
+                    scaler_view,
+                });
+            }
+
+            let frame_interval = Duration::from_micros(1_000_000 / framerate as u64);
 
             Ok(Self {
                 device: device.clone(),
                 context: context.clone(),
                 duplication,
-                shared_texture,
-                shared_handle: shared_handle_val,
+                surfaces,
+                delivered: [None; 2],
+                pending: None,
                 display_id,
                 resolution: output,
                 scaler,
-                frame_interval,
+                pacer: CapturePacer::new(frame_interval),
                 frame_sequence: 0,
                 running: true,
-                last_frame_time: std::time::Instant::now(),
-                last_delivery: std::time::Instant::now(),
+                last_delivery: Instant::now(),
                 has_copied_frame: false,
                 cursor_sink,
                 cursor_bitmap: None,
@@ -827,19 +863,32 @@ impl DxgiCaptureSession {
         }
     }
 
-    fn make_heartbeat_frame(&mut self) -> CapturedFrame {
+    fn spare_slot(&self) -> usize {
+        if let Some(slot) = self.pending {
+            return slot;
+        }
+        (0..self.surfaces.len())
+            .find(|slot| self.delivered.iter().all(|delivered| *delivered != Some(*slot)))
+            .expect("shared texture ring has a spare surface")
+    }
+
+    fn deliver(&mut self, slot: usize) -> CapturedFrame {
+        let now = Instant::now();
+        self.delivered = [Some(slot), self.delivered[0]];
+        self.pending = None;
+        self.pacer.mark_delivered(now);
         self.frame_sequence += 1;
-        self.last_delivery = std::time::Instant::now();
+        self.last_delivery = now;
         CapturedFrame {
             sequence: self.frame_sequence,
-            timestamp: std::time::Instant::now(),
+            timestamp: now,
             format: PixelFormat::Bgra8,
             resolution: self.resolution,
             stride: 0,
             data: Vec::new(),
             gpu_handle: Some(flux_core::frame::GpuFrameHandle::DxgiSharedTexture(
                 flux_core::frame::DxgiTextureHandle {
-                    handle: self.shared_handle,
+                    handle: self.surfaces[slot].handle,
                     width: self.resolution.width,
                     height: self.resolution.height,
                 },
@@ -847,7 +896,31 @@ impl DxgiCaptureSession {
         }
     }
 
-    fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+    fn make_heartbeat_frame(&mut self) -> CapturedFrame {
+        let Some(slot) = self.delivered[0] else {
+            return self.deliver(self.pending.expect("heartbeat requires a copied frame"));
+        };
+        let now = Instant::now();
+        self.frame_sequence += 1;
+        self.last_delivery = now;
+        CapturedFrame {
+            sequence: self.frame_sequence,
+            timestamp: now,
+            format: PixelFormat::Bgra8,
+            resolution: self.resolution,
+            stride: 0,
+            data: Vec::new(),
+            gpu_handle: Some(flux_core::frame::GpuFrameHandle::DxgiSharedTexture(
+                flux_core::frame::DxgiTextureHandle {
+                    handle: self.surfaces[slot].handle,
+                    width: self.resolution.width,
+                    height: self.resolution.height,
+                },
+            )),
+        }
+    }
+
+    fn acquire_frame(&mut self, timeout_ms: u32) -> Result<Acquired> {
         unsafe {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
@@ -864,14 +937,12 @@ impl DxgiCaptureSession {
                     // DXGI_ERROR_WAIT_TIMEOUT — no new frame available
                     let code = e.code().0 as u32;
                     if code == 0x887A0027 {
-                        // No duplication frame exists to copy, so re-use the
-                        // last flushed shared texture as a low-rate heartbeat.
                         if self.has_copied_frame
                             && self.last_delivery.elapsed() >= DXGI_HEARTBEAT_INTERVAL
                         {
-                            return Ok(Some(self.make_heartbeat_frame()));
+                            return Ok(Acquired::Heartbeat);
                         }
-                        return Ok(None);
+                        return Ok(Acquired::Nothing);
                     }
                     // DXGI_ERROR_ACCESS_LOST — need to recreate duplication
                     if code == 0x887A0026 {
@@ -902,55 +973,44 @@ impl DxgiCaptureSession {
                 && self.last_delivery.elapsed() < DXGI_HEARTBEAT_INTERVAL
             {
                 frame_guard.release()?;
-                return Ok(None);
+                return Ok(Acquired::Nothing);
             }
 
-            // Get the desktop texture
             let desktop_texture: ID3D11Texture2D = resource.cast()
                 .map_err(|e| FluxError::Capture(format!("Cast to ID3D11Texture2D: {}", e)))?;
 
-            // Copy to shared texture: direct GPU copy at native size, or a
-            // video-processor blit when downscaling.
-            match &self.scaler {
-                Some(scaler) => {
-                    if let Err(e) = scaler.scale(&self.device, &self.context, &desktop_texture) {
-                        if let Err(release_error) = frame_guard.release() {
-                            tracing::warn!("GPU scale failed before release error: {e}");
-                            return Err(release_error);
-                        }
-                        return Err(e);
-                    }
+            let slot = self.spare_slot();
+            let copy_result = match &self.scaler {
+                Some(scaler) => match self.surfaces[slot].scaler_view.as_ref() {
+                    Some(output_view) => scaler.scale(&self.device, &self.context, &desktop_texture, output_view),
+                    None => Err(FluxError::Capture("Scaler output view is missing".into())),
+                },
+                None => {
+                    self.context
+                        .CopyResource(&self.surfaces[slot].texture, &desktop_texture);
+                    Ok(())
                 }
-                None => self.context.CopyResource(&self.shared_texture, &desktop_texture),
+            };
+            if let Err(e) = copy_result {
+                if let Err(release_error) = frame_guard.release() {
+                    tracing::warn!("GPU scale failed before release error: {e}");
+                    return Err(release_error);
+                }
+                return Err(e);
             }
 
-            // Flush to ensure the GPU copy is submitted before the encoder
-            // reads from this texture on a different D3D11 device.
             self.context.Flush();
+            self.pending = Some(slot);
             self.has_copied_frame = true;
-
             frame_guard.release()?;
 
-            self.frame_sequence += 1;
-            self.last_delivery = std::time::Instant::now();
-
-            Ok(Some(CapturedFrame {
-                sequence: self.frame_sequence,
-                timestamp: std::time::Instant::now(),
-                format: PixelFormat::Bgra8,
-                resolution: self.resolution,
-                stride: 0, // Not relevant for GPU frames
-                data: Vec::new(), // No CPU data
-                gpu_handle: Some(flux_core::frame::GpuFrameHandle::DxgiSharedTexture(
-                    flux_core::frame::DxgiTextureHandle {
-                        handle: self.shared_handle,
-                        width: self.resolution.width,
-                        height: self.resolution.height,
-                    }
-                )),
-            }))
+            Ok(Acquired::Copied)
         }
     }
+}
+
+fn ceil_ms(duration: Duration) -> u32 {
+    duration.as_nanos().div_ceil(1_000_000).min(u32::MAX as u128) as u32
 }
 
 impl CaptureSession for DxgiCaptureSession {
@@ -959,20 +1019,34 @@ impl CaptureSession for DxgiCaptureSession {
             return Err(FluxError::Capture("session stopped".into()));
         }
 
-        // Rate limit to target framerate
-        let elapsed = self.last_frame_time.elapsed();
-        if elapsed < self.frame_interval {
-            std::thread::sleep(self.frame_interval - elapsed);
-        }
-
-        // Try with a generous timeout
         loop {
-            match self.acquire_frame(100)? {
-                Some(frame) => {
-                    self.last_frame_time = std::time::Instant::now();
-                    return Ok(frame);
+            let now = Instant::now();
+            if let Some(slot) = self.pending {
+                if self.pacer.is_due(now) {
+                    return Ok(self.deliver(slot));
                 }
-                None => continue, // timeout, try again
+            }
+
+            let timeout_ms = if self.pending.is_some() {
+                ceil_ms(self.pacer.time_until_due(now)).max(1)
+            } else {
+                100
+            };
+            match self.acquire_frame(timeout_ms)? {
+                Acquired::Copied => {
+                    if let Some(slot) = self.pending {
+                        if self.pacer.is_due(Instant::now()) {
+                            return Ok(self.deliver(slot));
+                        }
+                    }
+                }
+                Acquired::Heartbeat => {
+                    if let Some(slot) = self.pending {
+                        return Ok(self.deliver(slot));
+                    }
+                    return Ok(self.make_heartbeat_frame());
+                }
+                Acquired::Nothing => {}
             }
         }
     }
@@ -981,7 +1055,16 @@ impl CaptureSession for DxgiCaptureSession {
         if !self.running {
             return Ok(None);
         }
-        self.acquire_frame(0)
+        let acquired = self.acquire_frame(0)?;
+        if let Some(slot) = self.pending {
+            if self.pacer.is_due(Instant::now()) {
+                return Ok(Some(self.deliver(slot)));
+            }
+        }
+        match acquired {
+            Acquired::Heartbeat => Ok(Some(self.make_heartbeat_frame())),
+            Acquired::Copied | Acquired::Nothing => Ok(None),
+        }
     }
 
     fn gpu_device(&self) -> Option<GpuDeviceHandle> {
