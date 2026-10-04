@@ -1171,7 +1171,6 @@ dependencies = [
  "flux-encode",
  "flux-input",
  "flux-protocol",
- "flux-transport",
  "muda",
  "parking_lot",
  "quinn",

@@ -29,7 +29,6 @@ flux-capture = { workspace = true }
 flux-encode = { workspace = true }
 flux-audio = { workspace = true }
 flux-input = { workspace = true }
-flux-transport = { workspace = true }
 flux-crypto = { workspace = true }
 flux-protocol = { workspace = true }
 

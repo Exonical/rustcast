@@ -6,8 +6,17 @@
 //!
 //! This is critical for maintaining video quality over unreliable networks
 //! without the latency cost of TCP retransmission.
+//!
+//! Status: placeholder. Reed-Solomon is not implemented yet. The encoder only
+//! produces a single XOR parity packet and rejects groups that need more than
+//! one; the decoder only handles the no-loss case and returns an error when
+//! any packet is missing.
 
 use flux_core::error::{FluxError, Result};
+
+fn not_implemented(what: &str) -> FluxError {
+    FluxError::Network(format!("{what}: Reed-Solomon FEC not yet implemented"))
+}
 
 /// FEC encoder: generates parity packets from a group of data packets.
 pub struct FecEncoder {
@@ -31,7 +40,8 @@ impl FecEncoder {
     /// Generate FEC parity packets for a group of data packets.
     ///
     /// All data packets must be the same length (zero-padded if necessary).
-    /// Returns the parity packets.
+    /// Returns the parity packets. Errors if the group needs more than one
+    /// parity packet, since only single XOR parity is implemented.
     pub fn encode(&self, data_packets: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
         if data_packets.is_empty() {
             return Ok(vec![]);
@@ -42,6 +52,14 @@ impl FecEncoder {
 
         if packet_size == 0 {
             return Ok(vec![]);
+        }
+
+        if parity_count > 1 {
+            return Err(not_implemented(&format!(
+                "FEC encode of {} data packets needs {} parity packets",
+                data_packets.len(),
+                parity_count,
+            )));
         }
 
         // TODO: Replace with reed-solomon-erasure crate:
@@ -83,8 +101,7 @@ impl FecEncoder {
             }
         }
 
-        // Duplicate for the requested parity count (placeholder)
-        Ok(vec![parity; parity_count])
+        Ok(vec![parity])
     }
 }
 
@@ -150,15 +167,11 @@ impl FecDecoder {
         //       .map(|s| s.clone().unwrap())
         //       .collect()
 
-        tracing::debug!(
-            "FEC decode: reconstructing {} missing packets from {} received",
+        Err(not_implemented(&format!(
+            "FEC decode of {} missing packets from {} received",
             missing_count,
-            received.len()
-        );
-
-        Err(FluxError::Network(
-            "Reed-Solomon reconstruction not yet implemented".into(),
-        ))
+            received.len(),
+        )))
     }
 }
 
@@ -181,6 +194,31 @@ mod tests {
         let parity = encoder.encode(&data).unwrap();
         assert!(!parity.is_empty());
         // XOR parity: 0xAA ^ 0xCC = 0x66, 0xBB ^ 0xDD = 0x66
-        assert_eq!(parity[0], vec![0x66, 0x66]);
+        assert_eq!(parity, vec![vec![0x66, 0x66]]);
+    }
+
+    #[test]
+    fn encode_rejects_multiple_parity_packets() {
+        let encoder = FecEncoder::new(20);
+        let data = vec![vec![0x01; 4]; 10];
+        assert_eq!(encoder.parity_count(data.len()), 2);
+        assert!(matches!(encoder.encode(&data), Err(FluxError::Network(_))));
+    }
+
+    #[test]
+    fn decode_without_loss_returns_data_in_order() {
+        let decoder = FecDecoder::new(2, 1);
+        let received = vec![(2, vec![0x66]), (1, vec![0xBB]), (0, vec![0xAA])];
+        assert_eq!(decoder.decode(&received).unwrap(), vec![vec![0xAA], vec![0xBB]]);
+    }
+
+    #[test]
+    fn decode_with_loss_is_not_implemented() {
+        let decoder = FecDecoder::new(2, 1);
+        let received = vec![(0, vec![0xAA]), (2, vec![0x66])];
+        match decoder.decode(&received) {
+            Err(FluxError::Network(msg)) => assert!(msg.contains("not yet implemented"), "{msg}"),
+            other => panic!("expected not-implemented error, got {other:?}"),
+        }
     }
 }
