@@ -1834,7 +1834,7 @@ fn capture_loop(
         if let Some(ref mut enc) = encode_session {
             match enc.encode(&frame) {
                 Ok(packets) => {
-                    for pkt in &packets {
+                    for pkt in packets {
                         total_encoded_bytes += pkt.data.len() as u64;
                         if pkt.is_keyframe {
                             keyframe_bytes = Some(pkt.data.len());
@@ -1854,7 +1854,7 @@ fn capture_loop(
                             );
                         }
 
-                        let _ = h264_tx.send(Arc::new((ts_micros, pkt.data.clone())));
+                        let _ = h264_tx.send(Arc::new((ts_micros, pkt.data)));
                     }
                 }
                 Err(e) => {

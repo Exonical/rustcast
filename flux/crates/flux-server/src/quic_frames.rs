@@ -280,7 +280,7 @@ async fn handle_connection(
             let result = send_frame_message(
                 &connection,
                 frame.0,
-                frame.1.clone(),
+                &frame.1,
                 &mut rx,
                 &mut reset_policy,
                 &frame_idr_tx,
@@ -323,7 +323,7 @@ async fn handle_connection(
                 let result = send_frame_message(
                     &connection,
                     frame.0,
-                    frame.1.clone(),
+                    &frame.1,
                     &mut rx,
                     &mut reset_policy,
                     &frame_idr_tx,
@@ -414,7 +414,7 @@ enum FrameSendResult {
 async fn send_frame_message(
     connection: &quinn::Connection,
     ts: u64,
-    payload: Vec<u8>,
+    payload: &[u8],
     rx: &mut tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     reset_policy: &mut FrameResetPolicy,
     idr_tx: &std::sync::mpsc::Sender<()>,
@@ -435,7 +435,7 @@ async fn send_frame_message(
         return FrameSendResult::Disconnected;
     }
 
-    let is_idr = is_idr_frame(&payload);
+    let is_idr = is_idr_frame(payload);
     let mut pending = None;
     let mut backlog = 0;
     let mut dropped_frames = false;
