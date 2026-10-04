@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::{CapturedFrame, EncodedPacket, GpuDeviceHandle, GpuFrameHandle};
+use flux_core::frame::{CapturedFrame, DXGI_SHARED_TEXTURE_RING_SIZE, EncodedPacket, GpuDeviceHandle, GpuFrameHandle};
 use flux_core::types::{DynamicRange, RateControlMode, Resolution, VideoCodec};
 
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
@@ -487,6 +487,10 @@ fn amf_data_release(data: *mut AMFDataObj) {
 
 const AMF_TIMEBASE_PER_SECOND: u64 = 10_000_000;
 const H264_MAX_AU_TENTHS_OF_A_SECOND: u64 = 10;
+/// Opened shared textures kept per session; one slot of headroom over the
+/// capture ring so every in-rotation handle stays cached.
+const MAX_CACHED_SHARED_TEXTURES: usize = DXGI_SHARED_TEXTURE_RING_SIZE + 1;
+const _: () = assert!(MAX_CACHED_SHARED_TEXTURES >= DXGI_SHARED_TEXTURE_RING_SIZE);
 
 /// Return the configured frame duration in AMF's 100 ns timebase.
 fn frame_duration_100ns(framerate: u32) -> i64 {
@@ -1083,7 +1087,7 @@ impl AmfSession {
             })?;
             self.cached_shared_textures.push((handle_val, texture));
         }
-        if self.cached_shared_textures.len() > 4 {
+        if self.cached_shared_textures.len() > MAX_CACHED_SHARED_TEXTURES {
             self.cached_shared_textures.remove(0);
         }
 

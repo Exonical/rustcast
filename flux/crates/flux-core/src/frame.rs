@@ -107,6 +107,12 @@ pub struct DmaBufHandle {
     pub height: u32,
 }
 
+/// Number of distinct DXGI shared textures the capture backend cycles through.
+///
+/// Consumers that cache per-handle state (e.g. opened shared resources) must
+/// hold at least this many entries to avoid re-opening handles every frame.
+pub const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
+
 /// Windows DXGI shared texture descriptor.
 #[derive(Debug, Clone)]
 pub struct DxgiTextureHandle {
