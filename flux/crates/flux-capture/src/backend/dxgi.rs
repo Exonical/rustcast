@@ -6,7 +6,7 @@
 
 use flux_core::cursor::{CursorBitmap, CursorMetadata};
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::{CapturedFrame, GpuDeviceHandle};
+use flux_core::frame::{CapturedFrame, DXGI_SHARED_TEXTURE_RING_SIZE, GpuDeviceHandle};
 use flux_core::types::{PixelFormat, Resolution};
 
 use crate::cursor::{convert_dxgi_pointer_shape, scale_cursor_bitmap};
@@ -28,12 +28,11 @@ use windows::Win32::UI::HiDpi::{
 use windows::core::Interface;
 
 const DXGI_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-const SHARED_TEXTURE_COUNT: usize = 3;
 /// Most recently delivered ring slots that may still be read by the async
 /// encoder and must not be rewritten.
 const IN_FLIGHT_DEPTH: usize = 2;
 const _: () = assert!(
-    SHARED_TEXTURE_COUNT > IN_FLIGHT_DEPTH,
+    DXGI_SHARED_TEXTURE_RING_SIZE > IN_FLIGHT_DEPTH,
     "shared texture ring needs a spare surface beyond the in-flight slots"
 );
 
@@ -736,8 +735,8 @@ impl DxgiCaptureSession {
                 None
             };
 
-            let mut surfaces = Vec::with_capacity(SHARED_TEXTURE_COUNT);
-            for index in 0..SHARED_TEXTURE_COUNT {
+            let mut surfaces = Vec::with_capacity(DXGI_SHARED_TEXTURE_RING_SIZE);
+            for index in 0..DXGI_SHARED_TEXTURE_RING_SIZE {
                 let mut shared_texture = None;
                 device
                     .CreateTexture2D(&tex_desc, None, Some(&mut shared_texture))
