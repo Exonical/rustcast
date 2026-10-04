@@ -1006,7 +1006,8 @@ impl VulkanVideoSession {
 }
 
 impl EncodeSession for VulkanVideoSession {
-    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
+        let frame = &*frame;
         let width = self.coded_extent.width;
         let height = self.coded_extent.height;
         let nv12 = frame_to_nv12(frame, width, height)?;

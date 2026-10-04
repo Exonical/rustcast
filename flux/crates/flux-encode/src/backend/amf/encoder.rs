@@ -1159,7 +1159,8 @@ impl AmfSession {
 }
 
 impl EncodeSession for AmfSession {
-    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
+        let frame = &*frame;
         self.frame_index += 1;
 
         // Periodic IDR: force keyframe every idr_interval frames

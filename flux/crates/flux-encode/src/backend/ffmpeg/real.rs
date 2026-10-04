@@ -25,6 +25,7 @@
 
 use std::ffi::c_int;
 use std::ptr;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, unbounded, Sender};
@@ -445,7 +446,7 @@ impl VideoEncoder for FfmpegSoftwareEncoder {
 
 enum Cmd {
     Encode {
-        frame: Box<CapturedFrame>,
+        frame: Arc<CapturedFrame>,
         reply: Sender<Result<Vec<EncodedPacket>>>,
     },
     RequestIdr,
@@ -502,8 +503,7 @@ impl FfmpegSession {
 }
 
 impl EncodeSession for FfmpegSession {
-    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
-        let frame = Box::new(frame.clone());
+    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
         self.request(|reply| Cmd::Encode { frame, reply })
     }
 
@@ -554,7 +554,10 @@ fn run_encode_thread(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Encode { frame, reply } => {
-                let _ = reply.send(state.encode(&frame));
+                let result = state.encode(&frame);
+                // Release the frame before replying so the caller can reclaim it.
+                drop(frame);
+                let _ = reply.send(result);
             }
             Cmd::Flush { reply } => {
                 let _ = reply.send(state.flush());

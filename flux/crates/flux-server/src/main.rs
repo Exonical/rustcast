@@ -1883,8 +1883,9 @@ fn capture_loop(
             .saturating_duration_since(loop_start)
             .as_micros() as u64;
         let mut keyframe_bytes = None;
+        let frame = Arc::new(frame);
         if let Some(ref mut enc) = encode_session {
-            match enc.encode(&frame) {
+            match enc.encode(Arc::clone(&frame)) {
                 Ok(packets) => {
                     for pkt in packets {
                         total_encoded_bytes += pkt.data.len() as u64;
@@ -1915,8 +1916,11 @@ fn capture_loop(
             }
         }
         let t_encode = t1.elapsed();
-        // `encode` only borrows the frame, so its buffer is free for reuse.
-        session.recycle_frame(frame);
+        // Encoders release their clone before returning, so the buffer is
+        // normally free for reuse; otherwise it is simply dropped.
+        if let Ok(frame) = Arc::try_unwrap(frame) {
+            session.recycle_frame(frame);
+        }
         stage_timings.observe(t_capture, t_encode, keyframe_bytes);
 
         // Periodic performance stats (every 5 seconds)

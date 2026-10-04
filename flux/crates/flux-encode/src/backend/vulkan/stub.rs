@@ -11,6 +11,8 @@
 //!   - VK_KHR_video_encode_h264
 //!   - VK_KHR_video_encode_h265
 
+use std::sync::Arc;
+
 use flux_core::error::{FluxError, Result};
 use flux_core::frame::{CapturedFrame, EncodedPacket};
 use flux_core::types::{Resolution, VideoCodec};
@@ -139,7 +141,7 @@ impl VulkanVideoSession {
 }
 
 impl EncodeSession for VulkanVideoSession {
-    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
+    fn encode(&mut self, _frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
         self.frame_index += 1;
         let is_idr = self.idr_requested;
         self.idr_requested = false;
