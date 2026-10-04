@@ -842,7 +842,7 @@ fn encoder_backend_candidates(
     use flux_core::types::EncoderBackend;
     if let Some(backend) = forced {
         tracing::info!("Encoder backend forced by config: {:?}", backend);
-        // Keep the software fallback so a failed forced backend still streams.
+        // Keep the software fallback as the next candidate if the forced backend fails.
         if backend == EncoderBackend::Software {
             return vec![backend];
         }
@@ -1079,6 +1079,9 @@ fn build_encode_session_for(
             break;
         }
         tracing::warn!("{:?} encoder unavailable; trying next backend", candidate);
+    }
+    if session.is_none() {
+        tracing::error!("No functional encoder backend available; video will not be streamed");
     }
     (session, backend)
 }
