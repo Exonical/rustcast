@@ -152,6 +152,20 @@ func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
 			wantIDR:  false,
 			wantDrop: true,
 		},
+		{
+			name:     "empty queue keeps current keyframe",
+			current:  idrFrame(1),
+			wantTs:   1,
+			wantIDR:  true,
+			wantDrop: false,
+		},
+		{
+			name:     "empty queue keeps current P-frame",
+			current:  pFrame(1),
+			wantTs:   1,
+			wantIDR:  false,
+			wantDrop: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -160,10 +174,13 @@ func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
 			for _, frame := range test.queued {
 				ch <- frame
 			}
-			latest, dropped := latestFrame(ch, test.current)
-			if latest.tsMicros != test.wantTs || isIDRFrame(latest.data) != test.wantIDR || dropped != test.wantDrop {
-				t.Fatalf("latestFrame() = (%+v, %t), want ts=%d idr=%t dropped=%t",
-					latest, dropped, test.wantTs, test.wantIDR, test.wantDrop)
+			latest, idr, dropped := latestFrame(ch, test.current)
+			if latest.tsMicros != test.wantTs || idr != test.wantIDR || dropped != test.wantDrop {
+				t.Fatalf("latestFrame() = (%+v, %t, %t), want ts=%d idr=%t dropped=%t",
+					latest, idr, dropped, test.wantTs, test.wantIDR, test.wantDrop)
+			}
+			if idr != isIDRFrame(latest.data) {
+				t.Fatalf("latestFrame() idr=%t disagrees with isIDRFrame()=%t", idr, isIDRFrame(latest.data))
 			}
 		})
 	}
