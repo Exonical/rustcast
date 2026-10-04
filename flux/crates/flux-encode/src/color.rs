@@ -4,7 +4,7 @@
 //! YUV (NV12 / P010) before encoding. This module provides GPU-resident
 //! conversion via Vulkan compute shaders to avoid costly CPU round-trips.
 
-use flux_core::error::Result;
+use flux_core::error::{FluxError, Result};
 use flux_core::types::{ChromaSampling, DynamicRange, PixelFormat};
 
 /// Describes the desired color conversion transform.
@@ -89,6 +89,9 @@ impl GpuColorConverter {
     ///
     /// `input_handle` is an opaque GPU resource handle (DMA-BUF fd or DXGI texture).
     /// Returns a handle to the converted YUV image on the same GPU.
+    ///
+    /// Not implemented yet: always returns [`FluxError::Gpu`] rather than a
+    /// placeholder handle a caller could mistake for a converted image.
     pub fn convert(&mut self, _input_handle: u64) -> Result<u64> {
         // TODO: Real implementation:
         //   1. Import the input handle as a VkImage (via VK_EXT_external_memory_*)
@@ -99,14 +102,10 @@ impl GpuColorConverter {
         //   4. Pipeline barrier to ensure compute completes
         //   5. Return output VkImage handle for the encoder
 
-        tracing::trace!(
-            "GPU color conversion: {:?} → {:?}",
-            self.config.input_format,
-            self.output_format,
-        );
-
-        // Placeholder — return dummy handle
-        Ok(0)
+        Err(FluxError::Gpu(format!(
+            "GPU color conversion {:?} → {:?} not implemented (Vulkan compute pipeline missing)",
+            self.config.input_format, self.output_format,
+        )))
     }
 }
 
@@ -127,3 +126,22 @@ pub const BT2020_RGB_TO_YUV: [[f32; 3]; 3] = [
     [-0.1396, -0.3604,  0.5000],  // Cb
     [ 0.5000, -0.4598, -0.0402],  // Cr
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convert_fails_instead_of_returning_null_handle() {
+        let mut converter = GpuColorConverter::new(ColorConversionConfig {
+            input_format: PixelFormat::Bgra8,
+            output_chroma: ChromaSampling::Yuv420,
+            output_range: DynamicRange::Sdr,
+            width: 1920,
+            height: 1080,
+        })
+        .unwrap();
+
+        assert!(matches!(converter.convert(1), Err(FluxError::Gpu(_))));
+    }
+}
