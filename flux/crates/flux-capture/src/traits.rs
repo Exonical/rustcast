@@ -69,6 +69,12 @@ pub trait CaptureSession: Send {
         None
     }
 
+    /// Hand a fully consumed frame back so the backend can reuse its CPU
+    /// buffer for a later frame. Backends without a buffer pool just drop it.
+    fn recycle_frame(&mut self, frame: CapturedFrame) {
+        drop(frame);
+    }
+
     /// Signal the capture backend to stop. The session becomes invalid after this call.
     fn stop(&mut self) -> Result<()>;
 }
