@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use flux_core::error::Result;
 use flux_core::frame::{CapturedFrame, EncodedPacket, GpuDeviceHandle};
 use flux_core::types::{ChromaSampling, DynamicRange, RateControlMode, Resolution, VideoCodec};
@@ -78,7 +80,12 @@ pub trait EncodeSession: Send {
     ///
     /// Returns one or more encoded packets (there may be zero if the encoder
     /// is buffering, or multiple in case of B-frame reordering).
-    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>>;
+    ///
+    /// The frame is shared rather than borrowed so worker-thread backends can
+    /// move it across the thread boundary without copying the pixel data.
+    /// Implementations must release every clone before returning so the
+    /// caller can reclaim the frame with [`Arc::try_unwrap`] for buffer reuse.
+    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>>;
 
     /// Request that the next encoded frame be an IDR / keyframe.
     fn request_idr(&mut self);

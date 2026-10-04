@@ -13,6 +13,7 @@
 
 use std::borrow::Borrow;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, unbounded, Sender};
@@ -116,7 +117,7 @@ impl VideoEncoder for VaapiEncoder {
 /// A command sent from [`VaapiSession`] to the encode thread.
 enum Cmd {
     Encode {
-        frame: Box<CapturedFrame>,
+        frame: Arc<CapturedFrame>,
         reply: Sender<Result<Vec<EncodedPacket>>>,
     },
     RequestIdr,
@@ -174,8 +175,7 @@ impl VaapiSession {
 }
 
 impl EncodeSession for VaapiSession {
-    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
-        let frame = Box::new(frame.clone());
+    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
         self.request(|reply| Cmd::Encode { frame, reply })
     }
 
@@ -220,7 +220,10 @@ fn run_encode_thread(config: EncodeConfig, rx: crossbeam_channel::Receiver<Cmd>,
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Encode { frame, reply } => {
-                let _ = reply.send(state.encode(&frame));
+                let result = state.encode(&frame);
+                // Release the frame before replying so the caller can reclaim it.
+                drop(frame);
+                let _ = reply.send(result);
             }
             Cmd::Flush { reply } => {
                 let _ = reply.send(state.flush());
