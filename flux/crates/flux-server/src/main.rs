@@ -863,7 +863,7 @@ fn encoder_backend_candidates(
 
 /// Bits-per-pixel-per-frame coefficients for quality levels 1 through 10.
 /// Level 3 is the former 0.05 setting; the default level 6 is 0.10.
-/// Keep the UI estimate in `flux-web/ui/app/page.tsx` synchronized with this table.
+/// Mirrored by `QUALITY_BPP` in `flux-web/ui/lib/protocol.ts`; its parity test parses this table.
 fn quality_bpp(level: u8) -> f64 {
     match level.clamp(1, 10) {
         1 => 0.025,
@@ -879,6 +879,7 @@ fn quality_bpp(level: u8) -> f64 {
     }
 }
 
+/// The clamp bounds are mirrored by `flux-web/ui/lib/protocol.ts` and checked by its parity test.
 fn bitrate_kbps_for(
     resolution: flux_core::types::Resolution,
     fps: u32,
