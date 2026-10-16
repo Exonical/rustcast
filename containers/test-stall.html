@@ -20,6 +20,7 @@ const out = document.getElementById('out');
 const result = { phases: [], events: [] };
 let phase = null;
 let transport, controlWriter, decoder, decoderConfig;
+addEventListener('pagehide', () => transport?.close());
 let expectedSeq = null, waitingForKeyframe = true, gapAt = null;
 const pendingFrames = new Map();
 const metadata = new Map();

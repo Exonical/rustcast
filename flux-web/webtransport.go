@@ -24,6 +24,11 @@ const (
 	maxControlMessage    = 1 << 20
 	controlWriteTimeout  = 5 * time.Second
 	sessionErrorCode     = webtransport.SessionErrorCode(1)
+
+	// A viewer that vanished without closing (page reload, network loss) holds
+	// the machine's single viewer slot until this expires.
+	viewerIdleTimeout     = 6 * time.Second
+	viewerKeepAlivePeriod = 2 * time.Second
 )
 
 type quicConnContextKey struct{}
@@ -61,6 +66,8 @@ func newWebTransportServer(registry *machineRegistry, certificates *relayCertifi
 			QUICConfig: &quic.Config{
 				EnableDatagrams:                  true,
 				EnableStreamResetPartialDelivery: true,
+				MaxIdleTimeout:                   viewerIdleTimeout,
+				KeepAlivePeriod:                  viewerKeepAlivePeriod,
 			},
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 				return context.WithValue(ctx, quicConnContextKey{}, conn)

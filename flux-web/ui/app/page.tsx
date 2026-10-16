@@ -340,7 +340,10 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     client.onResolutionStatus = setResolutionStatus;
     client.connect().catch(console.error);
     const container = containerRef.current;
+    const closeOnPageHide = () => client.disconnect();
+    window.addEventListener("pagehide", closeOnPageHide);
     return () => {
+      window.removeEventListener("pagehide", closeOnPageHide);
       releaseAllInput();
       if (document.pointerLockElement === container) document.exitPointerLock();
       client.disconnect();
