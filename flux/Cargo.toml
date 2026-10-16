@@ -45,6 +45,7 @@ toml = "0.9"
 # Logging / tracing
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+prometheus = { version = "0.14", default-features = false }
 
 # Error handling
 thiserror = "2.0.21"

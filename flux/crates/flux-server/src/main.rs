@@ -9,6 +9,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 mod http;
+mod metrics;
 mod pipeline;
 mod quic_frames;
 mod registration;
@@ -170,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load or create configuration.
-    let config = if args.config.exists() {
+    let mut config = if args.config.exists() {
         FluxConfig::from_file(&args.config)?
     } else {
         tracing::info!(
@@ -181,6 +182,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.save(&args.config)?;
         config
     };
+    if let Ok(addr) = std::env::var("FLUX_METRICS_ADDR")
+        && !addr.trim().is_empty()
+    {
+        config.server.metrics_addr = addr.trim().to_owned();
+    }
+    metrics::init();
 
     #[cfg(target_os = "windows")]
     {
@@ -207,6 +214,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Detect platform capabilities.
     let platform = PlatformInfo::detect();
+    let gpu_vendor = format!("{:?}", platform.gpu_vendor);
+    metrics::set_host_info("unknown", &gpu_vendor, std::env::consts::OS);
     tracing::info!(
         "Platform: {:?} | GPU: {:?} | Capture: {:?} | Encoders: {:?}",
         platform.os,
@@ -475,6 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime_status_capture = runtime_status.clone();
     let resolution_status_tx_capture = resolution_status_tx.clone();
     let initial_mode = config.video.virtual_display;
+    let gpu_vendor_capture = gpu_vendor.clone();
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
@@ -490,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.video.default_fps_cap,
                 forced_encoder,
                 default_quality_level,
+                gpu_vendor_capture,
                 virtual_display_target,
                 virtual_display,
                 initial_mode,
@@ -526,6 +537,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_status,
     );
     tracing::info!("H.264 frame server listening on tcp://{}", frame_addr);
+
+    let metrics_handle = if config.server.metrics_addr.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        match tokio::net::TcpListener::bind(&config.server.metrics_addr).await {
+            Ok(listener) => {
+                tracing::info!("Metrics listener on http://{}/metrics", config.server.metrics_addr);
+                Some(tokio::spawn(async move {
+                    if let Err(error) = axum::serve(listener, http::build_router()).await {
+                        tracing::warn!("Metrics HTTP server stopped: {}", error);
+                    }
+                }))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Metrics listener {} unavailable: {}; streaming continues",
+                    config.server.metrics_addr,
+                    error
+                );
+                None
+            }
+        }
+    };
 
     // QUIC frame server on the same port number over UDP. Preferred by the
     // relay on lossy links (no head-of-line blocking); TCP remains as fallback.
@@ -609,6 +643,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     frame_handle.abort();
+    if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
     if let Some(h) = quic_handle {
         h.abort();
     }
@@ -762,6 +799,7 @@ async fn frame_server(
                                 break;
                             }
                             let count = u32::from_be_bytes(count_buf);
+                            crate::metrics::viewers(count);
                             tracing::info!("Client {} reported {} viewer(s)", addr, count);
                             #[cfg(target_os = "windows")]
                             if let Some(privacy) = privacy_connection.as_ref() {
@@ -1029,6 +1067,7 @@ impl StageTimings {
         encode: std::time::Duration,
         keyframe_bytes: Option<usize>,
     ) {
+        crate::metrics::encode_seconds(encode.as_secs_f64());
         self.frames += 1;
         self.capture_sum += capture;
         self.capture_max = self.capture_max.max(capture);
@@ -1585,12 +1624,14 @@ fn capture_loop(
     default_fps_cap: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
     default_quality_level: u8,
+    gpu_vendor: String,
     target_display: Option<flux_capture::traits::DisplayInfo>,
     mut virtual_display: Option<VirtualDisplayHandle>,
     initial_mode: Option<flux_core::config::VirtualDisplayConfig>,
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
     runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
 ) {
+    crate::metrics::set_host_info("unknown", &gpu_vendor, std::env::consts::OS);
     #[cfg(not(target_os = "windows"))]
     let _ = &virtual_display;
     #[cfg(target_os = "windows")]
@@ -1846,6 +1887,7 @@ fn capture_loop(
                         capture_resolution = flux_core::types::Resolution::new(0, 0);
                         encode_resolution = flux_core::types::Resolution::new(0, 0);
                         release_capture_session(session);
+                        crate::metrics::capture_restart();
                         (primary, session) =
                             transition_resolution(&starter, display, request, current_mode, &resolution_status_tx);
                     }
@@ -1923,6 +1965,7 @@ fn capture_loop(
         }
         // Check for IDR requests
         if let Ok(_) = idr_rx.try_recv() {
+            crate::metrics::idr_request();
             tracing::info!("Handling IDR request from client");
             if let Some(ref mut enc) = encode_session {
                 enc.request_idr();
@@ -1961,17 +2004,23 @@ fn capture_loop(
                 }
                 if let Err(error) = enc.set_bitrate(kbps) {
                     tracing::warn!("quality level {} bitrate update failed: {}", quality_level, error);
-                } else if let Ok(mut status) = runtime_status.write() {
-                    status.target_bitrate_kbps = kbps;
-                    if let Some(notify) = status.registration_notify.as_ref() {
-                        let _ = notify.send(());
+                } else {
+                    crate::metrics::encoder_target(kbps);
+                    if let Ok(mut status) = runtime_status.write() {
+                        status.target_bitrate_kbps = kbps;
+                        if let Some(notify) = status.registration_notify.as_ref() {
+                            let _ = notify.send(());
+                        }
                     }
                 }
             }
         }
         if let (Some(kbps), Some(ref mut enc)) = (new_bitrate, encode_session.as_mut()) {
             match enc.set_bitrate(kbps) {
-                Ok(()) => tracing::info!("Encoder bitrate set to {} kbps", kbps),
+                Ok(()) => {
+                    crate::metrics::encoder_target(kbps);
+                    tracing::info!("Encoder bitrate set to {} kbps", kbps);
+                }
                 Err(e) => tracing::warn!("set_bitrate({} kbps) failed: {}", kbps, e),
             }
         }
@@ -2002,6 +2051,7 @@ fn capture_loop(
                 capture_resolution = flux_core::types::Resolution::new(0, 0);
                 encode_resolution = flux_core::types::Resolution::new(0, 0);
                 release_capture_session(session);
+                crate::metrics::capture_restart();
                 (primary, session) = recover_lost_capture(&starter, &primary);
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -2010,6 +2060,7 @@ fn capture_loop(
                 continue;
             }
         };
+        crate::metrics::capture_frame();
         #[cfg(not(target_os = "windows"))]
         settle_pending_mode(
             &mut pending_mode,
@@ -2020,6 +2071,7 @@ fn capture_loop(
         );
 
         let t_capture = t0.elapsed();
+        crate::metrics::capture_seconds(t_capture.as_secs_f64());
         if !should_encode_frame(&mut frame_pacer, t0, fps_cap) {
             session.recycle_frame(frame);
             continue;
@@ -2037,6 +2089,7 @@ fn capture_loop(
                 quality_level,
                 session.gpu_device(),
             );
+            crate::metrics::set_host_info(&format!("{backend:?}"), &gpu_vendor, std::env::consts::OS);
             capture_resolution = frame.resolution;
             match sess {
                 Some((s, res)) => {
@@ -2081,6 +2134,7 @@ fn capture_loop(
                 release_capture_session(session);
                 match restart_for_downscale(&starter, &primary, encode_resolution) {
                     Ok(DownscaleRestart::Gpu(restarted)) => {
+                        crate::metrics::capture_restart();
                         session = restarted;
                         set_cursor_dimensions(&cursor_dimensions, encode_resolution, encode_resolution);
                         // The encoder was released with the old capture
@@ -2090,6 +2144,7 @@ fn capture_loop(
                         continue;
                     }
                     Ok(DownscaleRestart::Cpu(restored)) => {
+                        crate::metrics::capture_restart();
                         session = restored;
                         set_cursor_dimensions(&cursor_dimensions, primary.native_resolution, encode_resolution);
                     }
@@ -2130,6 +2185,7 @@ fn capture_loop(
                 Ok(packets) => {
                     for pkt in packets {
                         total_encoded_bytes += pkt.data.len() as u64;
+                        crate::metrics::encoded_frame(pkt.is_keyframe, pkt.data.len());
                         if pkt.is_keyframe {
                             keyframe_bytes = Some(pkt.data.len());
                         }

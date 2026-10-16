@@ -286,7 +286,9 @@ async fn handle_connection(
                 &frame_idr_tx,
             )
             .await;
-            send_timings.observe(started.elapsed(), bytes, is_idr);
+            let elapsed = started.elapsed();
+            send_timings.observe(elapsed, bytes, is_idr);
+            crate::metrics::frame_send_seconds(is_idr, elapsed.as_secs_f64());
             match result {
                 FrameSendResult::Complete => {}
                 FrameSendResult::Superseded {
@@ -313,6 +315,7 @@ async fn handle_connection(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("QUIC frame sender lagged by {} frames", n);
                         send_timings.record_lag(n);
+                        crate::metrics::broadcast_lagged(n);
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -328,7 +331,9 @@ async fn handle_connection(
                     &mut reset_policy,
                     &frame_idr_tx,
                 ).await;
-                send_timings.observe(started.elapsed(), bytes, is_idr);
+                let elapsed = started.elapsed();
+                send_timings.observe(elapsed, bytes, is_idr);
+                crate::metrics::frame_send_seconds(is_idr, elapsed.as_secs_f64());
                 match result {
                     FrameSendResult::Complete => {}
                     FrameSendResult::Superseded {
@@ -489,6 +494,7 @@ async fn send_frame_message(
                                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
                                         backlog += n as usize;
                                         dropped_frames = true;
+                                        crate::metrics::broadcast_lagged(n);
                                     }
                                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
@@ -503,6 +509,7 @@ async fn send_frame_message(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             backlog += n as usize;
                             dropped_frames = true;
+                            crate::metrics::broadcast_lagged(n);
                             if reset_policy.should_request_idr(Instant::now()) {
                                 let _ = idr_tx.send(());
                             }
@@ -515,6 +522,7 @@ async fn send_frame_message(
             }
         }
         if reset {
+            crate::metrics::frame_reset();
             let _ = stream.reset(quinn::VarInt::from_u32(0));
             let _ = idr_tx.send(());
             tracing::debug!(
@@ -597,6 +605,7 @@ async fn read_commands(
                     return;
                 }
                 let count = u32::from_be_bytes(count_buf);
+                crate::metrics::viewers(count);
                 tracing::info!("QUIC client reported {} viewer(s)", count);
                 #[cfg(target_os = "windows")]
                 if let Some(privacy) = privacy_connection.as_ref() {
