@@ -22,7 +22,29 @@ export class FrameSequencer {
 
   push(frame: EncodedFrame, now: number): SequenceResult {
     const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
-    if (this.expected === null) this.expected = frame.seq;
+    if (this.expected === null) {
+      if (!frame.keyframe) {
+        if (this.buffered.size >= this.maxBufferedFrames) {
+          result.dropped++;
+          result.requestKeyframe = true;
+        } else {
+          this.buffered.set(frame.seq, frame);
+        }
+        return result;
+      }
+      for (const seq of this.buffered.keys()) {
+        if (seq === frame.seq || sequenceDistance(seq, frame.seq) >= 0x80000000) {
+          this.buffered.delete(seq);
+          result.dropped++;
+        }
+      }
+      this.expected = frame.seq;
+      this.gapSince = null;
+      this.waitingForKeyframe = false;
+      this.consume(frame, result);
+      this.drain(result, now);
+      return result;
+    }
     const distance = sequenceDistance(frame.seq, this.expected);
     if (distance >= 0x80000000) {
       result.dropped++;
@@ -57,9 +79,6 @@ export class FrameSequencer {
   markLost(seq: number, now: number): SequenceResult {
     const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
     if (this.expected === null) {
-      this.expected = (seq + 1) >>> 0;
-      this.waitingForKeyframe = true;
-      result.dropped = 1;
       result.requestKeyframe = true;
       return result;
     }
@@ -79,6 +98,16 @@ export class FrameSequencer {
 
   expire(now: number): SequenceResult {
     const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
+    if (this.expected === null) {
+      for (const [seq, frame] of this.buffered) {
+        if (now - frame.receivedAt > this.gapTimeoutMs) {
+          this.buffered.delete(seq);
+          result.dropped++;
+          result.requestKeyframe = true;
+        }
+      }
+      return result;
+    }
     if (this.gapSince === null || now - this.gapSince < this.gapTimeoutMs) return result;
     while (this.buffered.size) {
       const next = this.nextBuffered();
