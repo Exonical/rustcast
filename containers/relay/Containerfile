@@ -27,6 +27,7 @@ COPY --from=ui /ui/out /app/ui/out
 USER flux-web
 # HTTP UI/API
 EXPOSE 8080/tcp
+EXPOSE 9101/tcp
 # HTTP/3 WebTransport
 EXPOSE 8443/udp
 ENTRYPOINT ["/app/flux-web"]

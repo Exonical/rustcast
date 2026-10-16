@@ -20,6 +20,9 @@ spec:
         - containerPort: 8080
           hostPort: 8080
           protocol: TCP
+        - containerPort: 9101
+          hostPort: 9101
+          protocol: TCP
         - containerPort: 8443
           hostPort: 8443
           protocol: UDP
