@@ -25,8 +25,8 @@ WORKDIR /app
 COPY --from=relay /out/flux-web /app/flux-web
 COPY --from=ui /ui/out /app/ui/out
 USER flux-web
-# HTTP/WebSocket signaling + UI
+# HTTP UI/API
 EXPOSE 8080/tcp
-# WebRTC media (single ICE UDP mux)
+# HTTP/3 WebTransport
 EXPOSE 8443/udp
 ENTRYPOINT ["/app/flux-web"]

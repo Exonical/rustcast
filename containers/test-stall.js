@@ -11,18 +11,24 @@ const path = require('path');
 
 const query = process.argv[2] || '';
 const reportPath = process.argv[3];
-const page = 'file:///' + path.resolve(__dirname, 'test-stall.html').replace(/\\/g, '/') + (query ? '?' + query : '');
 const chromePath = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const port = 9334;
-const chrome = spawn(chromePath, [
-  '--headless=new', '--disable-gpu', '--autoplay-policy=no-user-gesture-required',
-  '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-  `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(require('os').tmpdir(), 'flux-stall-profile')}`,
-  '--no-first-run', page,
-], { stdio: 'ignore' });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+let chrome;
 
 (async () => {
+  const discovery = await (await fetch('http://localhost:8080/api/webtransport')).json();
+  const params = new URLSearchParams(query);
+  params.set('wtHost', discovery.host || 'localhost');
+  params.set('wtPort', String(discovery.port));
+  params.set('certHashes', (discovery.certHashes || []).join(','));
+  const page = 'file:///' + path.resolve(__dirname, 'test-stall.html').replace(/\\/g, '/') + `?${params}`;
+  chrome = spawn(chromePath, [
+    '--headless=new', '--disable-gpu', '--autoplay-policy=no-user-gesture-required',
+    '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+    `--remote-debugging-port=${port}`, `--user-data-dir=${path.join(require('os').tmpdir(), 'flux-stall-profile')}`,
+    '--no-first-run', page,
+  ], { stdio: 'ignore' });
   await sleep(2000);
   const tabs = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
   const ws = new WebSocket(tabs.find(t => t.type === 'page').webSocketDebuggerUrl);
@@ -52,9 +58,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       p.phase.padEnd(5), `moves/s=${p.moveRate}`, `rx fps=${(s.framesReceived / p.secs).toFixed(1)}`,
       `content fps=${p.contentFps}`, `content ms p50/p95/p99/max=${d(p.contentMs)}`,
       `gaps>100ms=${p.contentGapsOver100ms} >250ms=${p.contentGapsOver250ms} frozen=${p.frozenMsTotal}ms`,
-      `recv ms=${d(p.recvDeltaMs)}`, `rtp ms=${d(p.rtpDeltaMs)}`, `jb=${p.jitterBufferMsPerFrame}ms`,
-      `kf=${s.keyFramesDecoded} pli=${s.pliCount} nack=${s.nackCount} lost=${s.packetsLost}`,
-      `freezes=${s.freezeCount}/${s.totalFreezesDuration}s dropped=${s.framesDropped}`,
+      `recv ms=${d(p.recvDeltaMs)}`, `paint ms=${d(p.presentedMs)}`,
+      `kf=${s.keyFramesDecoded} requests=${s.keyframeRequests} frame-gaps=${s.framesLost} net-lost=${s.packetsLost}`,
+      `dropped=${s.framesDropped}`,
       `cursor msgs=${p.cursorMsgs} (${p.cursorPerSec}/s) bitmaps=${p.cursorBitmaps} last=${JSON.stringify(p.lastCursor)}`,
       `video=${p.videoSize} resStatus=${(p.resolutionStatuses || []).map(r => r.state + ":" + r.width + "x" + r.height).join(",") || "-"}`,
     ].join(' | '));
@@ -62,4 +68,4 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   console.log(report.events.filter(e => !e.startsWith('error={"error":"No active')).join('\n'));
   chrome.kill();
   process.exit(0);
-})().catch(e => { console.error(e); chrome.kill(); process.exit(1); });
+})().catch(e => { console.error(e); chrome?.kill(); process.exit(1); });

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -14,10 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/webtransport-go"
 )
 
 // ---------------------------------------------------------------------------
@@ -28,7 +25,6 @@ type machineUpstream struct {
 	id           string
 	addr         string
 	frameChan    chan frameMsg
-	frameReady   chan struct{} // signalled on every enqueue; wakes paced writes
 	frameQueueMu sync.Mutex
 	frameBuffers frameBufferPool
 	cursorChan   chan cursorMsg
@@ -49,17 +45,10 @@ type machineUpstream struct {
 }
 
 const (
-	defaultFrameDuration    = 16 * time.Millisecond // ~60fps for the first sample
-	minFrameDuration        = 4 * time.Millisecond  // clamp absurdly fast bursts
-	maxSaneFrameDuration    = 30 * time.Second      // cap corrupted/absurd timestamps
-	pacingMultiplier        = 2                     // smooth bursts at 2x target bitrate
-	maxPacingMultiplier     = 4                     // cap frame-size floor at 4x target
-	pacingIDRTargetEmission = 40 * time.Millisecond // emit a keyframe within ~2 frame intervals
-	pacingIDRMinCeiling     = 10_000_000            // bits/s IDR pacing ceiling when the target is low or unknown
-	idrRequestInterval      = 2 * time.Second
-	stageStatsInterval      = 5 * time.Second // how often per-stage timings are logged
-	maxFramePayloadSize     = 10 * 1024 * 1024
-	maxCachedFrameBuffers   = 4
+	idrRequestInterval    = 2 * time.Second
+	stageStatsInterval    = 5 * time.Second
+	maxFramePayloadSize   = 10 * 1024 * 1024
+	maxCachedFrameBuffers = 4
 	// A frame that has waited this long in the relay queue means the relay is
 	// genuinely behind; only then does it skip ahead, at the cost of a recovery
 	// keyframe. Shorter backlogs are sent in order, because dropping any frame
@@ -113,55 +102,6 @@ func (p *frameBufferPool) put(data []byte) {
 	}
 }
 
-// Pion copies RTP payloads, but retains SPS/PPS slices across Payload calls.
-// Give it owned parameter sets so returning a frame buffer cannot corrupt them.
-type framePayloader struct {
-	h264 codecs.H264Payloader
-}
-
-func (p *framePayloader) Payload(mtu uint16, data []byte) [][]byte {
-	var payloads [][]byte
-	emit := func(nalu []byte) {
-		if len(nalu) == 0 {
-			return
-		}
-		if kind := nalu[0] & 0x1f; kind == 7 || kind == 8 {
-			nalu = bytes.Clone(nalu)
-		}
-		packets := p.h264.Payload(mtu, nalu)
-		if payloads == nil {
-			payloads = packets
-		} else {
-			payloads = append(payloads, packets...)
-		}
-	}
-	// Match Pion's Annex B splitting, including mixed 3/4-byte start codes
-	// and raw NAL units with no start code.
-	startCode := []byte{0, 0, 1}
-	start := bytes.Index(data, startCode)
-	if start < 0 {
-		emit(data)
-		return payloads
-	}
-	offset := 3
-	for start < len(data) {
-		end := bytes.Index(data[start+offset:], startCode)
-		if end < 0 {
-			emit(data[start+offset:])
-			break
-		}
-		next := start + offset + end
-		nextOffset := 3
-		if data[next-1] == 0 {
-			next--
-			nextOffset = 4
-		}
-		emit(data[start+offset : next])
-		start, offset = next, nextOffset
-	}
-	return payloads
-}
-
 // Why a keyframe was asked for. Every request path is tagged so the logs show
 // whether keyframes are driven by the viewer's decoder (real loss on the path)
 // or by the relay's own drop paths (the stream not keeping up locally) — the two
@@ -169,10 +109,10 @@ func (p *framePayloader) Payload(mtu uint16, data []byte) [][]byte {
 type idrReason string
 
 const (
-	idrReasonViewerPLI    idrReason = "viewer-pli"
-	idrReasonUpstreamDrop idrReason = "upstream-queue-full"
-	idrReasonStaleQueue   idrReason = "stale-queue-discard"
-	idrReasonAwaitingIDR  idrReason = "awaiting-idr"
+	idrReasonViewerRequest idrReason = "viewer-request"
+	idrReasonUpstreamDrop  idrReason = "upstream-queue-full"
+	idrReasonStaleQueue    idrReason = "stale-queue-discard"
+	idrReasonAwaitingIDR   idrReason = "awaiting-idr"
 )
 
 // idrStats counts keyframe requests by origin, including the ones the gate
@@ -206,7 +146,7 @@ func (s *idrStats) drain() string {
 	}
 	var summary string
 	for _, reason := range []idrReason{
-		idrReasonViewerPLI,
+		idrReasonViewerRequest,
 		idrReasonUpstreamDrop,
 		idrReasonStaleQueue,
 		idrReasonAwaitingIDR,
@@ -224,28 +164,24 @@ func (s *idrStats) drain() string {
 	return summary
 }
 
-// stageStats accumulates the per-frame timings of the relay's own stages over a
-// logging window. The point is to attribute a stall: relay wait is how long a
-// frame sat between arriving from the sender and its first packet going out,
-// pacing is how long the rest of its packets then took.
 type stageStats struct {
 	frames       int
 	maxQueueLen  int
 	queueLenSum  int
 	maxRelayMs   float64
 	relayMsSum   float64
-	maxPacingMs  float64
-	pacingMsSum  float64
+	maxSendMs    float64
+	sendMsSum    float64
 	idrFrames    int
 	maxIDRBytes  int
-	maxIDRPaceMs float64
-	flushed      int // frames whose pacing was cut short by a queued newer frame
+	maxIDRSendMs float64
+	resets       int
 }
 
-func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool, bytes int, flushed bool) {
+func (s *stageStats) observe(queueLen int, relay, send time.Duration, idr bool, bytes int, reset bool) {
 	s.frames++
-	if flushed {
-		s.flushed++
+	if reset {
+		s.resets++
 	}
 	s.queueLenSum += queueLen
 	if queueLen > s.maxQueueLen {
@@ -256,10 +192,10 @@ func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool
 	if relayMs > s.maxRelayMs {
 		s.maxRelayMs = relayMs
 	}
-	pacingMs := pacing.Seconds() * 1000
-	s.pacingMsSum += pacingMs
-	if pacingMs > s.maxPacingMs {
-		s.maxPacingMs = pacingMs
+	sendMs := send.Seconds() * 1000
+	s.sendMsSum += sendMs
+	if sendMs > s.maxSendMs {
+		s.maxSendMs = sendMs
 	}
 	if !idr {
 		return
@@ -268,8 +204,8 @@ func (s *stageStats) observe(queueLen int, relay, pacing time.Duration, idr bool
 	if bytes > s.maxIDRBytes {
 		s.maxIDRBytes = bytes
 	}
-	if pacingMs > s.maxIDRPaceMs {
-		s.maxIDRPaceMs = pacingMs
+	if sendMs > s.maxIDRSendMs {
+		s.maxIDRSendMs = sendMs
 	}
 }
 
@@ -279,29 +215,29 @@ func (s *stageStats) summary() string {
 	}
 	frames := float64(s.frames)
 	summary := fmt.Sprintf(
-		"frames=%d queue avg=%.1f max=%d | relay wait avg=%.1fms max=%.1fms | pacing avg=%.1fms max=%.1fms",
+		"frames=%d queue avg=%.1f max=%d | relay wait avg=%.1fms max=%.1fms | send avg=%.1fms max=%.1fms",
 		s.frames,
 		float64(s.queueLenSum)/frames,
 		s.maxQueueLen,
 		s.relayMsSum/frames,
 		s.maxRelayMs,
-		s.pacingMsSum/frames,
-		s.maxPacingMs,
+		s.sendMsSum/frames,
+		s.maxSendMs,
 	)
 	if s.idrFrames > 0 {
 		summary += fmt.Sprintf(
-			" | idr n=%d max=%d bytes max pacing=%.1fms",
-			s.idrFrames, s.maxIDRBytes, s.maxIDRPaceMs,
+			" | idr n=%d max=%d bytes max send=%.1fms",
+			s.idrFrames, s.maxIDRBytes, s.maxIDRSendMs,
 		)
 	}
-	if s.flushed > 0 {
-		summary += fmt.Sprintf(" | flushed=%d", s.flushed)
+	if s.resets > 0 {
+		summary += fmt.Sprintf(" | resets=%d", s.resets)
 	}
 	return summary
 }
 
 // idrRequestGate bounds the feedback-loop gain: regardless of how many
-// independent drop/PLI paths observe corruption, they can produce at most one
+// independent drop/keyframe-request paths observe corruption, they can produce at most one
 // upstream keyframe request during the interval. The two-second window is
 // deliberately longer than the cost of a large keyframe at the target rate;
 // shortening it makes recovery feedback generate another keyframe before the
@@ -323,72 +259,6 @@ func (g *idrRequestGate) allow() bool {
 	}
 	g.last = now
 	return true
-}
-
-func pacingSchedule(
-	packetSizes []int,
-	targetKbps uint32,
-	frameDuration time.Duration,
-) []time.Duration {
-	return pacingScheduleForFrame(packetSizes, targetKbps, frameDuration, false)
-}
-
-func pacingScheduleForFrame(
-	packetSizes []int,
-	targetKbps uint32,
-	frameDuration time.Duration,
-	idr bool,
-) []time.Duration {
-	schedule := make([]time.Duration, len(packetSizes))
-	if len(packetSizes) == 0 || frameDuration <= 0 {
-		return schedule
-	}
-	frameBits := 0
-	for _, size := range packetSizes {
-		frameBits += size * 8
-	}
-	targetBitsPerSecond := float64(targetKbps) * 1000 * pacingMultiplier
-	frameBitsPerSecond := float64(frameBits) / frameDuration.Seconds()
-	bitsPerSecond := frameBitsPerSecond
-	if targetKbps > 0 {
-		bitsPerSecond = targetBitsPerSecond
-		if bitsPerSecond < frameBitsPerSecond {
-			bitsPerSecond = frameBitsPerSecond
-		}
-		maxBitsPerSecond := float64(targetKbps) * 1000 * maxPacingMultiplier
-		if bitsPerSecond > maxBitsPerSecond {
-			bitsPerSecond = maxBitsPerSecond
-		}
-	}
-	if idr {
-		idrBitsPerSecond := float64(frameBits) / pacingIDRTargetEmission.Seconds()
-		if idrBitsPerSecond > bitsPerSecond {
-			bitsPerSecond = idrBitsPerSecond
-		}
-		idrCeiling := float64(pacingIDRMinCeiling)
-		if scaled := float64(targetKbps) * 1000 * maxPacingMultiplier; scaled > idrCeiling {
-			idrCeiling = scaled
-		}
-		if bitsPerSecond > idrCeiling {
-			bitsPerSecond = idrCeiling
-		}
-	}
-	var elapsedSeconds float64
-	for i, size := range packetSizes {
-		schedule[i] = time.Duration(elapsedSeconds * float64(time.Second))
-		elapsedSeconds += float64(size*8) / bitsPerSecond
-	}
-	return schedule
-}
-
-func assignSequenceNumber(packet *rtp.Packet, next *uint16) {
-	packet.Header.SequenceNumber = *next
-}
-
-func commitSequenceNumber(next *uint16, writeSucceeded bool) {
-	if writeSucceeded {
-		*next = *next + 1
-	}
 }
 
 // latestFrame drains ch, preferring the newest IDR frame over newer P-frames.
@@ -426,35 +296,10 @@ func nextFrame(ch <-chan frameMsg, current frameMsg, now time.Time) (frameMsg, b
 	return latestFrame(ch, current)
 }
 
-func consumeRTPDuration(duration time.Duration, remainder float64) (uint32, float64) {
-	total := duration.Seconds()*90000 + remainder
-	ticks := uint32(total)
-	return ticks, total - float64(ticks)
-}
-
-func captureFrameDuration(lastTs, currentTs uint64, haveLastTs bool) time.Duration {
-	if !haveLastTs || currentTs <= lastTs {
-		return defaultFrameDuration
-	}
-
-	deltaMicros := currentTs - lastTs
-	maxMicros := uint64(maxSaneFrameDuration / time.Microsecond)
-	if deltaMicros > maxMicros {
-		return maxSaneFrameDuration
-	}
-
-	frameDuration := time.Duration(deltaMicros) * time.Microsecond
-	if frameDuration < minFrameDuration {
-		return minFrameDuration
-	}
-	return frameDuration
-}
-
 func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 	u := &machineUpstream{
 		id: id, addr: addr,
 		frameChan:   make(chan frameMsg, 120),
-		frameReady:  make(chan struct{}, 1),
 		cursorChan:  make(chan cursorMsg, 1),
 		commandChan: make(chan []byte, 100),
 		stopChan:    make(chan struct{}),
@@ -518,10 +363,6 @@ func (u *machineUpstream) queueFrame(frame frameMsg) (dropped bool) {
 		}
 		u.frameChan <- frame
 	}
-	select {
-	case u.frameReady <- struct{}{}:
-	default:
-	}
 	return dropped
 }
 
@@ -556,7 +397,7 @@ func (u *machineUpstream) requestIDR(reason idrReason) bool {
 }
 
 func (u *machineUpstream) skipFrameUntilIDR(session *Session, idr bool) bool {
-	if !session.needsIDR || idr {
+	if !session.needsIDR.Load() || idr {
 		return false
 	}
 	u.requestIDR(idrReasonAwaitingIDR)
@@ -583,13 +424,13 @@ func (u *machineUpstream) sendIDRRequest() bool {
 func (u *machineUpstream) requestInitialIDR(session *Session) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if session.initialIDRRequested {
+	if !session.initialIDRRequested.CompareAndSwap(false, true) {
 		return false
 	}
 	if !u.send([]byte{0x01}) {
+		session.initialIDRRequested.Store(false)
 		return false
 	}
-	session.initialIDRRequested = true
 	// Opening the gate window here too: the initial keyframe is the most
 	// expensive one, so a drop observed while it drains must not immediately
 	// ask for another.
@@ -648,12 +489,11 @@ func (u *machineUpstream) clearSession(session *Session) {
 
 func (u *machineUpstream) sendResolutionStatus(data []byte) {
 	sess := u.currentSession()
-	if sess == nil || sess.writer == nil || !json.Valid(data) {
+	if sess == nil || !json.Valid(data) {
 		return
 	}
-	resp, err := json.Marshal(WSMessage{Type: "resolution-status", Data: data})
-	if err == nil {
-		_ = sess.writer.write(websocket.TextMessage, resp)
+	if err := sess.sendMetadataStream(0x03, data); err != nil {
+		log.Printf("[wt:%s] resolution status stream failed: %v", u.id, err)
 	}
 }
 
@@ -883,15 +723,7 @@ func (u *machineUpstream) connectQUIC() error {
 }
 
 func (u *machineUpstream) framePusher() {
-	// The capture source (e.g. a Wayland/mutter screen-cast) delivers frames at
-	// a variable, damage-driven rate and the server drains backlogs in bursts,
-	// so network arrival time is a poor clock. Pace the RTP timestamp by the
-	// frame's capture timestamp (reported by the server) instead, so the browser's
-	// jitter buffer can absorb bursts and play at true capture cadence rather than
-	// running ahead and stalling.
 	var sampleCount uint64
-	var lastTs uint64
-	var haveLastTs bool
 	var stats stageStats
 	statsTicker := time.NewTicker(stageStatsInterval)
 	defer statsTicker.Stop()
@@ -912,110 +744,112 @@ func (u *machineUpstream) framePusher() {
 			var idr, dropped bool
 			msg, idr, dropped = nextFrame(u.frameChan, msg, time.Now())
 			sess := u.currentSession()
-			if sess == nil || sess.VideoTrack == nil {
+			if sess == nil {
 				msg.release()
 				continue
 			}
 			if dropped {
-				sess.needsIDR = true
+				sess.needsIDR.Store(true)
 				if u.requestIDR(idrReasonStaleQueue) {
-					log.Printf("[webrtc:%s] relay fell more than %s behind; discarded queued frames and requesting IDR", u.id, maxRelayBacklog)
+					log.Printf("[wt:%s] relay fell more than %s behind; discarded queued frames and requesting IDR", u.id, maxRelayBacklog)
 				}
 			}
 			sampleCount++
-			// New session: skip P-frames until the next live IDR arrives.
-			// P-frames can't be decoded without their preceding frames.
-			if sess.needsIDR {
+			if sess.needsIDR.Load() {
 				if u.skipFrameUntilIDR(sess, idr) {
 					msg.release()
 					continue
 				}
-				if sess.hasStarted {
-					log.Printf("[webrtc:%s] recovery IDR arrived (%d bytes), resuming stream", u.id, len(msg.data))
+				if sess.hasStarted.Load() {
+					log.Printf("[wt:%s] recovery IDR arrived (%d bytes), resuming stream", u.id, len(msg.data))
 				} else {
-					log.Printf("[webrtc:%s] initial IDR arrived (%d bytes), starting stream", u.id, len(msg.data))
+					log.Printf("[wt:%s] initial IDR arrived (%d bytes), starting stream", u.id, len(msg.data))
 				}
-				sess.needsIDR = false
+				sess.needsIDR.Store(false)
 			} else if idr {
-				log.Printf("[webrtc:%s] IDR sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
+				log.Printf("[wt:%s] IDR sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
 			if idr {
-				sess.hasStarted = true
+				sess.hasStarted.Store(true)
 			}
-			// Duration = capture-time gap since the previous sent sample. The
-			// server timestamp resets on reconnect, so guard against going
-			// backwards and fall back to the nominal duration.
-			frameDuration := captureFrameDuration(lastTs, msg.tsMicros, haveLastTs)
-			lastTs, haveLastTs = msg.tsMicros, true
-			// Log first few frames and IDRs for diagnostics.
 			if sampleCount <= 5 && !idr {
-				log.Printf("[webrtc:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
+				log.Printf("[wt:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
-			curTicks, remainder := consumeRTPDuration(frameDuration, sess.rtpRemainder)
-			sess.rtpRemainder = remainder
 			frameBytes := len(msg.data)
-			packets := sess.Packetizer.Packetize(msg.data, curTicks)
+			writeElapsed, reset, err := u.writeFrame(sess, msg, idr)
 			msg.release()
-			packetSizes := make([]int, len(packets))
-			for i, packet := range packets {
-				packetSizes[i] = packet.MarshalSize()
-			}
-			schedule := pacingScheduleForFrame(packetSizes, u.abr.targetBitrateKbps(), frameDuration, idr)
-			pacingStart := time.Now()
-			_, flushed := u.writePacedPackets(sess, packets, schedule)
-			pacingElapsed := time.Since(pacingStart)
 			var relayWait time.Duration
-			if !msg.receivedAt.IsZero() {
-				relayWait = pacingStart.Sub(msg.receivedAt)
+			if !msg.receivedAt.IsZero() && !msg.receivedAt.After(time.Now()) {
+				relayWait = time.Since(msg.receivedAt) - writeElapsed
 			}
-			stats.observe(queueLen, relayWait, pacingElapsed, idr, frameBytes, flushed)
-			if idr {
-				log.Printf("[webrtc:%s] IDR paced: %d packets, waited %.1fms in relay, sent over %.1fms",
-					u.id, len(packets), relayWait.Seconds()*1000, pacingElapsed.Seconds()*1000)
+			stats.observe(queueLen, relayWait, writeElapsed, idr, frameBytes, reset)
+			if err != nil {
+				sess.needsIDR.Store(true)
+				log.Printf("[wt:%s] video stream write failed: %v", u.id, err)
+				sess.releaseNow()
+			} else if reset {
+				log.Printf("[wt:%s] reset stale delta stream after %.1fms; requested IDR", u.id, writeElapsed.Seconds()*1000)
 			}
 		}
 	}
 }
 
-// writePacedPackets sends one frame's packets on its pacing schedule. Once a
-// newer frame is queued the rest of this frame goes out unpaced: truncating it
-// instead would leave the viewer unable to decode anything until the next
-// keyframe. It returns how many packets were written (fewer only on shutdown)
-// and whether pacing was cut short.
-func (u *machineUpstream) writePacedPackets(
-	sess *Session,
-	packets []*rtp.Packet,
-	schedule []time.Duration,
-) (int, bool) {
-	start := time.Now()
-	flush := false
-	for i, packet := range packets {
-		for !flush {
-			if len(u.frameChan) > 0 {
-				flush = true
-				break
-			}
-			wait := time.Until(start.Add(schedule[i]))
-			if wait <= 0 {
-				break
-			}
-			timer := time.NewTimer(wait)
-			select {
-			case <-u.stopChan:
-				timer.Stop()
-				return i, flush
-			case <-u.frameReady:
-				// Re-checked above: the signal may predate a frame already consumed.
-				timer.Stop()
-			case <-timer.C:
-			}
-		}
-		assignSequenceNumber(packet, &sess.nextSequenceNumber)
-		err := sess.VideoTrack.WriteRTP(packet)
-		if err != nil {
-			log.Printf("[webrtc:%s] write RTP packet error: %v", u.id, err)
-		}
-		commitSequenceNumber(&sess.nextSequenceNumber, err == nil)
+func encodeVideoFrameHeader(seq uint32, msg frameMsg, keyframe bool) [18]byte {
+	var header [18]byte
+	header[0] = 0x01
+	binary.BigEndian.PutUint32(header[1:5], seq)
+	binary.BigEndian.PutUint64(header[5:13], msg.tsMicros)
+	if keyframe {
+		header[13] = 1
 	}
-	return len(packets), flush
+	binary.BigEndian.PutUint32(header[14:18], uint32(len(msg.data)))
+	return header
+}
+
+func shouldResetFrame(keyframe bool, writingFor time.Duration, queuedFrames int) bool {
+	return !keyframe && queuedFrames > 0 && writingFor > 16*time.Millisecond
+}
+
+func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool) (time.Duration, bool, error) {
+	start := time.Now()
+	seq := sess.nextSequence.Add(1) - 1
+	stream, err := sess.transport.OpenUniStreamSync(sess.transport.Context())
+	if err != nil {
+		return time.Since(start), false, err
+	}
+	stopCancel := context.AfterFunc(sess.transport.Context(), func() {
+		stream.CancelWrite(webtransport.StreamErrorCode(1))
+	})
+	defer stopCancel()
+	header := encodeVideoFrameHeader(seq, msg, keyframe)
+	chunks := [][]byte{header[:]}
+	for offset := 0; offset < len(msg.data); offset += 16 * 1024 {
+		end := min(offset+16*1024, len(msg.data))
+		chunks = append(chunks, msg.data[offset:end])
+	}
+	for _, chunk := range chunks {
+		for len(chunk) > 0 {
+			if shouldResetFrame(keyframe, time.Since(start), len(u.frameChan)) {
+				stream.CancelWrite(webtransport.StreamErrorCode(2))
+				sess.needsIDR.Store(true)
+				u.requestIDR(idrReasonStaleQueue)
+				return time.Since(start), true, nil
+			}
+			n, writeErr := stream.Write(chunk)
+			if writeErr != nil {
+				return time.Since(start), false, writeErr
+			}
+			if n == 0 {
+				return time.Since(start), false, io.ErrShortWrite
+			}
+			chunk = chunk[n:]
+		}
+	}
+	if err := stream.Close(); err != nil {
+		return time.Since(start), false, err
+	}
+	if sess.estimator != nil {
+		sess.estimator.onFrameSent(seq, len(msg.data), time.Now())
+	}
+	return time.Since(start), false, nil
 }

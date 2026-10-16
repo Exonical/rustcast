@@ -4,34 +4,32 @@ import (
 	"encoding/binary"
 	"testing"
 	"time"
-
-	"github.com/pion/rtcp"
 )
 
-func TestABRGCCInitialBitrateBps(t *testing.T) {
+func TestABRInitialBitrateKbps(t *testing.T) {
 	tests := []struct {
 		name        string
 		ceilingKbps uint32
-		want        int
+		want        uint32
 	}{
-		{name: "default", ceilingKbps: 0, want: 5_000_000},
-		{name: "sender target", ceilingKbps: 12_000, want: 12_000_000},
-		{name: "maximum", ceilingKbps: 100_000, want: 50_000_000},
-		{name: "minimum", ceilingKbps: 1_000, want: 1_500_000},
+		{name: "default", ceilingKbps: 0, want: abrInitialBitrateKbps},
+		{name: "sender target", ceilingKbps: 12_000, want: 12_000},
+		{name: "maximum", ceilingKbps: 100_000, want: 50_000},
+		{name: "minimum", ceilingKbps: 1_000, want: 1_500},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			state := &abrState{ceilingKbps: tt.ceilingKbps}
-			if got := state.gccInitialBitrateBps(); got != tt.want {
+			if got := state.initialBitrateKbps(); got != tt.want {
 				t.Fatalf("initial bitrate = %d, want %d", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestABRGCCEstimateClampsToFloorAndCeiling(t *testing.T) {
+func TestABREstimateClampsToFloorAndCeiling(t *testing.T) {
 	commands := make(chan []byte, 4)
-	state := &abrState{commandChan: commands, ceilingKbps: 10_000, lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval)}
+	state := &abrState{commandChan: commands, ceilingKbps: 10_000, lastEstimateUpdate: time.Now().Add(-abrEstimateInterval)}
 
 	state.onEstimate(500)
 	if state.targetKbps != abrMinKbps {
@@ -41,7 +39,7 @@ func TestABRGCCEstimateClampsToFloorAndCeiling(t *testing.T) {
 		t.Fatalf("floor command = %d, want %d", got, abrMinKbps)
 	}
 
-	state.lastGCCUpdate = time.Now().Add(-abrGCCUpdateInterval)
+	state.lastEstimateUpdate = time.Now().Add(-abrEstimateInterval)
 	state.onEstimate(20_000)
 	if state.targetKbps != 10_000 {
 		t.Fatalf("ceiling target = %d, want 10000", state.targetKbps)
@@ -51,13 +49,13 @@ func TestABRGCCEstimateClampsToFloorAndCeiling(t *testing.T) {
 	}
 }
 
-func TestABRGCCEstimateSuppressesSmallAndRapidUpdates(t *testing.T) {
+func TestABREstimateSuppressesSmallAndRapidUpdates(t *testing.T) {
 	commands := make(chan []byte, 4)
 	state := &abrState{
-		commandChan:   commands,
-		targetKbps:    5_000,
-		ceilingKbps:   20_000,
-		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
+		commandChan:        commands,
+		targetKbps:         5_000,
+		ceilingKbps:        20_000,
+		lastEstimateUpdate: time.Now().Add(-abrEstimateInterval),
 	}
 
 	state.onEstimate(5_400)
@@ -85,12 +83,12 @@ func TestABRGCCEstimateSuppressesSmallAndRapidUpdates(t *testing.T) {
 	}
 }
 
-func TestABRGCCEstimateDoesNotRepeatClampCommands(t *testing.T) {
+func TestABREstimateDoesNotRepeatClampCommands(t *testing.T) {
 	floorCommands := make(chan []byte, 4)
 	floor := &abrState{
-		commandChan:   floorCommands,
-		targetKbps:    abrMinKbps,
-		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
+		commandChan:        floorCommands,
+		targetKbps:         abrMinKbps,
+		lastEstimateUpdate: time.Now().Add(-abrEstimateInterval),
 	}
 	floor.onEstimate(500)
 	if len(floorCommands) != 0 {
@@ -99,10 +97,10 @@ func TestABRGCCEstimateDoesNotRepeatClampCommands(t *testing.T) {
 
 	ceilingCommands := make(chan []byte, 4)
 	ceiling := &abrState{
-		commandChan:   ceilingCommands,
-		targetKbps:    10_000,
-		ceilingKbps:   10_000,
-		lastGCCUpdate: time.Now().Add(-abrGCCUpdateInterval),
+		commandChan:        ceilingCommands,
+		targetKbps:         10_000,
+		ceilingKbps:        10_000,
+		lastEstimateUpdate: time.Now().Add(-abrEstimateInterval),
 	}
 	ceiling.onEstimate(20_000)
 	if len(ceilingCommands) != 0 {
@@ -110,7 +108,7 @@ func TestABRGCCEstimateDoesNotRepeatClampCommands(t *testing.T) {
 	}
 }
 
-func TestABRReportsDoNotSteerGCCTarget(t *testing.T) {
+func TestABRReportsDoNotChangeTarget(t *testing.T) {
 	commands := make(chan []byte, 4)
 	state := &abrState{
 		commandChan: commands,
@@ -148,27 +146,6 @@ func TestABRSenderCeilingOnlyPullsTargetDown(t *testing.T) {
 	}
 	if len(commands) != 0 {
 		t.Fatal("raised ceiling emitted a command")
-	}
-}
-
-func TestRTTFromReport(t *testing.T) {
-	arrival := time.Unix(1_700_000_000, 500_000_000)
-	const ntpEpochOffset = 2208988800
-	secs := uint64(arrival.Unix()) + ntpEpochOffset
-	frac := uint64(arrival.Nanosecond()) << 32 / uint64(time.Second)
-	nowNTP32 := uint32(secs<<16 | frac>>16)
-
-	report := rtcp.ReceptionReport{
-		LastSenderReport: nowNTP32 - 65536/10, // SR sent 100ms before arrival
-		Delay:            65536 / 20,          // receiver held it 50ms
-	}
-	rtt := rttFromReport(report, arrival)
-	if rtt < 45*time.Millisecond || rtt > 55*time.Millisecond {
-		t.Fatalf("rtt = %v, want ~50ms", rtt)
-	}
-
-	if got := rttFromReport(rtcp.ReceptionReport{}, arrival); got != 0 {
-		t.Fatalf("zero LSR should yield 0, got %v", got)
 	}
 }
 
