@@ -22,26 +22,28 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id           string
-	addr         string
-	frameChan    chan frameMsg
-	frameQueueMu sync.Mutex
-	frameBuffers frameBufferPool
-	cursorChan   chan cursorMsg
-	commandChan  chan []byte
-	abr          *abrState
-	stopChan     chan struct{}
-	stopOnce     sync.Once
-	viewers      int // Protected by machineRegistry.mu.
-	viewerCount  atomic.Uint32
-	mu           sync.Mutex
-	session      *Session
-	lastCursor   *cursorMsg
-	conn         net.Conn
-	cancel       context.CancelFunc
-	status       func(string)
-	idrGate      idrRequestGate
-	idrStats     idrStats
+	id            string
+	addr          string
+	frameChan     chan frameMsg
+	frameQueueMu  sync.Mutex
+	frameBuffers  frameBufferPool
+	cursorChan    chan cursorMsg
+	commandChan   chan []byte
+	abr           *abrState
+	stopChan      chan struct{}
+	stopOnce      sync.Once
+	viewers       int // Protected by machineRegistry.mu.
+	viewerCount   atomic.Uint32
+	mu            sync.Mutex
+	session       *Session
+	lastCursor    *cursorMsg
+	conn          net.Conn
+	cancel        context.CancelFunc
+	status        func(string)
+	idrGate       idrRequestGate
+	idrStats      idrStats
+	metrics       *machineMetrics
+	connectedOnce atomic.Bool
 }
 
 const (
@@ -122,6 +124,7 @@ type idrStats struct {
 	mu         sync.Mutex
 	granted    map[idrReason]int
 	suppressed map[idrReason]int
+	metrics    *machineMetrics
 }
 
 func (s *idrStats) record(reason idrReason, granted bool) {
@@ -135,6 +138,9 @@ func (s *idrStats) record(reason idrReason, granted bool) {
 		*counts = map[idrReason]int{}
 	}
 	(*counts)[reason]++
+	if s.metrics != nil {
+		s.metrics.recordIDR(reason, granted)
+	}
 }
 
 // drain returns a summary of the counts since the last call and resets them.
@@ -296,7 +302,14 @@ func nextFrame(ch <-chan frameMsg, current frameMsg, now time.Time) (frameMsg, b
 	return latestFrame(ch, current)
 }
 
-func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
+func newMachineUpstream(addr, id string, status func(string), metricChildren ...*machineMetrics) *machineUpstream {
+	var metrics *machineMetrics
+	if len(metricChildren) > 0 {
+		metrics = metricChildren[0]
+	}
+	if metrics == nil {
+		metrics = newRelayMetrics().machine(id)
+	}
 	u := &machineUpstream{
 		id: id, addr: addr,
 		frameChan:   make(chan frameMsg, 120),
@@ -305,8 +318,10 @@ func newMachineUpstream(addr, id string, status func(string)) *machineUpstream {
 		stopChan:    make(chan struct{}),
 		status:      status,
 		idrGate:     newIDRRequestGate(time.Now),
+		metrics:     metrics,
 	}
-	u.abr = &abrState{commandChan: u.commandChan}
+	u.idrStats.metrics = metrics
+	u.abr = &abrState{commandChan: u.commandChan, metrics: metrics}
 	return u
 }
 
@@ -329,12 +344,13 @@ func (u *machineUpstream) stop() {
 		}
 		u.mu.Unlock()
 		u.frameQueueMu.Lock()
-		defer u.frameQueueMu.Unlock()
 		for {
 			select {
 			case frame := <-u.frameChan:
 				frame.release()
 			default:
+				u.frameQueueMu.Unlock()
+				u.metrics.owner.deleteMachine(u.id)
 				return
 			}
 		}
@@ -431,6 +447,7 @@ func (u *machineUpstream) requestInitialIDR(session *Session) bool {
 		session.initialIDRRequested.Store(false)
 		return false
 	}
+	u.idrStats.record(idrReasonViewerRequest, true)
 	// Opening the gate window here too: the initial keyframe is the most
 	// expensive one, so a drop observed while it drains must not immediately
 	// ask for another.
@@ -459,6 +476,7 @@ func (u *machineUpstream) sendCursor(msg cursorMsg) {
 
 func (u *machineUpstream) sendViewerCount(count int) bool {
 	u.viewerCount.Store(uint32(count))
+	u.metrics.viewers.Set(float64(count))
 	cmd := make([]byte, 5)
 	cmd[0] = 0x04
 	binary.BigEndian.PutUint32(cmd[1:], uint32(count))
@@ -524,6 +542,7 @@ func (u *machineUpstream) connectFrameServer() {
 		}
 		log.Printf("[frame:%s] connected to %s", u.id, u.addr)
 		u.status("connected")
+		u.markConnected()
 		u.mu.Lock()
 		u.conn = conn
 		u.mu.Unlock()
@@ -547,6 +566,7 @@ func (u *machineUpstream) connectFrameServer() {
 			}
 		}()
 		err = u.readFrames(conn)
+		u.markDisconnected()
 		close(done) // Stop the writer.
 		conn.Close()
 		u.mu.Lock()
@@ -601,6 +621,8 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 		switch messageType {
 		case 0x01:
 			frameCount++
+			u.metrics.upstreamFrames.Inc()
+			u.metrics.upstreamBytes.Add(float64(len(data)))
 			u.abr.countFrameBytes(len(data))
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, payloadLen)
@@ -639,9 +661,11 @@ func (u *machineUpstream) connectQUIC() error {
 	}
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
 	u.status("connected")
+	u.markConnected()
 	ctx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
 	defer conn.CloseWithError(0, "done")
+	defer u.markDisconnected()
 	u.mu.Lock()
 	u.cancel = connCancel
 	u.mu.Unlock()
@@ -702,6 +726,8 @@ func (u *machineUpstream) connectQUIC() error {
 		switch messageType {
 		case 0x01:
 			frameCount++
+			u.metrics.upstreamFrames.Inc()
+			u.metrics.upstreamBytes.Add(float64(len(data)))
 			u.abr.countFrameBytes(len(data))
 			if frameCount%300 == 0 {
 				log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, payloadLen)
@@ -720,6 +746,17 @@ func (u *machineUpstream) connectQUIC() error {
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
 	}
+}
+
+func (u *machineUpstream) markConnected() {
+	if u.connectedOnce.Swap(true) {
+		u.metrics.upstreamReconnects.Inc()
+	}
+	u.metrics.upstreamConnected.Set(1)
+}
+
+func (u *machineUpstream) markDisconnected() {
+	u.metrics.upstreamConnected.Set(0)
 }
 
 func (u *machineUpstream) framePusher() {
@@ -750,6 +787,7 @@ func (u *machineUpstream) framePusher() {
 			}
 			if dropped {
 				sess.needsIDR.Store(true)
+				u.metrics.framesDroppedStale.Inc()
 				if u.requestIDR(idrReasonStaleQueue) {
 					log.Printf("[wt:%s] relay fell more than %s behind; discarded queued frames and requesting IDR", u.id, maxRelayBacklog)
 				}
@@ -757,6 +795,7 @@ func (u *machineUpstream) framePusher() {
 			sampleCount++
 			if sess.needsIDR.Load() {
 				if u.skipFrameUntilIDR(sess, idr) {
+					u.metrics.framesDroppedIDR.Inc()
 					msg.release()
 					continue
 				}
@@ -776,8 +815,21 @@ func (u *machineUpstream) framePusher() {
 				log.Printf("[wt:%s] sample #%d: %d bytes, NALUs: %s", u.id, sampleCount, len(msg.data), describeNALUs(msg.data))
 			}
 			frameBytes := len(msg.data)
+			writeStarted := time.Now()
+			queueWait := time.Duration(0)
+			if !msg.receivedAt.IsZero() && !msg.receivedAt.After(writeStarted) {
+				queueWait = writeStarted.Sub(msg.receivedAt)
+			}
 			writeElapsed, reset, err := u.writeFrame(sess, msg, idr)
 			msg.release()
+			u.metrics.recordFrameWrite(idr, frameBytes, writeElapsed, queueWait, err == nil && !reset, reset)
+			if err == nil && !reset {
+				sess.firstFrameWritten.Do(func() {
+					if !sess.acceptedAt.IsZero() {
+						u.metrics.timeToFirstFrame.Observe(time.Since(sess.acceptedAt).Seconds())
+					}
+				})
+			}
 			var relayWait time.Duration
 			if !msg.receivedAt.IsZero() && !msg.receivedAt.After(time.Now()) {
 				relayWait = time.Since(msg.receivedAt) - writeElapsed

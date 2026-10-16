@@ -58,10 +58,20 @@ type machineRecord struct {
 type machineRegistry struct {
 	mu       sync.Mutex
 	machines map[string]*machineRecord
+	metrics  *relayMetrics
 }
 
 func newMachineRegistry() *machineRegistry {
-	return &machineRegistry{machines: make(map[string]*machineRecord)}
+	return &machineRegistry{machines: make(map[string]*machineRecord), metrics: newRelayMetrics()}
+}
+
+func (r *machineRegistry) metricMachineID(id string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.machines[id]; ok {
+		return id
+	}
+	return "unknown"
 }
 
 func (r *machineRegistry) seedStatic(id, name, endpoint string) {
@@ -167,6 +177,8 @@ func (r *machineRegistry) deregister(id string) bool {
 	r.mu.Unlock()
 	if upstream != nil {
 		upstream.stop()
+	} else {
+		r.metrics.deleteMachine(id)
 	}
 	return true
 }
@@ -182,9 +194,10 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		return nil, errMachineInUse
 	}
 	if m.upstream == nil {
+		machineMetrics := r.metrics.machine(m.ID)
 		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
-		})
+		}, machineMetrics)
 		if m.TargetBitrate != 0 {
 			m.upstream.abr.setSenderTarget(m.TargetBitrate)
 		}

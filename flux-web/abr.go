@@ -14,6 +14,7 @@ import (
 type abrState struct {
 	mu          sync.Mutex
 	commandChan chan []byte
+	metrics     *machineMetrics
 
 	bytesReceived uint64    // video bytes since last sample
 	sampleStart   time.Time // start of current measurement window
@@ -218,6 +219,9 @@ func (a *abrState) sendBitrateCommand(kbps uint32) {
 	binary.BigEndian.PutUint32(cmd[1:], kbps)
 	select {
 	case a.commandChan <- cmd:
+		if a.metrics != nil {
+			a.metrics.encoderTarget.Set(float64(kbps))
+		}
 	default:
 	}
 }

@@ -41,6 +41,7 @@ func main() {
 		frameServerAddr = "127.0.0.1:8556"
 	}
 	registry := newMachineRegistry()
+	serveMetrics(os.Getenv("FLUX_METRICS_ADDR"), registry.metrics)
 	registry.seedStatic("default", "Configured Flux Server", frameServerAddr)
 
 	certificates, err := newRelayCertificateManager(
