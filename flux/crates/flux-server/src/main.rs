@@ -498,7 +498,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         })?;
 
-    // ── Start TCP frame server (for Go WebRTC relay) ─────────────
+    // ── Start TCP frame server (for Go relay) ─────────────
     let frame_port = config.server.signaling_port + 2; // e.g. 8555
     let frame_addr = format!("{}:{}", config.bind_address, frame_port);
     let frame_listener = tokio::net::TcpListener::bind(&frame_addr).await?;
@@ -1139,7 +1139,7 @@ fn build_encode_session_for(
         dynamic_range: flux_core::types::DynamicRange::Sdr,
         chroma_sampling: flux_core::types::ChromaSampling::Yuv420,
         // Emit a keyframe every ~2s so a late joiner or any decode desync
-        // recovers on its own without depending solely on a PLI/IDR request.
+        // recovers on its own without depending solely on a keyframe request.
         gop_size: framerate.saturating_mul(2).max(1),
         b_frames: 0,
         max_ref_frames: 1,

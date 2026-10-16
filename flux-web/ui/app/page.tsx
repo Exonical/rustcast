@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as Toggle from "@radix-ui/react-toggle";
 import * as Tooltip from "@radix-ui/react-tooltip";
 import * as Separator from "@radix-ui/react-separator";
-import { WebRTCClient, type ConnectionState, type CursorMetadata, type ResolutionStatus, type WebRTCStats } from "@/lib/webrtc-client";
+import { WebTransportClient, type ConnectionState, type CursorMetadata, type ResolutionStatus, type StreamStats } from "@/lib/webtransport-client";
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget } from "@/lib/local-controls";
@@ -231,12 +231,12 @@ function ResolutionPicker({ machine, onBack, onSelect }: {
 }
 
 function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resolution?: { width: number; height: number }; onBack: () => void }) {
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const clientRef = useRef<WebRTCClient | null>(null);
+  const clientRef = useRef<WebTransportClient | null>(null);
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
-  const [stats, setStats] = useState<WebRTCStats | null>(null);
+  const [stats, setStats] = useState<StreamStats | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showStats, setShowStats] = useState(true);
   const [showControls, setShowControls] = useState(true);
@@ -321,20 +321,13 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     heldButtons.current.clear();
   }, [cancelPendingMove]);
 
-  // WebRTC client
   useEffect(() => {
-    const client = new WebRTCClient(undefined, machine.id, resolution);
+    const client = new WebTransportClient(machine.id, resolution);
+    if (canvasRef.current) client.attachCanvas(canvasRef.current);
     clientRef.current = client;
     client.onStateChange = (state) => {
       setConnectionState(state);
       if (state !== "connected") releaseAllInput();
-    };
-    client.onStream = (stream) => {
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        video.play().catch(() => {});
-      }
     };
     client.onStats = setStats;
     client.onCursor = (next) => {
@@ -357,25 +350,26 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
 
   useEffect(() => {
     const updateLayout = () => {
-      const video = videoRef.current;
-      if (!video) return;
-      const rect = video.getBoundingClientRect();
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
       setVideoLayout({
-        width: video.videoWidth,
-        height: video.videoHeight,
+        width: canvas.width,
+        height: canvas.height,
         boxWidth: rect.width,
         boxHeight: rect.height,
       });
     };
     updateLayout();
-    const video = videoRef.current;
-    video?.addEventListener("loadedmetadata", updateLayout);
+    const canvas = canvasRef.current;
+    const observer = canvas ? new ResizeObserver(updateLayout) : null;
+    if (canvas && observer) observer.observe(canvas);
     window.addEventListener("resize", updateLayout);
     return () => {
-      video?.removeEventListener("loadedmetadata", updateLayout);
+      observer?.disconnect();
       window.removeEventListener("resize", updateLayout);
     };
-  }, [isFullscreen]);
+  }, [isFullscreen, stats?.width, stats?.height]);
 
   useEffect(() => {
     const h = () => setIsFullscreen(!!document.fullscreenElement);
@@ -426,15 +420,15 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
   }, [pointerLockEnabled, requestPointerLock]);
 
   const getNormalizedCoords = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!videoRef.current) return null;
-    const video = videoRef.current;
-    const rect = video.getBoundingClientRect();
-    
+    if (!canvasRef.current) return null;
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+
     const geometry = getContainedVideoGeometry(
       rect.width,
       rect.height,
-      video.videoWidth,
-      video.videoHeight,
+      canvas.width,
+      canvas.height,
     );
     if (!geometry) return null;
 
@@ -462,10 +456,10 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     if (isLocalControlTarget(e.target)) return;
 
     // Input capture
-    if (!clientRef.current || !videoRef.current) return;
+    if (!clientRef.current || !canvasRef.current) return;
     
     // Only send move if we have valid video dimensions
-    if (videoRef.current.videoWidth === 0) return;
+    if (canvasRef.current.width === 0) return;
 
     const coords = getNormalizedCoords(e);
     if (!coords) return;
@@ -555,7 +549,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
     if (
       pointerLockEnabled &&
       !isPointerLocked &&
-      (e.target === containerRef.current || e.target === videoRef.current)
+      (e.target === containerRef.current || e.target === canvasRef.current)
     ) {
       requestPointerLock();
     }
@@ -699,11 +693,10 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
           onMouseEnter={() => setVideoHovered(true)}
           onMouseLeave={() => setVideoHovered(false)}
         >
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
+          <canvas
+            ref={canvasRef}
+            width={0}
+            height={0}
             className="absolute inset-0 h-full w-full object-contain bg-black pointer-events-none"
           />
           <CursorOverlay cursor={cursor} layout={videoLayout} />
@@ -835,7 +828,7 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
             <div className="mb-3 flex items-center justify-between">
               <div>
                 <p className="text-xs font-semibold text-zinc-200">Stream health</p>
-                <p className="text-[11px] text-zinc-500">Live WebRTC telemetry</p>
+                <p className="text-[11px] text-zinc-500">Live WebTransport telemetry</p>
               </div>
               <span className={`rounded-full px-2 py-1 text-[10px] font-medium ${stats ? "bg-emerald-400/10 text-emerald-300" : "bg-amber-400/10 text-amber-300"}`}>
                 {stats ? "LIVE" : "WAITING"}
@@ -846,7 +839,6 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
               <StatCard label="Frame rate" value={stats ? `${stats.fps.toFixed(1)} fps` : "—"} />
               <StatCard label="Bitrate" value={stats ? formatBitrate(stats.bitrate) : "—"} accent />
               <StatCard label="Packets lost" value={stats ? stats.packetsLost.toLocaleString() : "—"} accent={!!stats && stats.packetsLost > 0} />
-              <StatCard label="Jitter" value={stats ? `${(stats.jitter * 1000).toFixed(1)} ms` : "—"} />
               <StatCard label="Received" value={stats ? formatBytes(stats.bytesReceived) : "—"} />
               <StatCard
                 label="Media RTT"
@@ -859,9 +851,9 @@ function StreamViewer({ machine, resolution, onBack }: { machine: Machine; resol
                 accent={!!stats?.controlRttMs && stats.controlRttMs > 100}
               />
               <StatCard
-                label="Jitter buffer"
-                value={stats?.jitterBufferMs != null ? `${stats.jitterBufferMs.toFixed(0)} ms` : "—"}
-                accent={!!stats?.jitterBufferMs && stats.jitterBufferMs > 100}
+                label="Receive → paint"
+                value={stats?.receiveToPaintMs != null ? `${stats.receiveToPaintMs.toFixed(1)} ms` : "—"}
+                accent={!!stats?.receiveToPaintMs && stats.receiveToPaintMs > 100}
               />
               <StatCard label="Decode" value={stats?.decodeMs != null ? `${stats.decodeMs.toFixed(1)} ms` : "—"} />
               <StatCard
