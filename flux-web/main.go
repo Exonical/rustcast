@@ -41,6 +41,7 @@ func main() {
 		frameServerAddr = "127.0.0.1:8556"
 	}
 	registry := newMachineRegistry()
+	sessions := newSessionRegistry()
 	registry.seedStatic("default", "Configured Flux Server", frameServerAddr)
 
 	certificates, err := newRelayCertificateManager(
@@ -51,7 +52,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load WebTransport TLS certificate: %v", err)
 	}
-	wtServer := newWebTransportServer(registry, certificates)
+	wtServer := newWebTransportServer(registry, sessions, certificates)
 	udpConn, err := listenWebTransportUDP()
 	if err != nil {
 		log.Fatalf("listen for WebTransport: %v", err)
@@ -70,6 +71,7 @@ func main() {
 	r := gin.Default()
 	r.Use(cors.Default())
 	registerMachineRoutes(r, registry)
+	registerSessionRoutes(r, sessions)
 	r.GET("/api/webtransport", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"host":       os.Getenv("FLUX_WT_PUBLIC_HOST"),

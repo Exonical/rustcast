@@ -101,6 +101,7 @@ export class WebTransportClient {
   private controlRttMs: number | null = null;
   private firstDecodedFrame = false;
   private waitingForKeyframe = true;
+  sessionId: string | null = null;
   private bytesReceived = 0;
   private bytesWindow = 0;
   private framesWindow = 0;
@@ -116,6 +117,9 @@ export class WebTransportClient {
   onStats: ((stats: StreamStats) => void) | null = null;
   onCursor: ((cursor: CursorMetadata) => void) | null = null;
   onResolutionStatus: ((status: ResolutionStatus) => void) | null = null;
+  onSessionId: ((id: string) => void) | null = null;
+  onError: ((message: string) => void) | null = null;
+  onSessionEnded: ((reason: string) => void) | null = null;
 
   constructor(
     private readonly machineId?: string,
@@ -134,6 +138,7 @@ export class WebTransportClient {
     this.closeCurrent();
     this.generation++;
     const generation = this.generation;
+    this.sessionId = null;
     this.decodeChain = Promise.resolve();
     this.setState("connecting");
     this.sequencer = new FrameSequencer();
@@ -148,6 +153,7 @@ export class WebTransportClient {
       const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
       const url = new URL(`https://${urlHost}:${discovery.port}/wt`);
       if (this.machineId) url.searchParams.set("machine", this.machineId);
+      if (typeof navigator !== "undefined" && navigator.userAgent) url.searchParams.set("user_agent", navigator.userAgent);
       if (this.resolution) {
         url.searchParams.set("width", String(this.resolution.width));
         url.searchParams.set("height", String(this.resolution.height));
@@ -220,7 +226,30 @@ export class WebTransportClient {
   }
 
   private handleControlMessage(message: ControlMessage): void {
-    if (message.type === "cursor") this.onCursor?.(message.data as CursorMetadata);
+    if (message.type === "session") {
+      const id = (message.data as { id?: unknown } | undefined)?.id;
+      if (typeof id === "string") {
+        this.sessionId = id;
+        this.onSessionId?.(id);
+      }
+    } else if (message.type === "error") {
+      const data = message.data as { error?: unknown } | string | undefined;
+      this.intentionalClose = true;
+      this.onError?.(typeof data === "string"
+        ? data
+        : typeof data?.error === "string" ? data.error : "The relay rejected the connection.");
+      this.closeCurrent();
+      this.setState("failed");
+    } else if (message.type === "session-ended") {
+      const data = message.data as { reason?: unknown } | string | undefined;
+      const reason = typeof data === "string"
+        ? data
+        : typeof data?.reason === "string" ? data.reason : "Disconnected by the relay";
+      this.intentionalClose = true;
+      this.closeCurrent();
+      this.setState("disconnected");
+      this.onSessionEnded?.(reason);
+    } else if (message.type === "cursor") this.onCursor?.(message.data as CursorMetadata);
     else if (message.type === "resolution-status") this.onResolutionStatus?.(message.data as ResolutionStatus);
     else if (message.type === "latency-pong") {
       const sentAt = (message.data as { t?: unknown } | undefined)?.t;

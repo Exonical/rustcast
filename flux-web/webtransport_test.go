@@ -93,6 +93,7 @@ func TestRelayCertificatePropertiesAndHash(t *testing.T) {
 
 func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	registry := newMachineRegistry()
+	sessions := newSessionRegistry()
 	registry.seedStatic("default", "test", "127.0.0.1:0")
 	upstream := newMachineUpstream("", "default", func(string) {})
 	registry.mu.Lock()
@@ -105,7 +106,7 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, certificates)
+	server := newWebTransportServer(registry, sessions, certificates)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -154,11 +155,46 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 		Type: "latency-ping",
 		Data: json.RawMessage(`{"t":0}`),
 	})
+	connected := readTestControlMessage(t, control)
+	if connected.Type != "session" {
+		t.Fatalf("first control message type = %q, want session", connected.Type)
+	}
+	var sessionID struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(connected.Data, &sessionID); err != nil {
+		t.Fatalf("decode session message: %v", err)
+	}
+	if len(sessionID.ID) != 32 {
+		t.Fatalf("session id = %q, want 32 hex characters", sessionID.ID)
+	}
+	for _, char := range sessionID.ID {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			t.Fatalf("session id = %q, want lowercase hexadecimal", sessionID.ID)
+		}
+	}
+	listed := sessions.list()
+	if len(listed) != 1 || listed[0].ID != sessionID.ID || listed[0].MachineID != "default" ||
+		listed[0].Width != 0 || listed[0].Height != 0 {
+		t.Fatalf("unexpected session registry entry: %+v", listed)
+	}
+	pong := readTestControlMessage(t, control)
+	if pong.Type != "latency-pong" {
+		t.Fatalf("second control message type = %q, want latency-pong", pong.Type)
+	}
 	waitForTestCondition(t, 3*time.Second, func() bool {
 		return upstream.currentSession() != nil
 	})
 
 	waitForUpstreamIDR(t, upstream)
+	draining := true
+	for draining {
+		select {
+		case <-upstream.commandChan:
+		default:
+			draining = false
+		}
+	}
 	upstream.mu.Lock()
 	upstream.idrGate.last = time.Now().Add(-idrRequestInterval)
 	upstream.mu.Unlock()
@@ -196,7 +232,99 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if string(received) != string(payload) {
 		t.Fatalf("video payload = %x, want %x", received, payload)
 	}
-	_ = control.Close()
+	disconnected := make(chan bool, 1)
+	go func() { disconnected <- sessions.disconnect(sessionID.ID) }()
+	ended := readTestControlMessage(t, control)
+	if ended.Type != "session-ended" {
+		t.Fatalf("end control type = %q, want session-ended", ended.Type)
+	}
+	var endedData struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(ended.Data, &endedData); err != nil || endedData.Reason == "" {
+		t.Fatalf("session-ended reason = %+v, err=%v", endedData, err)
+	}
+	_ = clientSession.CloseWithError(0, "session-ended received")
+	if !<-disconnected {
+		t.Fatal("active session could not be disconnected")
+	}
+	waitForTestCondition(t, time.Second, func() bool {
+		return len(sessions.list()) == 0 && registry.list()[0].Viewers == 0
+	})
+}
+
+func TestLoopbackWebTransportClientCloseRemovesSession(t *testing.T) {
+	registry := newMachineRegistry()
+	sessions := newSessionRegistry()
+	registry.seedStatic("default", "test", "127.0.0.1:0")
+	upstream := newMachineUpstream("", "default", func(string) {})
+	registry.mu.Lock()
+	registry.machines["default"].upstream = upstream
+	registry.mu.Unlock()
+	go upstream.framePusher()
+	defer upstream.stop()
+
+	certificates, err := newRelayCertificateManager("", "", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newWebTransportServer(registry, sessions, certificates)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(packetConn)
+	}()
+	defer func() {
+		_ = server.Close()
+		_ = packetConn.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Error("WebTransport server did not stop")
+		}
+	}()
+	time.Sleep(25 * time.Millisecond)
+
+	transport := &webtransport.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
+		QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+	}
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	target := (&url.URL{Scheme: "https", Host: packetConn.LocalAddr().String(), Path: "/wt", RawQuery: "machine=default&width=1280&height=720"}).String()
+	_, clientSession, err := transport.Dial(ctx, target, nil)
+	if err != nil {
+		t.Fatalf("dial WebTransport session: %v", err)
+	}
+	control, err := clientSession.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open client control stream: %v", err)
+	}
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "latency-ping",
+		Data: json.RawMessage(`{"t":0}`),
+	})
+	connected := readTestControlMessage(t, control)
+	if connected.Type != "session" {
+		t.Fatalf("first control message type = %q, want session", connected.Type)
+	}
+	listed := sessions.list()
+	if len(listed) != 1 || listed[0].MachineID != "default" || listed[0].Width != 1280 || listed[0].Height != 720 {
+		t.Fatalf("unexpected registered session: %+v", listed)
+	}
+	waitForTestCondition(t, time.Second, func() bool {
+		return len(sessions.list()) == 1 && registry.list()[0].Viewers == 1
+	})
+
+	_ = clientSession.CloseWithError(0, "viewer closed")
+	waitForTestCondition(t, time.Second, func() bool {
+		return len(sessions.list()) == 0 && registry.list()[0].Viewers == 0
+	})
 }
 
 func waitForUpstreamIDR(t *testing.T, upstream *machineUpstream) {
@@ -226,6 +354,24 @@ func writeTestControlMessage(t *testing.T, stream io.Writer, message controlMess
 	if _, err := stream.Write(record); err != nil {
 		t.Fatalf("write control message: %v", err)
 	}
+}
+
+func readTestControlMessage(t *testing.T, stream io.Reader) controlMessage {
+	t.Helper()
+	var header [4]byte
+	if _, err := io.ReadFull(stream, header[:]); err != nil {
+		t.Fatalf("read control header: %v", err)
+	}
+	length := binary.BigEndian.Uint32(header[:])
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(stream, payload); err != nil {
+		t.Fatalf("read control payload: %v", err)
+	}
+	var message controlMessage
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatalf("decode control message: %v", err)
+	}
+	return message
 }
 
 func waitForTestCondition(t *testing.T, timeout time.Duration, condition func() bool) {
