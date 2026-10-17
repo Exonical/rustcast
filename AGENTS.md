@@ -6,6 +6,7 @@
 ## Build / test
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).
 - Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg`); Cargo workspace root is `flux/`.
+- UI package operations use `npx -y pnpm@9.15.1 ...`; newer pnpm versions ignore the lockfile overrides.
 
 ## Deploy (Windows, Podman machine on WSL2; no Docker)
 - Full rebuild + pod replace: `./containers/run.sh` (auto-detects the WSL VM IP for `FLUX_WT_PUBLIC_HOST`; re-run after WSL restarts).

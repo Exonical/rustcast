@@ -1,26 +1,30 @@
 @import "tailwindcss";
 
 @theme inline {
-  --color-background: #09090b;
-  --color-foreground: #fafafa;
-  --color-muted: #27272a;
-  --color-muted-fg: #a1a1aa;
-  --color-accent: #4c6ef5;
-  --color-accent-fg: #fafafa;
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-background: #090a0d;
+  --color-foreground: #f4f5f7;
+  --color-muted: #181a20;
+  --color-muted-fg: #9499a5;
+  --color-accent: #4f83ff;
+  --color-accent-fg: #ffffff;
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-ibm-plex-mono);
 }
+
+* { box-sizing: border-box; }
 
 body {
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
-  overflow: hidden;
-  height: 100vh;
-  width: 100vw;
+  min-height: 100vh;
+  margin: 0;
 }
 
-::-webkit-scrollbar { display: none; }
+::selection { color: #fff; background: rgba(79, 131, 255, .35); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { border-radius: 999px; background: #292d36; }
+::-webkit-scrollbar-track { background: transparent; }
 
 .stream-canvas {
   display: block;
@@ -30,10 +34,10 @@ body {
 }
 
 .glass {
-  background: rgba(9, 9, 11, 0.8);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(16, 19, 24, 0.82);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.075);
 }
 
 button {
@@ -64,3 +68,5 @@ button {
 }
 
 .pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+input[type="range"] { accent-color: #68a0ff; }

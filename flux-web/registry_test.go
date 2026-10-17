@@ -77,6 +77,22 @@ func TestMachineRegistryAcquireReleaseLifecycle(t *testing.T) {
 	r.release(fresh)
 }
 
+func TestMachineRegistryListIncludesViewerCount(t *testing.T) {
+	r := newMachineRegistry()
+	r.upsert(testRegistration("machine-1"), false)
+	upstream, err := r.acquire("machine-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.list()[0].Viewers; got != 1 {
+		t.Fatalf("list viewers = %d, want 1", got)
+	}
+	r.release(upstream)
+	if got := r.list()[0].Viewers; got != 0 {
+		t.Fatalf("list viewers after release = %d, want 0", got)
+	}
+}
+
 func TestHeartbeatRejectsPathIDMismatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
