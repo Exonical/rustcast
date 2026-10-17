@@ -1,6 +1,8 @@
 # podman kube play containers/flux-pod.yaml
 # Both containers share the pod's network namespace, so the host registers with
 # the relay over 127.0.0.1. Only the relay's ports are published.
+# The host's DRI render nodes (renderD128 = dGPU, renderD129 = iGPU) are passed
+# through to the host container for VA-API hardware encoding.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -42,3 +44,17 @@ spec:
           value: "127.0.0.1"
         - name: RUST_LOG
           value: "info"
+      volumeMounts:
+        - name: dri-render-dgpu
+          mountPath: /dev/dri/renderD128
+        - name: dri-render-igpu
+          mountPath: /dev/dri/renderD129
+  volumes:
+    - name: dri-render-dgpu
+      hostPath:
+        path: /dev/dri/renderD128
+        type: CharDevice
+    - name: dri-render-igpu
+      hostPath:
+        path: /dev/dri/renderD129
+        type: CharDevice

@@ -1,11 +1,11 @@
 # Agent notes
 
 ## Layout
-- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebTransport (HTTP/3) relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod.
+- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebTransport (HTTP/3) relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod. The host image builds Mesa 25.3.6 RADV/ANV with video codecs enabled (stage `mesa` in containers/host/Containerfile — Rocky strips VK_KHR_video_*) and flux-pod.yaml passes the host's /dev/dri render nodes through as CharDevice volumes.
 
 ## Build / test
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).
-- Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg`); Cargo workspace root is `flux/`.
+- Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg,encoder-vulkan`); Cargo workspace root is `flux/`. Encoder check: `podman exec flux-host su flux -c 'XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u flux-server | grep "Encoder created"'`.
 - Metrics: relay `FLUX_METRICS_ADDR` defaults to `:9101`, host defaults to `127.0.0.1:9102`; metric prefixes are `flux_relay_`, `flux_client_`, and `flux_host_`.
 - UI package operations use `npx -y pnpm@9.15.1 ...`; newer pnpm versions ignore the lockfile overrides.
 

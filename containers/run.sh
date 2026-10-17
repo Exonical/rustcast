@@ -70,14 +70,11 @@ if [ -n "$public_host" ] || [ -n "$cert_dir" ]; then
       print "          readOnly: true"
     }
     { print }
-    END {
-      if (cert_file != "") {
-        print "  volumes:"
-        print "    - name: relay-certs"
-        print "      hostPath:"
-        print "        path: \"" cert_dir "\""
-        print "        type: Directory"
-      }
+    cert_file != "" && /^  volumes:$/ {
+      print "    - name: relay-certs"
+      print "      hostPath:"
+      print "        path: \"" cert_dir "\""
+      print "        type: Directory"
     }
   ' "$here/flux-pod.yaml" > "$pod_yaml"
 fi

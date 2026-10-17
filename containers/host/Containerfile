@@ -1,6 +1,14 @@
 # Build context: repository root.
 ARG ROCKY_IMAGE=docker.io/rockylinux/rockylinux:10
-ARG FLUX_FEATURES=capture-mutter,encoder-ffmpeg
+ARG FLUX_FEATURES=capture-mutter,encoder-ffmpeg,encoder-vulkan
+# Mesa 25.3.x — 26.x needs libdrm >= 2.4.133 but Rocky 10 ships 2.4.128.
+ARG MESA_VERSION=25.3.6
+# matches the 25.3.6 release announcement
+ARG MESA_SHA256=59217efeac3b64e7ced958324b9db7494f1e0741aeb22d780276514cc1b8f206
+ARG SVT_VERSION=21.1.9
+ARG SVT_SHA256=e3c292966ad2750fda94ce569e571325fd50b4959c70d32552c6dd249b59dde8
+ARG SPIRV_HEADERS_VERSION=1.4.363.0
+ARG SPIRV_HEADERS_SHA256=5b3a0d099f5c7649e29c0938476c462e71d66ad89a0bde42fa1ba3eb476956c9
 
 FROM ${ROCKY_IMAGE} AS repos
 RUN dnf -y install dnf-plugins-core epel-release \
@@ -26,6 +34,68 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     cargo build --release -p flux-server --no-default-features --features ${FLUX_FEATURES} \
  && install -D target/release/flux-server /out/flux-server
 
+# Mesa's Vulkan drivers built with video codecs enabled — Rocky 10 builds mesa
+# without VK_KHR_video_* (patented-codec strip), so RADV hardware encode needs
+# an upstream build.
+FROM repos AS mesa
+ARG MESA_VERSION
+ARG MESA_SHA256
+RUN dnf -y --setopt=install_weak_deps=False install \
+      meson ninja-build gcc gcc-c++ cmake pkgconf bison flex \
+      python3-mako python3-pyyaml python3-ply \
+      libdrm-devel elfutils-libelf-devel libzstd-devel expat-devel zlib-ng-compat-devel \
+      glslang spirv-tools-devel spirv-headers-devel clang clang-devel llvm llvm-devel \
+      opencl-headers xz tar gzip \
+ && dnf clean all
+WORKDIR /src
+# libclc (LLVM OpenCL builtins) — ANV's clc path needs its libclc.pc; not
+# packaged on EL10, so build it standalone against system clang/llvm 21.
+RUN curl -fsSL "https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-21.1.8.tar.gz" \
+      -o llvm-project.tar.gz \
+ && tar -xzf llvm-project.tar.gz "llvm-project-llvmorg-21.1.8/libclc" \
+      --strip-components=1 -C /src \
+ && cmake -S /src/libclc -B /src/libclc/build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+      -DLLVM_CONFIG_PATH="$(command -v llvm-config)" \
+ && cmake --build /src/libclc/build --parallel \
+ && cmake --install /src/libclc/build
+ARG SVT_VERSION
+ARG SVT_SHA256
+ARG SPIRV_HEADERS_VERSION
+ARG SPIRV_HEADERS_SHA256
+# SPIRV-LLVM-Translator for ANV's OpenCL-C (with_clc) path; EL10 only ships the
+# llvm15 translator, so build the llvm21 tag against system llvm-devel.
+RUN curl -fsSL "https://github.com/KhronosGroup/SPIRV-LLVM-Translator/archive/refs/tags/v${SVT_VERSION}.tar.gz" \
+      -o svt.tar.gz \
+ && echo "${SVT_SHA256}  svt.tar.gz" | sha256sum -c \
+ && tar -xzf svt.tar.gz && mv "SPIRV-LLVM-Translator-${SVT_VERSION}" SPIRV-LLVM-Translator \
+ && curl -fsSL "https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-${SPIRV_HEADERS_VERSION}.tar.gz" \
+      -o spirv-headers.tar.gz \
+ && echo "${SPIRV_HEADERS_SHA256}  spirv-headers.tar.gz" | sha256sum -c \
+ && tar -xzf spirv-headers.tar.gz && mv "SPIRV-Headers-vulkan-sdk-${SPIRV_HEADERS_VERSION}" SPIRV-Headers \
+ && cmake -S /src/SPIRV-LLVM-Translator -B /src/SPIRV-LLVM-Translator/build \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+      -DLLVM_DIR="$(llvm-config --cmakedir)" \
+      -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR=/src/SPIRV-Headers \
+ && cmake --build /src/SPIRV-LLVM-Translator/build --parallel \
+ && cmake --install /src/SPIRV-LLVM-Translator/build
+RUN curl -fsSLO "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" \
+ && echo "${MESA_SHA256}  mesa-${MESA_VERSION}.tar.xz" | sha256sum -c \
+ && tar -xf "mesa-${MESA_VERSION}.tar.xz" \
+ && mv "mesa-${MESA_VERSION}" mesa
+WORKDIR /src/mesa
+RUN meson setup build -Dprefix=/usr -Dbuildtype=release -Db_ndebug=true \
+      -Dplatforms= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false \
+      -Dgles1=disabled -Dgles2=disabled \
+      -Dgallium-drivers= -Dvulkan-drivers=amd,intel -Dvulkan-layers= \
+      -Dintel-rt=disabled \
+      -Dvideo-codecs=all -Dllvm=enabled -Dmesa-clc=enabled \
+      -Dtools= -Dbuild-tests=false -Dlibunwind=disabled -Dlmsensors=disabled \
+      -Dvalgrind=disabled -Dzstd=enabled \
+ && ninja -C build \
+ && DESTDIR=/out ninja -C build install \
+ && rm -f /out/usr/share/drirc.d/00-mesa-defaults.conf
+
 FROM repos AS runtime
 RUN dnf -y --setopt=install_weak_deps=False install \
       systemd dbus-daemon dbus-tools procps-ng iproute which glib2 dconf polkit xdg-user-dirs \
@@ -33,9 +103,12 @@ RUN dnf -y --setopt=install_weak_deps=False install \
       xdg-desktop-portal-gnome nautilus ptyxis firefox \
       pipewire pipewire-utils wireplumber \
       mesa-dri-drivers mesa-libEGL mesa-libgbm \
+      vulkan-loader vulkan-tools \
       google-noto-sans-fonts google-noto-sans-mono-fonts dejavu-sans-fonts \
+      redhat-text-vf-fonts redhat-mono-vf-fonts \
       ffmpeg-libs x264-libs \
  && dnf clean all
+COPY --from=mesa /out/usr/ /usr/
 COPY containers/host/rootfs/ /
 RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
  && useradd --create-home --uid 1000 --groups systemd-journal flux \
