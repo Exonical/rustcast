@@ -7,7 +7,7 @@
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).
 - Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg,encoder-vulkan`); Cargo workspace root is `flux/`. Encoder check: `podman exec flux-host su flux -c 'XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u flux-server | grep "Encoder created"'`.
 - Metrics: relay `FLUX_METRICS_ADDR` defaults to `:9101`, host defaults to `127.0.0.1:9102`; metric prefixes are `flux_relay_`, `flux_client_`, and `flux_host_`.
-- UI package operations use `npx -y pnpm@9.15.1 ...`; newer pnpm versions ignore the lockfile overrides.
+- UI package operations use `npx -y pnpm@12.9.1 ...` (or corepack; `packageManager` is pinned in package.json). Dependency overrides and the `allowBuilds` list live in `flux-web/ui/pnpm-workspace.yaml`.
 
 ## Deploy (Windows, Podman machine on WSL2; no Docker)
 - Full rebuild + pod replace: `./containers/run.sh` (auto-detects the WSL VM IP for `FLUX_WT_PUBLIC_HOST`; re-run after WSL restarts).
