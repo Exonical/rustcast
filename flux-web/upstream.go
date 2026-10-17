@@ -813,8 +813,17 @@ func shouldResetFrame(keyframe bool, writingFor time.Duration, queuedFrames int)
 func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool) (time.Duration, bool, error) {
 	start := time.Now()
 	seq := sess.nextSequence.Add(1) - 1
+	if sess.estimator != nil {
+		sess.estimator.onFrameSent(seq, len(msg.data), start)
+	}
+	forget := func() {
+		if sess.estimator != nil {
+			sess.estimator.forget(seq)
+		}
+	}
 	stream, err := sess.transport.OpenUniStreamSync(sess.transport.Context())
 	if err != nil {
+		forget()
 		return time.Since(start), false, err
 	}
 	stopCancel := context.AfterFunc(sess.transport.Context(), func() {
@@ -831,25 +840,26 @@ func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool)
 		for len(chunk) > 0 {
 			if shouldResetFrame(keyframe, time.Since(start), len(u.frameChan)) {
 				stream.CancelWrite(webtransport.StreamErrorCode(2))
+				forget()
 				sess.needsIDR.Store(true)
 				u.requestIDR(idrReasonStaleQueue)
 				return time.Since(start), true, nil
 			}
 			n, writeErr := stream.Write(chunk)
 			if writeErr != nil {
+				forget()
 				return time.Since(start), false, writeErr
 			}
 			if n == 0 {
+				forget()
 				return time.Since(start), false, io.ErrShortWrite
 			}
 			chunk = chunk[n:]
 		}
 	}
 	if err := stream.Close(); err != nil {
+		forget()
 		return time.Since(start), false, err
-	}
-	if sess.estimator != nil {
-		sess.estimator.onFrameSent(seq, len(msg.data), time.Now())
 	}
 	return time.Since(start), false, nil
 }
