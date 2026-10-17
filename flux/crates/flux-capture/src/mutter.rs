@@ -295,6 +295,7 @@ impl MutterSession {
             tx: self.tx.clone(),
             size: Arc::clone(&self.size),
             closed: Arc::clone(&self.closed),
+            warned: AtomicBool::new(false),
         })
     }
 }
@@ -312,12 +313,17 @@ struct MutterInput {
     tx: UnboundedSender<Cmd>,
     size: Arc<StreamSize>,
     closed: Arc<AtomicBool>,
+    warned: AtomicBool,
 }
 
 impl MutterInput {
     fn send(&self, cmd: Cmd) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
-            tracing::trace!("dropping input: Mutter session closed");
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!("dropping input: Mutter session closed (input backend not re-attached?)");
+            } else {
+                tracing::trace!("dropping input: Mutter session closed");
+            }
             return Ok(());
         }
         self.tx
@@ -549,6 +555,7 @@ mod tests {
             tx,
             size: Arc::new(StreamSize::new(Resolution::new(100, 100))),
             closed: Arc::clone(&closed),
+            warned: AtomicBool::new(false),
         };
         input.key(30, true).unwrap();
         assert!(rx.try_recv().is_ok());

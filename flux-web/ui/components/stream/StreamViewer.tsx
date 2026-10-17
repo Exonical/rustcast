@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { WebTransportClient, type ConnectionState, type CursorMetadata, type ResolutionStatus, type StreamStats } from "@/lib/webtransport-client";
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
-import { isLocalControlTarget } from "@/lib/local-controls";
+import { isLocalControlTarget, isLocalKeyboardTarget } from "@/lib/local-controls";
 import { modifierFlags } from "@/lib/protocol";
 import type { Machine } from "@/lib/api";
 import { buildConnectUrl } from "@/lib/launch";
@@ -408,6 +408,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocalControlTarget(e.target)) return;
     if (!clientRef.current) return;
+    containerRef.current?.focus({ preventScroll: true });
     e.preventDefault();
     const button = mapMouseButton(e.button);
     if (button) {
@@ -511,7 +512,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       (e.ctrlKey || e.metaKey) && ["KeyW", "KeyT", "KeyN", "KeyL"].includes(e.code);
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (isLocalControlTarget(e.target)) return;
+      if (isLocalKeyboardTarget(e.target)) return;
 
       if (isViewerChord(e)) {
         if (e.code === "KeyR") { e.preventDefault(); reconnect(); return; }
@@ -544,7 +545,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (isLocalControlTarget(e.target)) return;
+      if (isLocalKeyboardTarget(e.target)) return;
 
       const keyId = e.code || e.key;
       const held = heldKeys.current.get(keyId);
@@ -587,7 +588,8 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     <div
       ref={containerRef}
       data-session-id={sessionId ?? undefined}
-      className="relative h-screen min-h-screen w-screen overflow-hidden bg-black select-none"
+      tabIndex={-1}
+      className="relative h-screen min-h-screen w-screen overflow-hidden bg-black select-none outline-none"
       onMouseMove={handleMouseMove}
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}
