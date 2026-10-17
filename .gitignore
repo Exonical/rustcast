@@ -41,6 +41,7 @@ flux/~/
 # ── Secrets / config ──
 *.pem
 *.key
+containers/certs/
 *.cert
 flux.toml
 .env*

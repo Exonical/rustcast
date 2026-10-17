@@ -25,6 +25,9 @@ spec:
           protocol: TCP
         - containerPort: 8443
           hostPort: 8443
+          protocol: TCP
+        - containerPort: 8443
+          hostPort: 8443
           protocol: UDP
     - name: host
       image: localhost/flux-host:latest
