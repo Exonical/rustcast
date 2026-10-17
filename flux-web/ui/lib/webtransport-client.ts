@@ -1,4 +1,5 @@
 import { h264CodecFromSps, isH264Keyframe } from "./h264";
+import { browserFamily } from "./browser-family";
 import { FrameSequencer, type EncodedFrame, type SequenceResult } from "./frame-sequencer";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
 
@@ -97,6 +98,7 @@ export class WebTransportClient {
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private sequenceInterval: ReturnType<typeof setInterval> | null = null;
   private keyframeNudgeInterval: ReturnType<typeof setInterval> | null = null;
+  private clientStatsInterval: ReturnType<typeof setInterval> | null = null;
   private lastKeyframeRequest = Number.NEGATIVE_INFINITY;
   private controlRttMs: number | null = null;
   private firstDecodedFrame = false;
@@ -112,6 +114,16 @@ export class WebTransportClient {
   private decodeTotal = 0;
   private decodeCount = 0;
   private lastStatsAt = 0;
+  private decoderType: "hardware" | "software" | "unknown" = "unknown";
+  private clientWindowFrames = 0;
+  private clientWindowBytes = 0;
+  private clientWindowElapsed = 0;
+  private clientWindowDropped = 0;
+  private clientWindowLastDropped = 0;
+  private clientWindowDecodeTotal = 0;
+  private clientWindowDecodeCount = 0;
+  private clientWindowReceivePaintTotal = 0;
+  private clientWindowReceivePaintCount = 0;
 
   onStateChange: ((state: ConnectionState) => void) | null = null;
   onStats: ((stats: StreamStats) => void) | null = null;
@@ -409,6 +421,7 @@ export class WebTransportClient {
       if (!supported.supported || !supported.config) throw new Error(`Unsupported H.264 configuration ${codec}`);
       decoder.configure(supported.config);
       this.decoderConfig = supported.config;
+      this.decoderType = preferred.supported ? "hardware" : "software";
     } catch (error) {
       if (this.decoder === decoder) this.handleDecoderError(error);
       throw error;
@@ -462,6 +475,7 @@ export class WebTransportClient {
     if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
     this.decoder = null;
     this.decoderConfig = null;
+    this.decoderType = "unknown";
     this.frameMetadata.clear();
     this.waitingForKeyframe = true;
     this.framesDropped++;
@@ -476,6 +490,7 @@ export class WebTransportClient {
     this.keyframeNudgeInterval = setInterval(() => {
       if (!this.firstDecodedFrame) this.requestKeyframeIfAllowed();
     }, 1000);
+    this.clientStatsInterval = setInterval(() => this.publishClientStats(), 5000);
   }
 
   private async publishStats(transport: WebTransport, generation: number): Promise<void> {
@@ -505,6 +520,15 @@ export class WebTransportClient {
       framesDropped: this.framesDropped,
     };
     this.onStats?.(result);
+    this.clientWindowFrames += this.framesWindow;
+    this.clientWindowBytes += this.bytesWindow;
+    this.clientWindowElapsed += elapsed;
+    this.clientWindowDropped += Math.max(0, this.framesDropped - this.clientWindowLastDropped);
+    this.clientWindowLastDropped = this.framesDropped;
+    this.clientWindowDecodeTotal += this.decodeTotal;
+    this.clientWindowDecodeCount += this.decodeCount;
+    this.clientWindowReceivePaintTotal += this.receiveToPaintTotal;
+    this.clientWindowReceivePaintCount += this.receiveToPaintCount;
     this.framesWindow = 0;
     this.bytesWindow = 0;
     this.receiveToPaintTotal = 0;
@@ -512,6 +536,29 @@ export class WebTransportClient {
     this.decodeTotal = 0;
     this.decodeCount = 0;
     this.lastStatsAt = now;
+  }
+
+  private publishClientStats(): void {
+    const elapsed = Math.max(1, this.clientWindowElapsed);
+    this.sendControl("client-stats", {
+      fps: this.clientWindowFrames * 1000 / elapsed,
+      decodeMs: this.clientWindowDecodeCount ? this.clientWindowDecodeTotal / this.clientWindowDecodeCount : 0,
+      receiveToPaintMs: this.clientWindowReceivePaintCount
+        ? this.clientWindowReceivePaintTotal / this.clientWindowReceivePaintCount
+        : 0,
+      bitrateKbps: this.clientWindowBytes * 8 / elapsed,
+      framesDropped: this.clientWindowDropped,
+      decoder: this.decoderType,
+      browser: browserFamily(navigator.userAgent),
+    });
+    this.clientWindowFrames = 0;
+    this.clientWindowBytes = 0;
+    this.clientWindowElapsed = 0;
+    this.clientWindowDropped = 0;
+    this.clientWindowDecodeTotal = 0;
+    this.clientWindowDecodeCount = 0;
+    this.clientWindowReceivePaintTotal = 0;
+    this.clientWindowReceivePaintCount = 0;
   }
 
   private sendControl(type: string, data?: unknown): void {
@@ -550,10 +597,12 @@ export class WebTransportClient {
     if (this.pingInterval) clearInterval(this.pingInterval);
     if (this.sequenceInterval) clearInterval(this.sequenceInterval);
     if (this.keyframeNudgeInterval) clearInterval(this.keyframeNudgeInterval);
+    if (this.clientStatsInterval) clearInterval(this.clientStatsInterval);
     this.statsInterval = null;
     this.pingInterval = null;
     this.sequenceInterval = null;
     this.keyframeNudgeInterval = null;
+    this.clientStatsInterval = null;
     this.controlWriter?.close().catch(() => {});
     this.controlWriter = null;
     if (this.pendingPaint) this.pendingPaint.frame.close();
@@ -571,6 +620,16 @@ export class WebTransportClient {
     this.bytesWindow = 0;
     this.framesWindow = 0;
     this.framesDropped = 0;
+    this.decoderType = "unknown";
+    this.clientWindowFrames = 0;
+    this.clientWindowBytes = 0;
+    this.clientWindowElapsed = 0;
+    this.clientWindowDropped = 0;
+    this.clientWindowLastDropped = 0;
+    this.clientWindowDecodeTotal = 0;
+    this.clientWindowDecodeCount = 0;
+    this.clientWindowReceivePaintTotal = 0;
+    this.clientWindowReceivePaintCount = 0;
     this.packetsLost = 0;
     this.receiveToPaintTotal = 0;
     this.receiveToPaintCount = 0;

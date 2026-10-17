@@ -40,11 +40,16 @@ type Session struct {
 	quicConn  *quic.Conn
 	id        string
 
-	machine     *machineUpstream
-	machineMu   sync.RWMutex
-	release     func()
-	releaseOnce sync.Once
-	sessionDone chan struct{}
+	machine           *machineUpstream
+	metrics           *machineMetrics
+	machineMu         sync.RWMutex
+	release           func()
+	releaseOnce       sync.Once
+	acceptedAt        time.Time
+	firstFrameWritten sync.Once
+	clientStatsMu     sync.Mutex
+	released          bool
+	sessionDone       chan struct{}
 
 	controlMu           sync.Mutex
 	needsIDR            atomic.Bool
@@ -84,6 +89,10 @@ func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry,
 }
 
 func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry) {
+	machineID := r.URL.Query().Get("machine")
+	if machineID == "" {
+		machineID = "default"
+	}
 	transport, err := server.Upgrade(w, r)
 	if err != nil {
 		log.Printf("[webtransport] upgrade failed: %v", err)
@@ -95,6 +104,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	control, err := transport.AcceptStream(controlCtx)
 	cancel()
 	if err != nil {
+		registry.metrics.reject(registry.metricMachineID(machineID), "no_control_stream")
 		_ = transport.CloseWithError(sessionErrorCode, "control stream was not opened")
 		return
 	}
@@ -113,21 +123,31 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		return
 	}
 	session.id = id
-	machineID := r.URL.Query().Get("machine")
-	if machineID == "" {
-		machineID = "default"
-	}
 	width, height, err := requestedResolution(r)
 	if err != nil {
+		registry.metrics.reject(registry.metricMachineID(machineID), "bad_request")
 		session.fail(err.Error())
 		return
 	}
 	upstream, err := registry.acquire(machineID)
 	if err != nil {
+		reason := "bad_request"
+		switch err {
+		case errMachineInUse:
+			reason = "machine_in_use"
+		case errMachineNotFound:
+			reason = "not_found"
+		case errMachineOffline:
+			reason = "offline"
+		}
+		registry.metrics.reject(registry.metricMachineID(machineID), reason)
 		session.fail(err.Error())
 		return
 	}
 	session.setMachine(upstream)
+	session.metrics = upstream.metrics
+	session.acceptedAt = time.Now()
+	upstream.metrics.sessionsStarted.Inc()
 	session.release = func() {
 		sessions.remove(id)
 		registry.release(upstream)
@@ -241,7 +261,15 @@ func (s *Session) getMachine() *machineUpstream {
 
 func (s *Session) releaseNow() {
 	s.releaseOnce.Do(func() {
-		_ = s.transport.CloseWithError(0, "session released")
+		s.clientStatsMu.Lock()
+		s.released = true
+		if s.metrics != nil {
+			s.metrics.resetClientStats()
+		}
+		s.clientStatsMu.Unlock()
+		if s.transport != nil {
+			_ = s.transport.CloseWithError(0, "session released")
+		}
 		if machine := s.getMachine(); machine != nil {
 			machine.clearSession(s)
 		}
@@ -383,6 +411,20 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 			return fmt.Errorf("invalid frame acknowledgement: %w", err)
 		}
 		s.estimator.onFrameAck(ack.Seq, ack.DoneMs, time.Now())
+	case "client-stats":
+		stats, ok := decodeClientStats(message.Data)
+		if !ok {
+			if s.metrics != nil {
+				log.Printf("[control:%s] ignored invalid client stats", s.metrics.id)
+			}
+			return nil
+		}
+		s.clientStatsMu.Lock()
+		defer s.clientStatsMu.Unlock()
+		if s.released || s.metrics == nil {
+			return nil
+		}
+		s.metrics.recordClientStats(stats)
 	default:
 		log.Printf("[control] unknown message type: %s", message.Type)
 	}
@@ -466,18 +508,29 @@ func (s *Session) runBandwidthEstimator() {
 		case <-s.sessionDone:
 			return
 		case <-ticker.C:
+			var stats quic.ConnectionStats
 			if machine := s.getMachine(); machine != nil {
 				s.estimator.setCeilingKbps(machine.abr.senderCeilingKbps())
 			}
 			if s.quicConn != nil {
-				stats := s.quicConn.ConnectionStats()
+				stats = s.quicConn.ConnectionStats()
 				s.estimator.onTransportStats(stats.SmoothedRTT, stats.MinRTT, stats.PacketsSent, stats.PacketsLost)
+				if s.metrics != nil {
+					s.metrics.rttSmoothed.Set(stats.SmoothedRTT.Seconds())
+					s.metrics.rttMin.Set(stats.MinRTT.Seconds())
+				}
 				if machine := s.getMachine(); machine != nil {
 					machine.abr.onRTTSample(stats.SmoothedRTT)
 					machine.abr.onReceiverReport(s.estimator.lossRatio())
 				}
 			}
 			kbps, _ := s.estimator.update(time.Now())
+			if s.metrics != nil {
+				_, queue, _, loss := s.estimator.diagnostics()
+				s.metrics.bweTarget.Set(float64(kbps))
+				s.metrics.queueDelay.Set(queue.Seconds())
+				s.metrics.packetLoss.Set(loss)
+			}
 			if machine := s.getMachine(); machine != nil {
 				machine.abr.onEstimate(kbps)
 			}

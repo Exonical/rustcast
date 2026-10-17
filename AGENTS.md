@@ -6,6 +6,7 @@
 ## Build / test
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).
 - Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg`); Cargo workspace root is `flux/`.
+- Metrics: relay `FLUX_METRICS_ADDR` defaults to `:9101`, host defaults to `127.0.0.1:9102`; metric prefixes are `flux_relay_`, `flux_client_`, and `flux_host_`.
 - UI package operations use `npx -y pnpm@9.15.1 ...`; newer pnpm versions ignore the lockfile overrides.
 
 ## Deploy (Windows, Podman machine on WSL2; no Docker)

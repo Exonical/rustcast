@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,6 +76,22 @@ func TestMachineRegistryAcquireReleaseLifecycle(t *testing.T) {
 		t.Fatal("subsequent acquire reused stopped upstream")
 	}
 	r.release(fresh)
+}
+
+func TestMachineRegistryDeregisterRemovesMetrics(t *testing.T) {
+	r := newMachineRegistry()
+	r.upsert(testRegistration("machine-1"), false)
+	machine := r.metrics.machine("machine-1")
+	machine.upstreamFrames.Inc()
+	machine.recordClientStats(clientStats{Browser: "chrome", Decoder: "hardware"})
+
+	if !r.deregister("machine-1") {
+		t.Fatal("machine was not deregistered")
+	}
+	body := scrapeMetrics(r.metrics)
+	if strings.Contains(body, `machine="machine-1"`) {
+		t.Fatalf("machine metrics remained after deregistration: %s", body)
+	}
 }
 
 func TestMachineRegistryListIncludesViewerCount(t *testing.T) {

@@ -93,6 +93,14 @@ pub struct ServerConfig {
 
     /// Idle timeout in seconds before a session is torn down.
     pub session_timeout_secs: u64,
+
+    /// HTTP metrics listener; set to `off` to disable.
+    #[serde(default = "default_metrics_addr")]
+    pub metrics_addr: String,
+}
+
+fn default_metrics_addr() -> String {
+    "127.0.0.1:9102".into()
 }
 
 impl Default for ServerConfig {
@@ -102,6 +110,7 @@ impl Default for ServerConfig {
             signaling_port: 8554,
             max_sessions: 4,
             session_timeout_secs: 300,
+            metrics_addr: default_metrics_addr(),
         }
     }
 }
@@ -313,5 +322,18 @@ impl Default for SecurityConfig {
             require_client_cert: false,
             pin_pairing: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod metrics_addr_tests {
+    use super::ServerConfig;
+
+    #[test]
+    fn legacy_server_config_defaults_metrics_address() {
+        let config: ServerConfig =
+            toml::from_str("https_port = 8443\nsignaling_port = 8554\nmax_sessions = 4\nsession_timeout_secs = 300")
+                .expect("legacy server config");
+        assert_eq!(config.metrics_addr, "127.0.0.1:9102");
     }
 }
