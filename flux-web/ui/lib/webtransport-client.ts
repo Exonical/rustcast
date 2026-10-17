@@ -145,6 +145,10 @@ export class WebTransportClient {
     private resolution?: { width: number; height: number },
   ) {}
 
+  get requestedResolution(): { width: number; height: number } | undefined {
+    return this.resolution ? { ...this.resolution } : undefined;
+  }
+
   attachCanvas(canvas: HTMLCanvasElement): void {
     this.canvas = canvas;
     this.canvasContext = canvas.getContext("2d", { alpha: false });

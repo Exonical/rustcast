@@ -249,6 +249,26 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   }, [machine.id, releaseAllInput, clearResolutionStatus]);
 
   useEffect(() => {
+    const client = clientRef.current;
+    if (!client) return;
+    if (connectionState === "connected" && resolution) {
+      const currentResolution = client.requestedResolution;
+      if (!currentResolution || currentResolution.width !== resolution.width || currentResolution.height !== resolution.height) {
+        client.requestResolution(resolution.width, resolution.height);
+      }
+    }
+    const nextFps = initialFps ?? null;
+    const nextQuality = initialQuality ?? null;
+    if (committedFps.current === nextFps && committedQuality.current === nextQuality) return;
+    setFpsCap(nextFps);
+    setQualityLevel(nextQuality);
+    if (connectionState !== "connected") return;
+    committedFps.current = nextFps;
+    committedQuality.current = nextQuality;
+    client.sendQuality(nextQuality ?? 0, nextFps ?? 0);
+  }, [machine.id, resolution, initialFps, initialQuality, connectionState]);
+
+  useEffect(() => {
     const updateLayout = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
