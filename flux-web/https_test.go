@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -63,22 +64,34 @@ func TestWebHTTPSApiUsesTrustedRelayCertificate(t *testing.T) {
 }
 
 func TestHTTPPageRequestsRedirectToHTTPS(t *testing.T) {
-	handler := withHTTPSRedirect(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Fatal("page handler ran instead of redirecting")
-	}), "localhost:9443")
-	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		t.Run(method, func(t *testing.T) {
-			request := httptest.NewRequest(method, "http://relay.example:8080/connect?width=1280&height=720", nil)
-			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, request)
+	tests := []struct {
+		name         string
+		httpsAddr    string
+		redirectHost string
+	}{
+		{name: "wildcard bind uses request host", httpsAddr: ":9443", redirectHost: "relay.example"},
+		{name: "IPv4 wildcard bind uses request host", httpsAddr: "0.0.0.0:9443", redirectHost: "relay.example"},
+		{name: "IPv6 wildcard bind uses request host", httpsAddr: "[::]:9443", redirectHost: "relay.example"},
+		{name: "specific bind uses configured host", httpsAddr: "relay-internal:9443", redirectHost: "relay-internal"},
+	}
+	for _, test := range tests {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			t.Run(test.name+"/"+method, func(t *testing.T) {
+				handler := withHTTPSRedirect(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					t.Fatal("page handler ran instead of redirecting")
+				}), test.httpsAddr)
+				request := httptest.NewRequest(method, "http://relay.example:8080/connect?width=1280&height=720", nil)
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
 
-			if response.Code != http.StatusPermanentRedirect {
-				t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusPermanentRedirect)
-			}
-			if got, want := response.Header().Get("Location"), "https://relay.example:9443/connect?width=1280&height=720"; got != want {
-				t.Fatalf("Location = %q, want %q", got, want)
-			}
-		})
+				if response.Code != http.StatusPermanentRedirect {
+					t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusPermanentRedirect)
+				}
+				if got, want := response.Header().Get("Location"), "https://"+net.JoinHostPort(test.redirectHost, "9443")+"/connect?width=1280&height=720"; got != want {
+					t.Fatalf("Location = %q, want %q", got, want)
+				}
+			})
+		}
 	}
 }
 

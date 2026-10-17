@@ -126,18 +126,21 @@ func withAltSvc(handler http.Handler) http.Handler {
 }
 
 func withHTTPSRedirect(handler http.Handler, httpsAddr string) http.Handler {
-	_, httpsPort, err := net.SplitHostPort(httpsAddr)
+	httpsHost, httpsPort, err := net.SplitHostPort(httpsAddr)
 	if err != nil || httpsPort == "" {
 		return handler
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isAPIPath := r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && !isAPIPath {
-			host := r.Host
-			if requestHost, _, err := net.SplitHostPort(host); err == nil {
-				host = requestHost
-			} else {
-				host = strings.Trim(host, "[]")
+			host := httpsHost
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = r.Host
+				if requestHost, _, err := net.SplitHostPort(host); err == nil {
+					host = requestHost
+				} else {
+					host = strings.Trim(host, "[]")
+				}
 			}
 			location := "https://" + net.JoinHostPort(host, httpsPort) + r.URL.RequestURI()
 			http.Redirect(w, r, location, http.StatusPermanentRedirect)
