@@ -142,7 +142,7 @@ export class WebTransportClient {
 
   constructor(
     private readonly machineId?: string,
-    private readonly resolution?: { width: number; height: number },
+    private resolution?: { width: number; height: number },
   ) {}
 
   attachCanvas(canvas: HTMLCanvasElement): void {
@@ -218,6 +218,7 @@ export class WebTransportClient {
   }
 
   requestResolution(width: number, height: number): void {
+    this.resolution = { width, height };
     this.sendControl("resolution", { width, height });
   }
 
