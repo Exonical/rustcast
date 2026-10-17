@@ -107,6 +107,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const committedQuality = useRef<number | null>(null);
   const committedFps = useRef<number | null>(null);
   const initialControlsApplied = useRef(false);
+  const connectOptions = useRef({ resolution, initialFps, initialQuality });
   const [cursor, setCursor] = useState<CursorMetadata>({
     position: null,
     hotspot: [0, 0],
@@ -187,19 +188,20 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   }, []);
 
   useEffect(() => {
-    const client = new WebTransportClient(machine.id, resolution);
+    const { resolution: connectResolution, initialFps: connectInitialFps, initialQuality: connectInitialQuality } = connectOptions.current;
+    const client = new WebTransportClient(machine.id, connectResolution);
     if (canvasRef.current) client.attachCanvas(canvasRef.current);
     clientRef.current = client;
     client.onStateChange = (state) => {
       setConnectionState(state);
       if (state !== "connected") releaseAllInput();
-      if (state === "connected" && !initialControlsApplied.current && (initialFps !== undefined || initialQuality !== undefined)) {
+      if (state === "connected" && !initialControlsApplied.current && (connectInitialFps !== undefined || connectInitialQuality !== undefined)) {
         initialControlsApplied.current = true;
-        setFpsCap(initialFps ?? null);
-        setQualityLevel(initialQuality ?? null);
-        committedFps.current = initialFps ?? null;
-        committedQuality.current = initialQuality ?? null;
-        client.sendQuality(initialQuality ?? 0, initialFps ?? 0);
+        setFpsCap(connectInitialFps ?? null);
+        setQualityLevel(connectInitialQuality ?? null);
+        committedFps.current = connectInitialFps ?? null;
+        committedQuality.current = connectInitialQuality ?? null;
+        client.sendQuality(connectInitialQuality ?? 0, connectInitialFps ?? 0);
       }
     };
     client.onStats = setStats;
@@ -244,7 +246,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       client.disconnect();
       clientRef.current = null;
     };
-  }, [machine.id, resolution, initialFps, initialQuality, releaseAllInput, clearResolutionStatus]);
+  }, [machine.id, releaseAllInput, clearResolutionStatus]);
 
   useEffect(() => {
     const updateLayout = () => {
