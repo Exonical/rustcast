@@ -51,6 +51,7 @@ export function ConnectPageClient() {
   return (
     machine ? (
       <StreamViewer
+        key={machine.id}
         machine={machine}
         resolution={resolution}
         initialFps={parsed.fps}

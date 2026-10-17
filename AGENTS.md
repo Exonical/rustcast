@@ -12,7 +12,9 @@
 ## Deploy (Windows, Podman machine on WSL2; no Docker)
 - Full rebuild + pod replace: `./containers/run.sh` (auto-detects the WSL VM IP for `FLUX_WT_PUBLIC_HOST`; re-run after WSL restarts).
 - Relay-only swap keeping the host container: `podman build -f containers/relay/Containerfile -t localhost/flux-relay:latest . && podman rm -f flux-relay && podman run -d --pod flux --name flux-relay -e FLUX_WT_PUBLIC_HOST=<vm-ip> --user flux-web localhost/flux-relay:latest`
-- Optional relay TLS files: set `FLUX_TLS_CERT` and `FLUX_TLS_KEY`; otherwise the relay rotates its self-signed WebTransport certificate.
+- On Windows, install mkcert with `winget install FiloSottile.mkcert`, run `mkcert -install`, then `./containers/run.sh`. The script creates or reuses `containers/certs/relay.pem` and `relay-key.pem`, adds localhost and the advertised VM address as SANs, mounts them read-only, and prints trusted UI URLs at `https://localhost:8443` and (when available) `https://<vm-ip>:8443`. HTTP remains available on port 8080. Without mkcert, the script prints the install hint and preserves HTTP-only behavior.
+- The same `FLUX_TLS_CERT` and `FLUX_TLS_KEY` configure WebTransport and the Gin UI/API HTTPS listener; HTTPS defaults to `:8443` and can be disabled with `FLUX_HTTPS_ADDR=off`. The relay still rotates its self-signed WebTransport certificate when neither file is configured.
+- For WSL2 localhost UDP forwarding, add `[wsl2]` and `networkingMode=mirrored` to `%UserProfile%\.wslconfig`, then set `FLUX_WT_PUBLIC_HOST=127.0.0.1` before running the script. Without mirrored networking, use the detected VM IP and its trusted certificate URL; Chrome flags are not needed.
 - From Git Bash, prefix podman commands that pass absolute container paths with `MSYS_NO_PATHCONV=1`.
 - Server log: `MSYS_NO_PATHCONV=1 podman exec flux-host su flux -c 'XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u flux-server'`; relay: `podman logs flux-relay`.
 

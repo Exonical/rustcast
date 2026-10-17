@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -68,6 +70,38 @@ func main() {
 	go certificates.runRotation(rotationCtx)
 
 	webAddr := ":8080"
+	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"))
+	httpHandler := http.Handler(r)
+	httpsAddr := strings.TrimSpace(os.Getenv("FLUX_HTTPS_ADDR"))
+	if httpsAddr == "" {
+		httpsAddr = ":8443"
+	}
+	if certificates.configured && !strings.EqualFold(httpsAddr, "off") {
+		httpsServer := &http.Server{
+			Addr:      httpsAddr,
+			Handler:   withAltSvc(r),
+			TLSConfig: webHTTPSTLSConfig(certificates),
+		}
+		go func() {
+			log.Printf("flux-web listening on https://localhost%s", httpsAddr)
+			if err := httpsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("HTTPS server error: %v", err)
+			}
+		}()
+		httpHandler = withHTTPSRedirect(r, httpsAddr)
+	}
+	log.Printf("flux-web listening on http://localhost%s", webAddr)
+	if err := http.ListenAndServe(webAddr, httpHandler); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}
+
+func newWebHandler(
+	registry *machineRegistry,
+	sessions *sessionRegistry,
+	certificates *relayCertificateManager,
+	publicHost string,
+) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	r.Use(cors.Default())
@@ -75,14 +109,50 @@ func main() {
 	registerSessionRoutes(r, sessions)
 	r.GET("/api/webtransport", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"host":       os.Getenv("FLUX_WT_PUBLIC_HOST"),
+			"host":       publicHost,
 			"port":       webTransportPort,
 			"certHashes": certificates.certificateHashes(),
 		})
 	})
 	r.NoRoute(gin.WrapH(http.FileServer(http.Dir("./ui/out"))))
-	log.Printf("flux-web listening on http://localhost%s", webAddr)
-	if err := r.Run(webAddr); err != nil {
-		log.Fatalf("server error: %v", err)
+	return r
+}
+
+func withAltSvc(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Alt-Svc", `h3=":8443"`)
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func withHTTPSRedirect(handler http.Handler, httpsAddr string) http.Handler {
+	httpsHost, httpsPort, err := net.SplitHostPort(httpsAddr)
+	if err != nil || httpsPort == "" {
+		return handler
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isAPIPath := r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && !isAPIPath {
+			host := httpsHost
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = r.Host
+				if requestHost, _, err := net.SplitHostPort(host); err == nil {
+					host = requestHost
+				} else {
+					host = strings.Trim(host, "[]")
+				}
+			}
+			location := "https://" + net.JoinHostPort(host, httpsPort) + r.URL.RequestURI()
+			http.Redirect(w, r, location, http.StatusPermanentRedirect)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func webHTTPSTLSConfig(certificates *relayCertificateManager) *tls.Config {
+	return &tls.Config{
+		MinVersion:     tls.VersionTLS13,
+		GetCertificate: certificates.getCertificate,
 	}
 }

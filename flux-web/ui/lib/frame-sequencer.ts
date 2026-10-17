@@ -4,6 +4,7 @@ export interface EncodedFrame {
   data: Uint8Array;
   receivedAt: number;
   captureTimestampUs?: bigint;
+  arrivalOrdinal?: number;
 }
 
 export interface SequenceResult {

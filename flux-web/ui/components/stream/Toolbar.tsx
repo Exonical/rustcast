@@ -74,13 +74,16 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
                   <p className="mb-2 text-xs font-semibold text-zinc-300">Change resolution</p>
                   <div className="grid grid-cols-2 gap-1.5">
                     {RESOLUTION_OPTIONS.map((mode) => (
-                      <button key={`${mode.width}x${mode.height}`} data-local-control onClick={() => onResolution(mode.width, mode.height)}
+                      <button key={`${mode.width}x${mode.height}`} data-local-control onClick={() => {
+                        setSettingsOpen(false);
+                        onResolution(mode.width, mode.height);
+                      }}
                         className="rounded-lg border border-white/[0.06] px-2 py-2 text-[10px] font-medium text-zinc-400 hover:border-blue-400/30 hover:bg-blue-400/[0.06] hover:text-blue-100">
                         {mode.width} × {mode.height}
                       </button>
                     ))}
                   </div>
-                  <p className="mt-2 text-[10px] leading-4 text-zinc-600">Changing mode reconnects this stream.</p>
+                  <p className="mt-2 text-[10px] leading-4 text-zinc-600">Changes apply without reconnecting.</p>
                 </div>
               )}
             </div>

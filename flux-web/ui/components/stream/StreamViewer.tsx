@@ -103,9 +103,11 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const [clientError, setClientError] = useState<string | null>(null);
   const [endedReason, setEndedReason] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const resolutionStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const committedQuality = useRef<number | null>(null);
   const committedFps = useRef<number | null>(null);
   const initialControlsApplied = useRef(false);
+  const connectOptions = useRef({ resolution, initialFps, initialQuality });
   const [cursor, setCursor] = useState<CursorMetadata>({
     position: null,
     hotspot: [0, 0],
@@ -179,20 +181,27 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     heldButtons.current.clear();
   }, [cancelPendingMove]);
 
+  const clearResolutionStatus = useCallback(() => {
+    if (resolutionStatusTimer.current) clearTimeout(resolutionStatusTimer.current);
+    resolutionStatusTimer.current = null;
+    setResolutionStatus(null);
+  }, []);
+
   useEffect(() => {
-    const client = new WebTransportClient(machine.id, resolution);
+    const { resolution: connectResolution, initialFps: connectInitialFps, initialQuality: connectInitialQuality } = connectOptions.current;
+    const client = new WebTransportClient(machine.id, connectResolution);
     if (canvasRef.current) client.attachCanvas(canvasRef.current);
     clientRef.current = client;
     client.onStateChange = (state) => {
       setConnectionState(state);
       if (state !== "connected") releaseAllInput();
-      if (state === "connected" && !initialControlsApplied.current && (initialFps !== undefined || initialQuality !== undefined)) {
+      if (state === "connected" && !initialControlsApplied.current && (connectInitialFps !== undefined || connectInitialQuality !== undefined)) {
         initialControlsApplied.current = true;
-        setFpsCap(initialFps ?? null);
-        setQualityLevel(initialQuality ?? null);
-        committedFps.current = initialFps ?? null;
-        committedQuality.current = initialQuality ?? null;
-        client.sendQuality(initialQuality ?? 0, initialFps ?? 0);
+        setFpsCap(connectInitialFps ?? null);
+        setQualityLevel(connectInitialQuality ?? null);
+        committedFps.current = connectInitialFps ?? null;
+        committedQuality.current = connectInitialQuality ?? null;
+        client.sendQuality(connectInitialQuality ?? 0, connectInitialFps ?? 0);
       }
     };
     client.onStats = setStats;
@@ -203,7 +212,18 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         bitmap: next.bitmap ?? previous.bitmap,
       }));
     };
-    client.onResolutionStatus = setResolutionStatus;
+    client.onResolutionStatus = (status) => {
+      if (resolutionStatusTimer.current) clearTimeout(resolutionStatusTimer.current);
+      resolutionStatusTimer.current = null;
+      setResolutionStatus(status);
+      if (status.state === "succeeded") {
+        resolutionStatusTimer.current = setTimeout(() => {
+          resolutionStatusTimer.current = null;
+          setResolutionStatus(null);
+        }, 5000);
+      }
+    };
+    client.onKeyframePainted = clearResolutionStatus;
     client.onError = (message) => {
       setClientError(message);
       setConnectionState("failed");
@@ -220,11 +240,33 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     return () => {
       window.removeEventListener("pagehide", closeOnPageHide);
       releaseAllInput();
+      if (resolutionStatusTimer.current) clearTimeout(resolutionStatusTimer.current);
+      resolutionStatusTimer.current = null;
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       client.disconnect();
       clientRef.current = null;
     };
-  }, [machine.id, resolution, initialFps, initialQuality, releaseAllInput]);
+  }, [machine.id, releaseAllInput, clearResolutionStatus]);
+
+  useEffect(() => {
+    const client = clientRef.current;
+    if (!client) return;
+    if (connectionState === "connected" && resolution) {
+      const currentResolution = client.requestedResolution;
+      if (!currentResolution || currentResolution.width !== resolution.width || currentResolution.height !== resolution.height) {
+        client.requestResolution(resolution.width, resolution.height);
+      }
+    }
+    const nextFps = initialFps ?? null;
+    const nextQuality = initialQuality ?? null;
+    if (committedFps.current === nextFps && committedQuality.current === nextQuality) return;
+    setFpsCap(nextFps);
+    setQualityLevel(nextQuality);
+    if (connectionState !== "connected") return;
+    committedFps.current = nextFps;
+    committedQuality.current = nextQuality;
+    client.sendQuality(nextQuality ?? 0, nextFps ?? 0);
+  }, [machine.id, resolution, initialFps, initialQuality, connectionState]);
 
   useEffect(() => {
     const updateLayout = () => {
@@ -284,7 +326,8 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     clientRef.current?.sendQuality(qualityLevel ?? 0, fpsCap ?? 0);
   }, [fpsCap, qualityLevel]);
   const changeResolution = useCallback((width: number, height: number) => {
-    window.location.assign(buildConnectUrl(
+    clientRef.current?.requestResolution(width, height);
+    window.history.replaceState(null, "", buildConnectUrl(
       machine.id,
       undefined,
       { width, height, fps: fpsCap ?? undefined, quality: qualityLevel ?? undefined },

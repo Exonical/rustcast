@@ -16,7 +16,18 @@ export function ConnectionOverlay({ state, machineName, error, endedReason, reso
     <>
       {resolutionStatus?.state === "transitioning" && (
         <div data-local-control className="absolute left-1/2 top-24 z-20 -translate-x-1/2 rounded-xl border border-amber-300/20 bg-[#111318]/90 px-4 py-3 text-center text-xs text-amber-100 shadow-xl backdrop-blur-xl">
-          Applying display mode · the stream will reconnect briefly
+          Changing resolution to {resolutionStatus.width}x{resolutionStatus.height}…
+        </div>
+      )}
+      {resolutionStatus?.state === "recovering" && (
+        <div data-local-control role="status" className="absolute left-1/2 top-24 z-20 -translate-x-1/2 rounded-xl border border-amber-300/20 bg-[#111318]/90 px-4 py-3 text-center text-xs text-amber-100 shadow-xl backdrop-blur-xl">
+          <p>Recovering video</p>
+          {resolutionStatus.error && <p className="mt-1 text-amber-100/70">{resolutionStatus.error}</p>}
+        </div>
+      )}
+      {resolutionStatus?.state === "succeeded" && (
+        <div data-local-control className="absolute left-1/2 top-24 z-20 -translate-x-1/2 rounded-xl border border-emerald-300/20 bg-[#111318]/90 px-4 py-3 text-center text-xs text-emerald-100 shadow-xl backdrop-blur-xl">
+          Resolution applied · waiting for video
         </div>
       )}
       {resolutionStatus?.state === "failed" && (

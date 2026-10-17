@@ -66,6 +66,10 @@ pub(crate) struct ResolutionStatus {
     pub previous_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode_height: Option<u32>,
 }
 
 type ResolutionStatusMessage = Arc<(u64, Vec<u8>)>;
@@ -76,6 +80,78 @@ fn publish_resolution_status(
 ) {
     if let Ok(payload) = serde_json::to_vec(&status) {
         let _ = tx.send(Arc::new((0, payload)));
+    }
+}
+
+#[derive(Default)]
+struct ResolutionStatusTracker {
+    pending_success: Option<((u32, u32), ResolutionStatus)>,
+    latest_started: Option<(u32, u32)>,
+    recovering: Option<(u32, u32)>,
+}
+
+impl ResolutionStatusTracker {
+    fn on_transition_started(&mut self, width: u32, height: u32) {
+        self.latest_started = Some((width, height));
+        self.pending_success = None;
+    }
+
+    fn on_transition_applied(&mut self, status: ResolutionStatus) {
+        let requested = (status.width, status.height);
+        if self.latest_started == Some(requested) {
+            self.pending_success = Some((requested, status));
+        }
+    }
+
+    fn on_transition_failed(&mut self, width: u32, height: u32) {
+        if self.latest_started == Some((width, height)) {
+            self.pending_success = None;
+        }
+    }
+
+    fn on_encoder_failed(&mut self, width: u32, height: u32, retry: Duration) -> ResolutionStatus {
+        self.recovering = Some((width, height));
+        ResolutionStatus {
+            state: "recovering",
+            width,
+            height,
+            previous_width: None,
+            previous_height: None,
+            error: Some(format!(
+                "encoder failed to start at {width}x{height}; retrying in {}s",
+                retry.as_secs()
+            )),
+            encode_width: None,
+            encode_height: None,
+        }
+    }
+
+    fn on_packet_emitted(&mut self, encode_width: u32, encode_height: u32) -> Option<ResolutionStatus> {
+        let pending_success = self
+            .pending_success
+            .take()
+            .filter(|(requested, _)| self.latest_started == Some(*requested));
+        let mut status = if let Some((_, status)) = pending_success {
+            status
+        } else {
+            let (width, height) = self.recovering.take()?;
+            ResolutionStatus {
+                state: "succeeded",
+                width,
+                height,
+                previous_width: None,
+                previous_height: None,
+                error: None,
+                encode_width: None,
+                encode_height: None,
+            }
+        };
+        status.state = "succeeded";
+        status.error = None;
+        status.encode_width = Some(encode_width);
+        status.encode_height = Some(encode_height);
+        self.recovering = None;
+        Some(status)
     }
 }
 
@@ -1416,6 +1492,7 @@ fn settle_pending_mode(
     primary: &mut flux_capture::traits::DisplayInfo,
     input_sink: &flux_input::InputSink,
     tx: &tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
+    status_tracker: &mut ResolutionStatusTracker,
 ) {
     let Some(request) = *pending else {
         return;
@@ -1430,17 +1507,16 @@ fn settle_pending_mode(
                 tracing::warn!("Failed to update input target rectangle: {}", error);
             }
             tracing::info!("Resolution request applied: now {}", request.requested);
-            publish_resolution_status(
-                tx,
-                ResolutionStatus {
-                    state: "succeeded",
-                    width: request.requested.width,
-                    height: request.requested.height,
-                    previous_width: Some(request.previous.width),
-                    previous_height: Some(request.previous.height),
-                    error: None,
-                },
-            );
+            status_tracker.on_transition_applied(ResolutionStatus {
+                state: "succeeded",
+                width: request.requested.width,
+                height: request.requested.height,
+                previous_width: Some(request.previous.width),
+                previous_height: Some(request.previous.height),
+                error: None,
+                encode_width: None,
+                encode_height: None,
+            });
             *pending = None;
         }
         PendingModeState::TimedOut => {
@@ -1449,6 +1525,8 @@ fn settle_pending_mode(
                 request.requested,
                 MODE_REQUEST_TIMEOUT
             );
+            status_tracker
+                .on_transition_failed(request.requested.width, request.requested.height);
             publish_resolution_status(
                 tx,
                 ResolutionStatus {
@@ -1458,6 +1536,8 @@ fn settle_pending_mode(
                     previous_width: Some(request.previous.width),
                     previous_height: Some(request.previous.height),
                     error: Some("compositor did not apply the mode".into()),
+                    encode_width: None,
+                    encode_height: None,
                 },
             );
             *pending = None;
@@ -1475,6 +1555,7 @@ fn transition_resolution(
     request: ModeRequest,
     old_mode: ModeRequest,
     resolution_status_tx: &tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
+    status_tracker: &mut ResolutionStatusTracker,
 ) -> (
     flux_capture::traits::DisplayInfo,
     Box<dyn flux_capture::traits::CaptureSession>,
@@ -1489,13 +1570,24 @@ fn transition_resolution(
                 previous_width: Some(old_mode.width),
                 previous_height: Some(old_mode.height),
                 error,
+                encode_width: None,
+                encode_height: None,
             },
         );
     };
     let error = match replug_capture(starter, display, request) {
         Ok(restored) => {
             tracing::info!("Resolution transition succeeded: {}x{}", request.width, request.height);
-            publish("succeeded", None);
+            status_tracker.on_transition_applied(ResolutionStatus {
+                state: "succeeded",
+                width: request.width,
+                height: request.height,
+                previous_width: Some(old_mode.width),
+                previous_height: Some(old_mode.height),
+                error: None,
+                encode_width: None,
+                encode_height: None,
+            });
             return restored;
         }
         Err(error) => error,
@@ -1513,6 +1605,7 @@ fn transition_resolution(
                 old_mode.width,
                 old_mode.height
             );
+            status_tracker.on_transition_failed(request.width, request.height);
             publish(
                 "failed",
                 Some(format!(
@@ -1525,6 +1618,7 @@ fn transition_resolution(
         Err(rollback_error) => rollback_error,
     };
     tracing::error!("Resolution transition rollback failed: {}", rollback_error);
+    status_tracker.on_transition_failed(request.width, request.height);
     publish(
         "failed",
         Some(format!("transition and rollback failed: {rollback_error}")),
@@ -1871,10 +1965,12 @@ fn capture_loop(
 
     let mut frame_count: u64 = 0;
     let mut stage_timings = StageTimings::default();
+    let mut resolution_status_tracker = ResolutionStatusTracker::default();
     #[cfg(not(target_os = "windows"))]
     let mut pending_mode: Option<PendingMode> = None;
     loop {
         if let Ok(request) = resolution_rx.try_recv() {
+            resolution_status_tracker.on_transition_started(request.width, request.height);
             #[cfg(target_os = "windows")]
             {
                 let current_mode = ModeRequest {
@@ -1910,6 +2006,8 @@ fn capture_loop(
                                 previous_width: None,
                                 previous_height: None,
                                 error: None,
+                                encode_width: None,
+                                encode_height: None,
                             },
                         );
                     }
@@ -1926,8 +2024,14 @@ fn capture_loop(
                         encode_resolution = flux_core::types::Resolution::new(0, 0);
                         release_capture_session(session);
                         crate::metrics::capture_restart();
-                        (primary, session) =
-                            transition_resolution(&starter, display, request, current_mode, &resolution_status_tx);
+                        (primary, session) = transition_resolution(
+                            &starter,
+                            display,
+                            request,
+                            current_mode,
+                            &resolution_status_tx,
+                            &mut resolution_status_tracker,
+                        );
                     }
                 }
             }
@@ -1943,6 +2047,8 @@ fn capture_loop(
                             previous_width: None,
                             previous_height: None,
                             error,
+                            encode_width: None,
+                            encode_height: None,
                         },
                     );
                 };
@@ -1954,6 +2060,8 @@ fn capture_loop(
                             request.height,
                             error
                         );
+                        resolution_status_tracker
+                            .on_transition_failed(request.width, request.height);
                         publish("failed", request, Some(error.to_string()));
                     }
                     Ok(request) => {
@@ -1993,6 +2101,8 @@ fn capture_loop(
                                         request.height,
                                         error
                                     );
+                                    resolution_status_tracker
+                                        .on_transition_failed(request.width, request.height);
                                     publish("failed", request, Some(error.to_string()));
                                 }
                             }
@@ -2076,6 +2186,7 @@ fn capture_loop(
                     &mut primary,
                     &input_sink,
                     &resolution_status_tx,
+                    &mut resolution_status_tracker,
                 );
                 continue;
             }
@@ -2106,6 +2217,7 @@ fn capture_loop(
             &mut primary,
             &input_sink,
             &resolution_status_tx,
+            &mut resolution_status_tracker,
         );
 
         let t_capture = t0.elapsed();
@@ -2141,6 +2253,12 @@ fn capture_loop(
                     encode_resolution = frame.resolution;
                     let retry_delay = encoder_retry.on_failure(std::time::Instant::now());
                     tracing::warn!("Encoder rebuild failed; retrying in {}s", retry_delay.as_secs());
+                    let status = resolution_status_tracker.on_encoder_failed(
+                        capture_resolution.width,
+                        capture_resolution.height,
+                        retry_delay,
+                    );
+                    publish_resolution_status(&resolution_status_tx, status);
                 }
             }
             if let Ok(mut status) = runtime_status.write() {
@@ -2247,6 +2365,11 @@ fn capture_loop(
                         }
 
                         let _ = h264_tx.send(Arc::new((ts_micros, pkt.data)));
+                        if let Some(status) = resolution_status_tracker
+                            .on_packet_emitted(encode_resolution.width, encode_resolution.height)
+                        {
+                            publish_resolution_status(&resolution_status_tx, status);
+                        }
                     }
                 }
                 Err(e) => {
@@ -2461,6 +2584,101 @@ mod encoder_retry_tests {
             retry.on_failure(now + Duration::from_secs(1)),
             Duration::from_secs(1)
         );
+    }
+}
+
+#[cfg(test)]
+mod resolution_status_tests {
+    use super::*;
+
+    #[test]
+    fn transition_success_waits_for_encoded_packet_and_records_encode_size() {
+        let mut tracker = ResolutionStatusTracker::default();
+        tracker.on_transition_started(2560, 1440);
+        tracker.on_transition_applied(ResolutionStatus {
+            state: "succeeded",
+            width: 2560,
+            height: 1440,
+            previous_width: Some(1920),
+            previous_height: Some(1080),
+            error: None,
+            encode_width: None,
+            encode_height: None,
+        });
+
+        let status = tracker.on_packet_emitted(1920, 1080).unwrap();
+        assert_eq!(status.state, "succeeded");
+        assert_eq!((status.width, status.height), (2560, 1440));
+        assert_eq!((status.encode_width, status.encode_height), (Some(1920), Some(1080)));
+        assert_eq!(
+            (status.previous_width, status.previous_height),
+            (Some(1920), Some(1080))
+        );
+        assert!(tracker.on_packet_emitted(1920, 1080).is_none());
+    }
+
+    #[test]
+    fn encoder_recovery_publishes_recovering_then_succeeded() {
+        let mut tracker = ResolutionStatusTracker::default();
+        let recovering = tracker.on_encoder_failed(1280, 720, Duration::from_secs(4));
+        assert_eq!(recovering.state, "recovering");
+        assert_eq!(
+            recovering.error.as_deref(),
+            Some("encoder failed to start at 1280x720; retrying in 4s")
+        );
+
+        let succeeded = tracker.on_packet_emitted(1280, 720).unwrap();
+        assert_eq!(succeeded.state, "succeeded");
+        assert_eq!((succeeded.width, succeeded.height), (1280, 720));
+        assert_eq!(
+            (succeeded.encode_width, succeeded.encode_height),
+            (Some(1280), Some(720))
+        );
+        assert!(succeeded.error.is_none());
+    }
+
+    #[test]
+    fn pending_transition_success_takes_precedence_over_recovery_clear() {
+        let mut tracker = ResolutionStatusTracker::default();
+        tracker.on_transition_started(1600, 900);
+        tracker.on_transition_applied(ResolutionStatus {
+            state: "succeeded",
+            width: 1600,
+            height: 900,
+            previous_width: Some(1920),
+            previous_height: Some(1080),
+            error: None,
+            encode_width: None,
+            encode_height: None,
+        });
+        tracker.on_encoder_failed(1600, 900, Duration::from_secs(2));
+
+        let succeeded = tracker.on_packet_emitted(1600, 900).unwrap();
+        assert_eq!((succeeded.width, succeeded.height), (1600, 900));
+        assert_eq!(
+            (succeeded.previous_width, succeeded.previous_height),
+            (Some(1920), Some(1080))
+        );
+    }
+
+    #[test]
+    fn newer_failed_transition_discards_older_pending_success() {
+        let mut tracker = ResolutionStatusTracker::default();
+        tracker.on_transition_started(1280, 720);
+        tracker.on_transition_applied(ResolutionStatus {
+            state: "succeeded",
+            width: 1280,
+            height: 720,
+            previous_width: Some(1920),
+            previous_height: Some(1080),
+            error: None,
+            encode_width: None,
+            encode_height: None,
+        });
+        tracker.on_transition_started(1600, 900);
+        tracker.on_transition_failed(1600, 900);
+
+        assert!(tracker.on_packet_emitted(1280, 720).is_none());
     }
 }
 

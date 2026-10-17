@@ -195,6 +195,60 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 			draining = false
 		}
 	}
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "resolution",
+		Data: json.RawMessage(`{"width":641,"height":480}`),
+	})
+	rejected := readTestControlMessage(t, control)
+	if rejected.Type != "error" {
+		t.Fatalf("invalid resolution response type = %q, want error", rejected.Type)
+	}
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "latency-ping",
+		Data: json.RawMessage(`{"t":1}`),
+	})
+	if continued := readTestControlMessage(t, control); continued.Type != "latency-pong" {
+		t.Fatalf("control response after invalid resolution = %q, want latency-pong", continued.Type)
+	}
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "resolution",
+		Data: json.RawMessage(`{"width":1280,"height":720}`),
+	})
+	select {
+	case command := <-upstream.commandChan:
+		want := []byte{0x06, 0x05, 0x00, 0x02, 0xd0}
+		if string(command) != string(want) {
+			t.Fatalf("upstream resolution command = %x, want %x", command, want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("resolution request did not reach upstream as command 0x06")
+	}
+	statusStream, err := clientSession.AcceptUniStream(ctx)
+	if err != nil {
+		t.Fatalf("accept resolution status stream: %v", err)
+	}
+	var statusHeader [5]byte
+	if _, err := io.ReadFull(statusStream, statusHeader[:]); err != nil {
+		t.Fatalf("read resolution status header: %v", err)
+	}
+	if statusHeader[0] != 0x03 {
+		t.Fatalf("resolution status stream type = %02x, want 03", statusHeader[0])
+	}
+	statusPayload := make([]byte, binary.BigEndian.Uint32(statusHeader[1:]))
+	if _, err := io.ReadFull(statusStream, statusPayload); err != nil {
+		t.Fatalf("read resolution status payload: %v", err)
+	}
+	var status struct {
+		State  string `json:"state"`
+		Width  uint32 `json:"width"`
+		Height uint32 `json:"height"`
+	}
+	if err := json.Unmarshal(statusPayload, &status); err != nil {
+		t.Fatalf("decode resolution status: %v", err)
+	}
+	if status.State != "transitioning" || status.Width != 1280 || status.Height != 720 {
+		t.Fatalf("resolution status = %+v, want transitioning 1280x720", status)
+	}
 	upstream.mu.Lock()
 	upstream.idrGate.last = time.Now().Add(-idrRequestInterval)
 	upstream.mu.Unlock()
