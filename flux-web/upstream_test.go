@@ -6,14 +6,9 @@ import (
 	"errors"
 	"io"
 	"net"
-	"reflect"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
-	"github.com/pion/webrtc/v4"
 )
 
 func pooledFrame(pool *frameBufferPool, frame frameMsg) frameMsg {
@@ -209,73 +204,6 @@ func TestConcurrentQueueAndStop(t *testing.T) {
 	}
 }
 
-func pacingSession(t *testing.T) *Session {
-	t.Helper()
-	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Session{VideoTrack: track}
-}
-
-func emptyPackets(n int) []*rtp.Packet {
-	packets := make([]*rtp.Packet, n)
-	for i := range packets {
-		packets[i] = &rtp.Packet{}
-	}
-	return packets
-}
-
-func TestPacingFlushesWholeFrameWhenNewerFrameIsQueued(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
-	session := pacingSession(t)
-	u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(2)))
-	done := make(chan struct{})
-	var sent int
-	var flushed bool
-	go func() {
-		sent, flushed = u.writePacedPackets(session, emptyPackets(3), []time.Duration{0, time.Hour, time.Hour})
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("pacing kept waiting with a newer frame queued")
-	}
-	if sent != 3 || !flushed || session.nextSequenceNumber != 3 {
-		t.Fatalf("writePacedPackets = (%d, %t), seq=%d; want the whole frame flushed", sent, flushed, session.nextSequenceNumber)
-	}
-	if len(u.frameChan) != 1 || u.frameBuffers.count != 0 {
-		t.Fatal("pacing consumed or released the queued newer frame")
-	}
-}
-
-func TestPacingFlushesWhenFrameArrivesMidWait(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
-	session := pacingSession(t)
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		u.queueFrame(pFrame(2))
-	}()
-	start := time.Now()
-	sent, flushed := u.writePacedPackets(session, emptyPackets(2), []time.Duration{0, time.Hour})
-	if sent != 2 || !flushed || time.Since(start) > time.Second {
-		t.Fatalf("writePacedPackets = (%d, %t) after %s; want a flush on arrival", sent, flushed, time.Since(start))
-	}
-}
-
-func TestPacingIgnoresStaleReadySignal(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
-	session := pacingSession(t)
-	u.queueFrame(pFrame(1))
-	<-u.frameChan // consumed by the pusher; the ready signal is still pending
-	start := time.Now()
-	sent, flushed := u.writePacedPackets(session, emptyPackets(2), []time.Duration{0, 30 * time.Millisecond})
-	if sent != 2 || flushed || time.Since(start) < 30*time.Millisecond {
-		t.Fatalf("writePacedPackets = (%d, %t) after %s; want the schedule kept", sent, flushed, time.Since(start))
-	}
-}
-
 func TestNextFrameSendsShortBacklogInOrder(t *testing.T) {
 	now := time.Now()
 	current := pFrame(1)
@@ -304,322 +232,6 @@ func TestNextFrameSkipsStaleBacklogToNewestKeyframe(t *testing.T) {
 	got, _, dropped = nextFrame(make(chan frameMsg), stale, now)
 	if got.tsMicros != 1 || dropped {
 		t.Fatal("a stale frame with nothing newer queued was dropped")
-	}
-}
-
-func TestFramePusherReleasesConsumedAndSkippedFrames(t *testing.T) {
-	for _, scenario := range []string{"no session", "no video track", "awaiting IDR", "packetized"} {
-		t.Run(scenario, func(t *testing.T) {
-			u := newMachineUpstream("", "", func(string) {})
-			if scenario != "no session" {
-				session := &Session{needsIDR: scenario == "awaiting IDR"}
-				if scenario != "no video track" {
-					track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
-					if err != nil {
-						t.Fatal(err)
-					}
-					session.VideoTrack = track
-					session.Packetizer = rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000)
-				}
-				u.bindSession(session)
-			}
-			u.queueFrame(pooledFrame(&u.frameBuffers, pFrame(1)))
-			done := make(chan struct{})
-			go func() { u.framePusher(); close(done) }()
-			defer func() { u.stop(); <-done }()
-			deadline := time.NewTimer(time.Second)
-			defer deadline.Stop()
-			ticker := time.NewTicker(time.Millisecond)
-			defer ticker.Stop()
-			for cachedFrameBuffers(&u.frameBuffers) != 1 {
-				select {
-				case <-deadline.C:
-					t.Fatal("pusher did not release frame")
-				case <-ticker.C:
-				}
-			}
-		})
-	}
-}
-
-type stopAfterPacketizing struct {
-	rtp.Packetizer
-	stop func()
-}
-
-func (p *stopAfterPacketizing) Packetize(data []byte, samples uint32) []*rtp.Packet {
-	packets := p.Packetizer.Packetize(data, samples)
-	p.stop()
-	return packets
-}
-
-func TestFramePusherReleasesPayloadWhenPacingStops(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
-	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.bindSession(&Session{VideoTrack: track, Packetizer: &stopAfterPacketizing{
-		Packetizer: rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000),
-		stop:       u.stop,
-	}})
-	data := bytes.Repeat([]byte{3}, 4096)
-	copy(data, pFrame(1).data)
-	u.queueFrame(pooledFrame(&u.frameBuffers, frameMsg{data: data}))
-	u.framePusher()
-	if u.frameBuffers.count != 1 || len(u.frameChan) != 0 {
-		t.Fatal("stopped pacing retained or released the payload twice")
-	}
-}
-
-func TestFramePayloaderMatchesPion(t *testing.T) {
-	for _, mtu := range []uint16{0, 2, 16, 1200} {
-		var safe framePayloader
-		var original codecs.H264Payloader
-		for _, data := range [][]byte{
-			nil, {0x41, 1, 2}, {0, 0, 1},
-			{0, 0, 0, 1, 0x67, 3, 0, 0, 1, 0x68, 4, 0, 0, 0, 1, 0x65, 5},
-			{0, 0, 1, 0x67, 8}, {0x68, 9}, {0, 0, 1, 0x09},
-			append([]byte{0, 0, 1, 0x65}, bytes.Repeat([]byte{3}, 4096)...),
-			{0, 0, 1, 0, 0, 0, 1, 0x41, 4},
-		} {
-			got, want := safe.Payload(mtu, data), original.Payload(mtu, data)
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("mtu=%d data=%x: got %x, want %x", mtu, data, got, want)
-			}
-		}
-	}
-}
-
-func TestPacketizerDoesNotRetainPooledPayload(t *testing.T) {
-	var pool frameBufferPool
-	packetizer := rtp.NewPacketizer(1200, 96, 1, &framePayloader{}, rtp.NewFixedSequencer(0), 90000)
-	var reference codecs.H264Payloader
-	// Parameter sets may arrive separately and survive multiple Packetize calls.
-	for _, data := range [][]byte{{0, 0, 1, 0x67, 1}, {0, 0, 1, 0x68, 2}, {0, 0, 1, 0x65, 3}} {
-		frame := pooledFrame(&pool, frameMsg{data: data})
-		packets := packetizer.Packetize(frame.data, 1440)
-		want := reference.Payload(1188, data)
-		frame.release()
-		reused := pool.get(len(data))
-		clear(reused)
-		pool.put(reused)
-		if len(packets) != len(want) {
-			t.Fatalf("packets=%d, want %d", len(packets), len(want))
-		}
-		for i, packet := range packets {
-			if !bytes.Equal(packet.Payload, want[i]) {
-				t.Fatalf("packet payload corrupted after reuse: got %x, want %x", packet.Payload, want[i])
-			}
-		}
-	}
-}
-
-func FuzzFramePayloaderMatchesPion(f *testing.F) {
-	f.Add([]byte{0, 0, 0, 1, 0x67, 3, 0, 0, 1, 0x68, 4, 0, 0, 0, 1, 0x65, 5}, uint16(1200))
-	f.Add([]byte{0x41, 1, 2}, uint16(16))
-	f.Fuzz(func(t *testing.T, data []byte, mtu uint16) {
-		var safe framePayloader
-		var original codecs.H264Payloader
-		for _, part := range [][]byte{data[:len(data)/2], data[len(data)/2:]} {
-			got, want := safe.Payload(mtu, part), original.Payload(mtu, part)
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("mtu=%d data=%x: got %x, want %x", mtu, part, got, want)
-			}
-		}
-	})
-}
-
-var benchmarkFrameData []byte
-
-func BenchmarkFramePayloadBuffer(b *testing.B) {
-	for _, size := range []int{256 * 1024, 1024 * 1024, maxFramePayloadSize} {
-		b.Run(stringSize(size), func(b *testing.B) {
-			b.Run("allocate", func(b *testing.B) {
-				b.ReportAllocs()
-				for i := 0; i < b.N; i++ {
-					benchmarkFrameData = make([]byte, size)
-				}
-			})
-			b.Run("reuse", func(b *testing.B) {
-				var pool frameBufferPool
-				pool.put(pool.get(size))
-				b.ReportAllocs()
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					benchmarkFrameData = pool.get(size)
-					pool.put(benchmarkFrameData)
-				}
-			})
-		})
-	}
-}
-
-func BenchmarkFrameReadAndPacketize(b *testing.B) {
-	data := bytes.Repeat([]byte{3}, 1024*1024)
-	copy(data, []byte{0, 0, 0, 1, 0x65})
-	for _, reuse := range []bool{false, true} {
-		name := "allocate"
-		var payloader rtp.Payloader = &codecs.H264Payloader{}
-		if reuse {
-			name = "reuse"
-			payloader = &framePayloader{}
-		}
-		b.Run(name, func(b *testing.B) {
-			u := newMachineUpstream("", "", func(string) {})
-			packetizer := rtp.NewPacketizer(1200, 96, 1, payloader, rtp.NewFixedSequencer(0), 90000)
-			reader := bytes.NewReader(data)
-			if reuse {
-				u.frameBuffers.put(u.frameBuffers.get(len(data)))
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				reader.Reset(data)
-				var frame frameMsg
-				if reuse {
-					var err error
-					frame, err = u.readPayload(reader, 0x01, len(data))
-					if err != nil {
-						b.Fatal(err)
-					}
-				} else {
-					frame.data = make([]byte, len(data))
-					if _, err := io.ReadFull(reader, frame.data); err != nil {
-						b.Fatal(err)
-					}
-				}
-				packets := packetizer.Packetize(frame.data, 1440)
-				if len(packets) == 0 {
-					b.Fatal("no packets")
-				}
-				benchmarkFrameData = packets[0].Payload
-				frame.release()
-			}
-		})
-	}
-}
-
-func stringSize(size int) string {
-	switch size {
-	case 256 * 1024:
-		return "256KiB"
-	case 1024 * 1024:
-		return "1MiB"
-	default:
-		return "10MiB"
-	}
-}
-
-func TestCaptureFrameDuration(t *testing.T) {
-	tests := []struct {
-		name       string
-		lastTs     uint64
-		currentTs  uint64
-		haveLastTs bool
-		want       time.Duration
-	}{
-		{
-			name:       "normal frame interval",
-			lastTs:     1_000_000,
-			currentTs:  1_016_000,
-			haveLastTs: true,
-			want:       16 * time.Millisecond,
-		},
-		{
-			name:       "multi-second idle gap is preserved",
-			lastTs:     1_000_000,
-			currentTs:  4_000_000,
-			haveLastTs: true,
-			want:       3 * time.Second,
-		},
-		{
-			name:       "backwards timestamp uses nominal duration",
-			lastTs:     4_000_000,
-			currentTs:  3_000_000,
-			haveLastTs: true,
-			want:       defaultFrameDuration,
-		},
-		{
-			name:       "timestamp reset uses nominal duration",
-			lastTs:     9_000_000,
-			currentTs:  0,
-			haveLastTs: true,
-			want:       defaultFrameDuration,
-		},
-		{
-			name:       "first sample uses nominal duration",
-			lastTs:     0,
-			currentTs:  2_000_000,
-			haveLastTs: false,
-			want:       defaultFrameDuration,
-		},
-		{
-			name:       "absurd timestamp gap is capped",
-			lastTs:     1,
-			currentTs:  31_000_000,
-			haveLastTs: true,
-			want:       maxSaneFrameDuration,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := captureFrameDuration(test.lastTs, test.currentTs, test.haveLastTs); got != test.want {
-				t.Fatalf("captureFrameDuration(%d, %d, %t) = %s, want %s",
-					test.lastTs, test.currentTs, test.haveLastTs, got, test.want)
-			}
-		})
-	}
-}
-
-func TestPacingScheduleUsesTwiceTargetBitrate(t *testing.T) {
-	schedule := pacingSchedule([]int{1000, 1000, 500}, 1000, 16*time.Millisecond)
-	want := []time.Duration{0, 4 * time.Millisecond, 8 * time.Millisecond}
-	for i := range want {
-		if schedule[i] != want[i] {
-			t.Fatalf("schedule[%d] = %s, want %s", i, schedule[i], want[i])
-		}
-	}
-}
-
-func TestPacingScheduleUsesFrameRateFloor(t *testing.T) {
-	schedule := pacingSchedule([]int{1200, 800}, 0, 16*time.Millisecond)
-	if schedule[0] != 0 || schedule[1] != 9600*time.Microsecond {
-		t.Fatalf("frame-rate floor schedule = %v, want [0 9.6ms]", schedule)
-	}
-}
-
-func TestPacingScheduleLargeFrameIsBoundedByTargetMultiple(t *testing.T) {
-	packetSizes := []int{10_000, 10_000}
-	schedule := pacingSchedule(packetSizes, 100, 16*time.Millisecond)
-	if got, want := schedule[len(schedule)-1], 200*time.Millisecond; got != want {
-		t.Fatalf("large frame's final packet starts at %s, want %s", got, want)
-	}
-}
-
-func TestPacingScheduleIDRUsesEmissionTargetAfterLongGap(t *testing.T) {
-	schedule := pacingScheduleForFrame([]int{50_000, 30_000}, 2_100, time.Second, true)
-	if got, want := schedule[1], 40*time.Millisecond; got != want {
-		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
-	}
-	if got, want := schedule[1]+30_000*8*time.Second/time.Duration(pacingIDRMinCeiling), 64*time.Millisecond; got != want {
-		t.Fatalf("IDR emission time = %s, want %s", got, want)
-	}
-}
-
-func TestPacingScheduleIDRCeilingScalesWithTarget(t *testing.T) {
-	schedule := pacingScheduleForFrame([]int{200_000, 200_000}, 12_000, 16*time.Millisecond, true)
-	bitsPerSecond := float64(48_000_000)
-	if got, want := schedule[1], time.Duration(float64(200_000*8)/bitsPerSecond*float64(time.Second)); got != want {
-		t.Fatalf("IDR final packet starts at %s, want %s", got, want)
-	}
-}
-
-func TestPacingScheduleIDRRespectsAbsoluteRateCeiling(t *testing.T) {
-	schedule := pacingScheduleForFrame([]int{1_000_000, 1}, 1_000, time.Second, true)
-	if got, want := schedule[1], 800*time.Millisecond; got != want {
-		t.Fatalf("large IDR final packet starts at %s, want %s", got, want)
 	}
 }
 
@@ -694,7 +306,8 @@ func TestGatedSkipRequestsRecoveryIDRThroughGate(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	u := newMachineUpstream("", "", nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
-	session := &Session{needsIDR: true}
+	session := &Session{}
+	session.needsIDR.Store(true)
 
 	if !u.skipFrameUntilIDR(session, false) {
 		t.Fatal("gated P-frame was not skipped")
@@ -720,7 +333,8 @@ func TestGatedSkipRequestsRecoveryIDRThroughGate(t *testing.T) {
 
 func TestGatedSkipDoesNotSkipIDR(t *testing.T) {
 	u := newMachineUpstream("", "", nil)
-	session := &Session{needsIDR: true}
+	session := &Session{}
+	session.needsIDR.Store(true)
 	if u.skipFrameUntilIDR(session, true) {
 		t.Fatal("IDR was incorrectly skipped")
 	}
@@ -770,7 +384,7 @@ func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 	session := &Session{}
 
-	if !u.requestIDR(idrReasonViewerPLI) {
+	if !u.requestIDR(idrReasonViewerRequest) {
 		t.Fatal("regular IDR request was rejected")
 	}
 	if !u.requestInitialIDR(session) {
@@ -784,79 +398,18 @@ func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
 	}
 }
 
-func TestEmissionSequenceNumbersRemainContiguousAcrossAbandonment(t *testing.T) {
-	next := uint16(65534)
-	var emitted []uint16
-	for range 2 {
-		packet := &rtp.Packet{}
-		assignSequenceNumber(packet, &next)
-		emitted = append(emitted, packet.Header.SequenceNumber)
-		commitSequenceNumber(&next, true)
-	}
-	// The remainder of this frame is abandoned. The next frame starts with
-	// the next emitted sequence number rather than the packetizer's counter.
-	for range 3 {
-		packet := &rtp.Packet{}
-		assignSequenceNumber(packet, &next)
-		emitted = append(emitted, packet.Header.SequenceNumber)
-		commitSequenceNumber(&next, true)
-	}
-	want := []uint16{65534, 65535, 0, 1, 2}
-	for i := range want {
-		if emitted[i] != want[i] {
-			t.Fatalf("emitted sequence[%d] = %d, want %d", i, emitted[i], want[i])
-		}
-	}
-}
-
-func TestSequenceNumberDoesNotAdvanceOnWriteError(t *testing.T) {
-	next := uint16(41)
-	packet := &rtp.Packet{}
-	assignSequenceNumber(packet, &next)
-	if packet.Header.SequenceNumber != next {
-		t.Fatalf("assigned sequence = %d, want %d", packet.Header.SequenceNumber, next)
-	}
-	if next != 41 {
-		t.Fatalf("sequence advanced before write: %d", next)
-	}
-
-	commitSequenceNumber(&next, false)
-	if next != 41 {
-		t.Fatalf("failed write sequence = %d, want 41", next)
-	}
-	commitSequenceNumber(&next, true)
-	if next != 42 {
-		t.Fatalf("successful write sequence = %d, want 42", next)
-	}
-}
-
-func TestAbandonedFrameDoesNotOveradvanceRTPClock(t *testing.T) {
-	firstTicks, remainder := consumeRTPDuration(16*time.Millisecond, 0)
-	secondTicks, remainder := consumeRTPDuration(16*time.Millisecond, remainder)
-	combinedTicks, combinedRemainder := consumeRTPDuration(32*time.Millisecond, 0)
-	if firstTicks+secondTicks != combinedTicks || remainder != combinedRemainder {
-		t.Fatalf(
-			"abandoned-frame timeline = (%d, %v), direct timeline = (%d, %v)",
-			firstTicks+secondTicks,
-			remainder,
-			combinedTicks,
-			combinedRemainder,
-		)
-	}
-}
-
 func TestIDRStatsSeparatesGrantedFromSuppressedByReason(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	u := newMachineUpstream("", "", nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 
-	u.requestIDR(idrReasonViewerPLI)   // granted
-	u.requestIDR(idrReasonAwaitingIDR) // gated
-	u.requestIDR(idrReasonStaleQueue)  // gated
-	u.requestIDR(idrReasonStaleQueue)  // gated
+	u.requestIDR(idrReasonViewerRequest) // granted
+	u.requestIDR(idrReasonAwaitingIDR)   // gated
+	u.requestIDR(idrReasonStaleQueue)    // gated
+	u.requestIDR(idrReasonStaleQueue)    // gated
 
 	summary := u.idrStats.drain()
-	want := "viewer-pli=1(+0 suppressed) stale-queue-discard=0(+2 suppressed) awaiting-idr=0(+1 suppressed)"
+	want := "viewer-request=1(+0 suppressed) stale-queue-discard=0(+2 suppressed) awaiting-idr=0(+1 suppressed)"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}
@@ -872,7 +425,7 @@ func TestStageStatsReportsWorstCaseSeparatelyFromAverage(t *testing.T) {
 
 	summary := stats.summary()
 	want := "frames=2 queue avg=5.0 max=9 | relay wait avg=11.0ms max=20.0ms | " +
-		"pacing avg=22.0ms max=40.0ms | idr n=1 max=700000 bytes max pacing=40.0ms | flushed=1"
+		"send avg=22.0ms max=40.0ms | idr n=1 max=700000 bytes max send=40.0ms | resets=1"
 	if summary != want {
 		t.Fatalf("summary = %q, want %q", summary, want)
 	}

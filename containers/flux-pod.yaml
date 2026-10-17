@@ -13,9 +13,8 @@ spec:
       image: localhost/flux-relay:latest
       imagePullPolicy: Never
       env:
-        # Advertised as the WebRTC host candidate: what a browser on the
-        # podman-machine host reaches through the published UDP port.
-        - name: FLUX_ICE_PUBLIC_IPS
+        # Host browsers use the published WebTransport UDP port at this address.
+        - name: FLUX_WT_PUBLIC_HOST
           value: "127.0.0.1"
       ports:
         - containerPort: 8080

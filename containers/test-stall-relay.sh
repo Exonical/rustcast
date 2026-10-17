@@ -9,4 +9,4 @@ id=$1 since=$2 until=$3
 log=$(MSYS_NO_PATHCONV=1 podman logs --since "$since" --until "$until" flux-relay 2>&1)
 reasons=$(grep -F "[idr:$id]" <<<"$log" | grep -oE '[a-z-]+=[0-9]+\(\+[0-9]+' |
   awk -F'[=(+]' '{s[$1] += $2 + $4} END {for (r in s) printf "%s=%d ", r, s[r]}')
-echo "recovery-idr=$(grep -c -F "[webrtc:$id] recovery IDR" <<<"$log" || true) ${reasons:-no-idr-requests}"
+echo "recovery-idr=$(grep -c -F "[wt:$id] recovery IDR" <<<"$log" || true) ${reasons:-no-idr-requests}"

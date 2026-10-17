@@ -1,15 +1,17 @@
 # Agent notes
 
 ## Layout
-- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebRTC relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod.
+- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebTransport (HTTP/3) relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod.
 
 ## Build / test
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).
 - Rust host build runs inside `containers/host/Containerfile` (features `capture-mutter,encoder-ffmpeg`); Cargo workspace root is `flux/`.
+- UI package operations use `npx -y pnpm@9.15.1 ...`; newer pnpm versions ignore the lockfile overrides.
 
 ## Deploy (Windows, Podman machine on WSL2; no Docker)
-- Full rebuild + pod replace: `./containers/run.sh` (auto-detects the WSL VM IP for `FLUX_ICE_PUBLIC_IPS`; re-run after WSL restarts).
-- Relay-only swap keeping the host container: `podman build -f containers/relay/Containerfile -t localhost/flux-relay:latest . && podman rm -f flux-relay && podman run -d --pod flux --name flux-relay -e FLUX_ICE_PUBLIC_IPS=<vm-ip> --user flux-web localhost/flux-relay:latest`
+- Full rebuild + pod replace: `./containers/run.sh` (auto-detects the WSL VM IP for `FLUX_WT_PUBLIC_HOST`; re-run after WSL restarts).
+- Relay-only swap keeping the host container: `podman build -f containers/relay/Containerfile -t localhost/flux-relay:latest . && podman rm -f flux-relay && podman run -d --pod flux --name flux-relay -e FLUX_WT_PUBLIC_HOST=<vm-ip> --user flux-web localhost/flux-relay:latest`
+- Optional relay TLS files: set `FLUX_TLS_CERT` and `FLUX_TLS_KEY`; otherwise the relay rotates its self-signed WebTransport certificate.
 - From Git Bash, prefix podman commands that pass absolute container paths with `MSYS_NO_PATHCONV=1`.
 - Server log: `MSYS_NO_PATHCONV=1 podman exec flux-host su flux -c 'XDG_RUNTIME_DIR=/run/user/1000 journalctl --user -u flux-server'`; relay: `podman logs flux-relay`.
 

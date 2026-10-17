@@ -14,8 +14,8 @@ const ibmPlexMono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Flux Stream",
-  description: "GPU-accelerated remote desktop viewer",
+  title: "Flux Workspace",
+  description: "Manage and connect to your Flux remote workspaces",
 };
 
 export default function RootLayout({
