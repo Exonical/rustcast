@@ -65,7 +65,7 @@ function writeControl(type, data) {
   if (!controlWriter) return;
   const payload = new TextEncoder().encode(JSON.stringify({ type, ...(data === undefined ? {} : { data }) }));
   const framed = new Uint8Array(payload.length + 4);
-  new DataView(framed.buffer).setUint32(0, payload.length);
+  new DataView(framed.buffer, framed.byteOffset, framed.byteLength).setUint32(0, payload.length);
   framed.set(payload, 4);
   controlWriter.write(framed).catch(error => result.events.push(`control-write=${error}`));
 }
@@ -209,7 +209,7 @@ async function readControlStream(stream) {
   try {
     while (true) {
       const header = await readExactly(reader, 4, buffered);
-      const length = new DataView(header.buffer).getUint32(0);
+      const length = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(0);
       const payload = await readExactly(reader, length, buffered);
       const message = JSON.parse(new TextDecoder().decode(payload));
       if (message.type === 'latency-pong') result.controlRttMs = performance.now() - message.data.t;
@@ -235,9 +235,10 @@ async function readMetadataStream(stream) {
     const kind = (await readExactly(reader, 1, buffered))[0];
     if (kind === 1) {
       const header = await readExactly(reader, 17, buffered);
-      seq = new DataView(header.buffer, header.byteOffset, 4).getUint32(0);
+      const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+      seq = view.getUint32(0);
       const keyframe = (header[12] & 1) !== 0;
-      const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(13);
+      const length = view.getUint32(13);
       const data = await readExactly(reader, length, buffered);
       const receivedAt = performance.now();
       counters.framesReceived++;
@@ -249,7 +250,8 @@ async function readMetadataStream(stream) {
       if (!decoder) { requestKeyframe(); return; }
       releaseOrdered({ seq, keyframe: isKey, data, receivedAt });
     } else if (kind === 2 || kind === 3) {
-      const length = new DataView(await readExactly(reader, 4, buffered).then(value => value.buffer)).getUint32(0);
+      const lengthHeader = await readExactly(reader, 4, buffered);
+      const length = new DataView(lengthHeader.buffer, lengthHeader.byteOffset, lengthHeader.byteLength).getUint32(0);
       const data = JSON.parse(new TextDecoder().decode(await readExactly(reader, length, buffered)));
       if (kind === 2 && phase) {
         phase.cursorMsgs++;
