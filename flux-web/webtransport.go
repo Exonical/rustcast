@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -37,6 +38,7 @@ type Session struct {
 	transport *webtransport.Session
 	control   *webtransport.Stream
 	quicConn  *quic.Conn
+	id        string
 
 	machine           *machineUpstream
 	metrics           *machineMetrics
@@ -62,7 +64,7 @@ type controlMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
-func newWebTransportServer(registry *machineRegistry, certificates *relayCertificateManager) *webtransport.Server {
+func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager) *webtransport.Server {
 	mux := http.NewServeMux()
 	server := &webtransport.Server{
 		H3: &http3.Server{
@@ -81,12 +83,12 @@ func newWebTransportServer(registry *machineRegistry, certificates *relayCertifi
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
 	mux.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
-		handleWebTransport(w, r, server, registry)
+		handleWebTransport(w, r, server, registry, sessions)
 	})
 	return server
 }
 
-func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry) {
+func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry) {
 	machineID := r.URL.Query().Get("machine")
 	if machineID == "" {
 		machineID = "default"
@@ -115,6 +117,12 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	if conn, ok := r.Context().Value(quicConnContextKey{}).(*quic.Conn); ok {
 		session.quicConn = conn
 	}
+	id, err := sessions.newID()
+	if err != nil {
+		session.fail("failed to create session")
+		return
+	}
+	session.id = id
 	width, height, err := requestedResolution(r)
 	if err != nil {
 		registry.metrics.reject(registry.metricMachineID(machineID), "bad_request")
@@ -140,7 +148,10 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	session.metrics = upstream.metrics
 	session.acceptedAt = time.Now()
 	upstream.metrics.sessionsStarted.Inc()
-	session.release = func() { registry.release(upstream) }
+	session.release = func() {
+		sessions.remove(id)
+		registry.release(upstream)
+	}
 	go func() {
 		<-transport.Context().Done()
 		session.releaseNow()
@@ -168,6 +179,49 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 			return
 		}
 	}
+	clientIP := r.RemoteAddr
+	if host, _, splitErr := net.SplitHostPort(r.RemoteAddr); splitErr == nil {
+		clientIP = host
+	}
+	userAgent := r.UserAgent()
+	if userAgent == "" {
+		userAgent = r.URL.Query().Get("user_agent")
+	}
+	sessions.add(sessionInfo{
+		ID:          id,
+		MachineID:   machineID,
+		MachineName: registry.displayName(machineID),
+		ClientIP:    clientIP,
+		UserAgent:   userAgent,
+		StartedAt:   time.Now(),
+		Width:       width,
+		Height:      height,
+	}, func(reason string) {
+		if err := session.writeControl(controlMessage{
+			Type: "session-ended",
+			Data: mustJSON(map[string]string{"reason": reason}),
+		}); err != nil {
+			log.Printf("[webtransport] session %s end message failed: %v", id, err)
+		}
+		log.Printf("[webtransport] session ended id=%s machine=%s reason=%q", id, machineID, reason)
+		_ = session.control.Close()
+		select {
+		case <-transport.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+		_ = transport.CloseWithError(0, reason)
+		session.releaseNow()
+	})
+	select {
+	case <-session.sessionDone:
+		sessions.remove(id)
+	default:
+	}
+	if err := session.writeControl(controlMessage{Type: "session", Data: mustJSON(map[string]string{"id": id})}); err != nil {
+		session.fail("failed to initialize session")
+		return
+	}
+	log.Printf("[webtransport] session started id=%s machine=%s client=%s mode=%dx%d", id, machineID, clientIP, width, height)
 	go forwardCursorUpdates(session)
 	go session.runBandwidthEstimator()
 	session.readControlMessages()
@@ -227,10 +281,16 @@ func (s *Session) releaseNow() {
 }
 
 func (s *Session) fail(message string) {
+	log.Printf("[webtransport] session failed id=%s reason=%q", s.id, message)
 	_ = s.writeControl(controlMessage{
 		Type: "error",
 		Data: mustJSON(map[string]string{"error": message}),
 	})
+	_ = s.control.Close()
+	select {
+	case <-s.transport.Context().Done():
+	case <-time.After(2 * time.Second):
+	}
 	_ = s.transport.CloseWithError(sessionErrorCode, message)
 	s.releaseNow()
 }
@@ -326,6 +386,7 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 		if err := json.Unmarshal(message.Data, &quality); err != nil || quality.Level > 10 || quality.FPS > 144 {
 			return errors.New("quality must be 0-10 and FPS must be 0-144")
 		}
+		log.Printf("[control] quality/fps machine=%s level=%d fps=%d", machine.id, quality.Level, quality.FPS)
 		if !machine.send([]byte{0x05, quality.Level, quality.FPS}) {
 			log.Printf("[control] upstream command channel full, dropped quality/FPS control")
 		}

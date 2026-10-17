@@ -4,7 +4,7 @@ ARG NODE_IMAGE=docker.io/library/node:lts
 ARG ROCKY_IMAGE=docker.io/rockylinux/rockylinux:10-minimal
 
 FROM ${NODE_IMAGE} AS ui
-RUN corepack enable
+RUN corepack enable && corepack prepare pnpm@9.15.1 --activate
 WORKDIR /ui
 COPY flux-web/ui/package.json flux-web/ui/pnpm-lock.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile --config.strict-dep-builds=false

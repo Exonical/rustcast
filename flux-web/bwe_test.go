@@ -86,3 +86,56 @@ func TestDeliveryEstimatorIgnoresUnknownAndExpiredAcknowledgements(t *testing.T)
 		t.Fatalf("invalid acknowledgements changed queue estimate: queue=%v have=%t", queue, estimator.haveQueue)
 	}
 }
+
+func TestDeliveryEstimatorIncludesSlowFrameWrites(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	estimator := newDeliveryEstimator(10_000, base)
+	estimator.onFrameSent(1, 1000, base)
+	estimator.onFrameSent(2, 1000, base)
+	estimator.onFrameAck(1, 20, base.Add(20*time.Millisecond))
+	estimator.onFrameAck(2, 220, base.Add(220*time.Millisecond))
+	_, queue, _, _ := estimator.diagnostics()
+	if queue != 50*time.Millisecond {
+		t.Fatalf("queue delay = %v, want 50ms from a 220ms delay and 20ms baseline", queue)
+	}
+}
+
+func TestDeliveryEstimatorForgetsFailedFrames(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	estimator := newDeliveryEstimator(10_000, base)
+	estimator.onFrameSent(1, 1000, base)
+	estimator.forget(1)
+	estimator.onFrameAck(1, 100, base.Add(100*time.Millisecond))
+	_, queue, _, _ := estimator.diagnostics()
+	if queue != 0 || estimator.haveQueue {
+		t.Fatalf("forgotten frame affected queue estimate: queue=%v have=%t", queue, estimator.haveQueue)
+	}
+}
+
+func TestDeliveryEstimatorIdleQueueSignalExpires(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	estimator := newDeliveryEstimator(10_000, base)
+	estimator.onFrameSent(1, 1000, base)
+	estimator.onFrameSent(2, 1000, base)
+	estimator.onFrameAck(1, 20, base.Add(20*time.Millisecond))
+	estimator.onFrameAck(2, 220, base.Add(220*time.Millisecond))
+	decreases := 0
+	increases := 0
+	previous := estimator.targetKbps
+	for elapsed := 500 * time.Millisecond; elapsed <= 10*time.Second; elapsed += 500 * time.Millisecond {
+		target, changed := estimator.update(base.Add(elapsed))
+		if changed && target < previous {
+			decreases++
+		}
+		if changed && target > previous {
+			increases++
+		}
+		previous = target
+	}
+	if decreases > 2 {
+		t.Fatalf("idle queue caused %d bitrate decreases, want at most 2 within the first second", decreases)
+	}
+	if increases == 0 {
+		t.Fatal("bitrate did not increase after the queue sample expired")
+	}
+}

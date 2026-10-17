@@ -46,6 +46,7 @@ type deliveryEstimator struct {
 	delaySamples []delaySample
 	queueEWMA    time.Duration
 	haveQueue    bool
+	lastSampleAt time.Time
 
 	smoothedRTT    time.Duration
 	minRTT         time.Duration
@@ -119,6 +120,7 @@ func (e *deliveryEstimator) onFrameAck(seq uint32, clientDoneMs float64, at time
 		at:      at,
 		delayMs: delayMs,
 	})
+	e.lastSampleAt = at
 	first := 0
 	baseline := math.Inf(1)
 	for _, sample := range e.delaySamples {
@@ -141,6 +143,19 @@ func (e *deliveryEstimator) onFrameAck(seq uint32, clientDoneMs float64, at time
 	} else {
 		e.queueEWMA = time.Duration((1-bweQueueAlpha)*float64(e.queueEWMA) + bweQueueAlpha*float64(queueDelay))
 	}
+}
+
+func (e *deliveryEstimator) forget(seq uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.outstanding, seq)
+	kept := e.sendOrder[:0]
+	for _, item := range e.sendOrder {
+		if item.seq != seq {
+			kept = append(kept, item)
+		}
+	}
+	e.sendOrder = kept
 }
 
 func (e *deliveryEstimator) onTransportStats(smoothedRTT, minRTT time.Duration, packetsSent, packetsLost uint64) {
@@ -187,6 +202,10 @@ func (e *deliveryEstimator) update(now time.Time) (uint32, bool) {
 		e.lossRatioValue = 0
 	}
 	e.windowSent, e.windowLost = 0, 0
+	if e.haveQueue && now.Sub(e.lastSampleAt) > time.Second {
+		e.haveQueue = false
+		e.queueEWMA = 0
+	}
 	rttInflation := e.smoothedRTT - e.minRTT
 	congested := e.haveQueue && e.queueEWMA > bweQueueThreshold ||
 		rttInflation > bweRTTThreshold ||

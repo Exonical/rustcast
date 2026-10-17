@@ -28,6 +28,7 @@ type machineInfo struct {
 	TargetFPS      uint32    `json:"target_fps,omitempty"`
 	DefaultFPS     uint32    `json:"default_fps,omitempty"`
 	TargetBitrate  uint32    `json:"target_bitrate_kbps,omitempty"`
+	Viewers        int       `json:"viewers"`
 	LastSeen       time.Time `json:"last_seen"`
 	Status         string    `json:"status"`
 	UpstreamStatus string    `json:"upstream_status"`
@@ -156,13 +157,30 @@ func (r *machineRegistry) list() []machineInfo {
 				m.upstream = nil
 			}
 		}
-		result = append(result, m.machineInfo)
+		info := m.machineInfo
+		if m.upstream != nil {
+			info.Viewers = m.upstream.viewers
+		}
+		result = append(result, info)
 	}
 	r.mu.Unlock()
 	for _, upstream := range stale {
 		upstream.stop()
 	}
 	return result
+}
+
+func (r *machineRegistry) displayName(id string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.machines[id]
+	if m == nil {
+		return ""
+	}
+	if m.DisplayName != "" {
+		return m.DisplayName
+	}
+	return m.Name
 }
 
 func (r *machineRegistry) deregister(id string) bool {
