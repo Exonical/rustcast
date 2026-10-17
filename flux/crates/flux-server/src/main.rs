@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 #[cfg(feature = "tray")]
@@ -1043,6 +1044,42 @@ fn should_encode_frame(
     }
 }
 
+const ENCODER_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const ENCODER_RETRY_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct EncoderRetry {
+    retry_at: Option<Instant>,
+    next_delay: Duration,
+}
+
+impl Default for EncoderRetry {
+    fn default() -> Self {
+        Self {
+            retry_at: None,
+            next_delay: ENCODER_RETRY_INITIAL,
+        }
+    }
+}
+
+impl EncoderRetry {
+    fn on_failure(&mut self, now: Instant) -> Duration {
+        let delay = self.next_delay;
+        self.retry_at = Some(now + delay);
+        self.next_delay = delay.saturating_mul(2).min(ENCODER_RETRY_MAX);
+        delay
+    }
+
+    fn on_success(&mut self) {
+        self.retry_at = None;
+        self.next_delay = ENCODER_RETRY_INITIAL;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.retry_at.map_or(true, |retry_at| now >= retry_at)
+    }
+}
+
 /// Per-frame capture and encode durations accumulated over a reporting window.
 /// A single instantaneous sample hides exactly the frames that matter, since the
 /// stalls being chased are occasional: only the maxima show them, and keyframes
@@ -1811,6 +1848,7 @@ fn capture_loop(
     // monitors). Build the encoder from the frame the capture path actually
     // delivers, and rebuild it if the resolution changes mid-stream.
     let mut encode_session: Option<Box<dyn flux_encode::traits::EncodeSession>> = None;
+    let mut encoder_retry = EncoderRetry::default();
     let mut quality_level = default_quality_level.clamp(1, 10);
     let configured_fps = target_fps;
     let default_fps_cap = effective_default_fps_cap(configured_fps, default_fps_cap);
@@ -2081,7 +2119,9 @@ fn capture_loop(
         // (Re)build the encoder once the negotiated capture resolution is
         // known or whenever it changes (e.g. display rotation / mode switch),
         // so the encoder dimensions always match the frames it receives.
-        if capture_resolution != frame.resolution {
+        let rebuild_now = std::time::Instant::now();
+        if capture_resolution != frame.resolution || (encode_session.is_none() && encoder_retry.due(rebuild_now)) {
+            encode_session = None;
             let (sess, backend) = build_encode_session_for(
                 fps_cap,
                 frame.resolution,
@@ -2095,10 +2135,12 @@ fn capture_loop(
                 Some((s, res)) => {
                     encode_session = Some(s);
                     encode_resolution = res;
+                    encoder_retry.on_success();
                 }
                 None => {
-                    encode_session = None;
                     encode_resolution = frame.resolution;
+                    let retry_delay = encoder_retry.on_failure(std::time::Instant::now());
+                    tracing::warn!("Encoder rebuild failed; retrying in {}s", retry_delay.as_secs());
                 }
             }
             if let Ok(mut status) = runtime_status.write() {
@@ -2377,6 +2419,48 @@ mod stage_timing_tests {
     #[test]
     fn idle_window_has_no_summary() {
         assert!(StageTimings::default().summary().is_none());
+    }
+}
+
+#[cfg(test)]
+mod encoder_retry_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_to_thirty_seconds_and_stays_capped() {
+        let mut now = Instant::now();
+        let mut retry = EncoderRetry::default();
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            assert!(retry.due(now));
+            let delay = retry.on_failure(now);
+            assert_eq!(delay, Duration::from_secs(seconds));
+            now = now + delay;
+        }
+    }
+
+    #[test]
+    fn retry_is_not_due_before_its_deadline_and_is_due_at_it() {
+        let now = Instant::now();
+        let mut retry = EncoderRetry::default();
+        let delay = retry.on_failure(now);
+
+        assert!(!retry.due(now + delay - Duration::from_nanos(1)));
+        assert!(retry.due(now + delay));
+    }
+
+    #[test]
+    fn success_resets_backoff_to_one_second() {
+        let now = Instant::now();
+        let mut retry = EncoderRetry::default();
+        retry.on_failure(now);
+        retry.on_failure(now + Duration::from_secs(1));
+        retry.on_success();
+
+        assert!(retry.due(now + Duration::from_secs(1)));
+        assert_eq!(
+            retry.on_failure(now + Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
     }
 }
 
