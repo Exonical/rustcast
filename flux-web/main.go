@@ -71,6 +71,7 @@ func main() {
 
 	webAddr := ":8080"
 	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"))
+	httpHandler := http.Handler(r)
 	httpsAddr := strings.TrimSpace(os.Getenv("FLUX_HTTPS_ADDR"))
 	if httpsAddr == "" {
 		httpsAddr = ":8443"
@@ -87,9 +88,10 @@ func main() {
 				log.Printf("HTTPS server error: %v", err)
 			}
 		}()
+		httpHandler = withHTTPSRedirect(r, httpsAddr)
 	}
 	log.Printf("flux-web listening on http://localhost%s", webAddr)
-	if err := r.Run(webAddr); err != nil {
+	if err := http.ListenAndServe(webAddr, httpHandler); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
@@ -119,6 +121,28 @@ func newWebHandler(
 func withAltSvc(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Alt-Svc", `h3=":8443"`)
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func withHTTPSRedirect(handler http.Handler, httpsAddr string) http.Handler {
+	_, httpsPort, err := net.SplitHostPort(httpsAddr)
+	if err != nil || httpsPort == "" {
+		return handler
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isAPIPath := r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && !isAPIPath {
+			host := r.Host
+			if requestHost, _, err := net.SplitHostPort(host); err == nil {
+				host = requestHost
+			} else {
+				host = strings.Trim(host, "[]")
+			}
+			location := "https://" + net.JoinHostPort(host, httpsPort) + r.URL.RequestURI()
+			http.Redirect(w, r, location, http.StatusPermanentRedirect)
+			return
+		}
 		handler.ServeHTTP(w, r)
 	})
 }

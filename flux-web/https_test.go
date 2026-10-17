@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -8,6 +9,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestWebHTTPSApiUsesTrustedRelayCertificate(t *testing.T) {
@@ -56,5 +59,49 @@ func TestWebHTTPSApiUsesTrustedRelayCertificate(t *testing.T) {
 	}
 	if body.Host != "localhost" || body.Port != webTransportPort {
 		t.Fatalf("API response = %+v, want host localhost and port %d", body, webTransportPort)
+	}
+}
+
+func TestHTTPPageRequestsRedirectToHTTPS(t *testing.T) {
+	handler := withHTTPSRedirect(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("page handler ran instead of redirecting")
+	}), "localhost:9443")
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "http://relay.example:8080/connect?width=1280&height=720", nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusPermanentRedirect {
+				t.Fatalf("HTTP status = %d, want %d", response.Code, http.StatusPermanentRedirect)
+			}
+			if got, want := response.Header().Get("Location"), "https://relay.example:9443/connect?width=1280&height=720"; got != want {
+				t.Fatalf("Location = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestHTTPMachineAPIRequestsAreNotRedirected(t *testing.T) {
+	router := gin.New()
+	registry := newMachineRegistry()
+	registerMachineRoutes(router, registry)
+	handler := withHTTPSRedirect(router, ":8443")
+	body, err := json.Marshal(testRegistration("machine-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/machines/register", "/api/machines/machine-1/heartbeat"} {
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080"+path, bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("POST %s status = %d, want %d", path, response.Code, http.StatusOK)
+		}
+		if got := response.Header().Get("Location"); got != "" {
+			t.Fatalf("POST %s Location = %q, want no redirect", path, got)
+		}
 	}
 }
