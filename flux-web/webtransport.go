@@ -241,10 +241,17 @@ func requestedResolution(r *http.Request) (uint32, uint32, error) {
 	if err != nil {
 		return 0, 0, errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
 	}
-	if width < 640 || width > 2560 || height < 480 || height > 1440 || width%2 != 0 || height%2 != 0 {
-		return 0, 0, errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+	if err := validateResolution(uint32(width), uint32(height)); err != nil {
+		return 0, 0, err
 	}
 	return uint32(width), uint32(height), nil
+}
+
+func validateResolution(width, height uint32) error {
+	if width < 640 || width > 2560 || height < 480 || height > 1440 || width%2 != 0 || height%2 != 0 {
+		return errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+	}
+	return nil
 }
 
 func (s *Session) setMachine(machine *machineUpstream) {
@@ -390,6 +397,46 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 		if !machine.send([]byte{0x05, quality.Level, quality.FPS}) {
 			log.Printf("[control] upstream command channel full, dropped quality/FPS control")
 		}
+	case "resolution":
+		var resolution struct {
+			Width  uint32 `json:"width"`
+			Height uint32 `json:"height"`
+		}
+		if err := json.Unmarshal(message.Data, &resolution); err != nil {
+			return s.writeControl(controlMessage{
+				Type: "error",
+				Data: mustJSON(map[string]string{"error": "invalid resolution; use even dimensions from 640x480 through 2560x1440"}),
+			})
+		}
+		if err := validateResolution(resolution.Width, resolution.Height); err != nil {
+			return s.writeControl(controlMessage{
+				Type: "error",
+				Data: mustJSON(map[string]string{"error": err.Error()}),
+			})
+		}
+		if machine == nil {
+			return s.writeControl(controlMessage{
+				Type: "error",
+				Data: mustJSON(map[string]string{"error": "no active machine session"}),
+			})
+		}
+		command := []byte{
+			0x06,
+			byte(resolution.Width >> 8), byte(resolution.Width),
+			byte(resolution.Height >> 8), byte(resolution.Height),
+		}
+		if !machine.send(command) {
+			return s.writeControl(controlMessage{
+				Type: "error",
+				Data: mustJSON(map[string]string{"error": "resolution change could not be queued"}),
+			})
+		}
+		status, _ := json.Marshal(map[string]any{
+			"state":  "transitioning",
+			"width":  resolution.Width,
+			"height": resolution.Height,
+		})
+		machine.sendResolutionStatus(status)
 	case "latency-ping":
 		if err := s.writeControl(controlMessage{Type: "latency-pong", Data: message.Data}); err != nil {
 			return err

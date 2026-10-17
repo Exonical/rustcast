@@ -1,6 +1,7 @@
 import { h264CodecFromSps, isH264Keyframe } from "./h264";
 import { browserFamily } from "./browser-family";
 import { FrameSequencer, type EncodedFrame, type SequenceResult } from "./frame-sequencer";
+import { ResolutionPaintTracker } from "./resolution-paint";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "failed";
@@ -34,9 +35,11 @@ export interface CursorMetadata {
 }
 
 export interface ResolutionStatus {
-  state: "transitioning" | "succeeded" | "failed";
+  state: "transitioning" | "recovering" | "succeeded" | "failed";
   width?: number;
   height?: number;
+  encode_width?: number;
+  encode_height?: number;
   error?: string;
 }
 
@@ -76,6 +79,8 @@ interface DiscoveryResponse {
 interface FrameMetadata {
   receivedAt: number;
   decodeStarted: number;
+  keyframe: boolean;
+  arrivalOrdinal: number;
   decodeMs?: number;
 }
 
@@ -90,6 +95,7 @@ export class WebTransportClient {
   private paintScheduled = false;
   private readonly frameMetadata = new Map<number, FrameMetadata>();
   private sequencer = new FrameSequencer();
+  private readonly resolutionPaintTracker = new ResolutionPaintTracker();
   private decodeChain: Promise<void> = Promise.resolve();
   private generation = 0;
   private intentionalClose = false;
@@ -129,6 +135,7 @@ export class WebTransportClient {
   onStats: ((stats: StreamStats) => void) | null = null;
   onCursor: ((cursor: CursorMetadata) => void) | null = null;
   onResolutionStatus: ((status: ResolutionStatus) => void) | null = null;
+  onKeyframePainted: (() => void) | null = null;
   onSessionId: ((id: string) => void) | null = null;
   onError: ((message: string) => void) | null = null;
   onSessionEnded: ((reason: string) => void) | null = null;
@@ -154,6 +161,7 @@ export class WebTransportClient {
     this.decodeChain = Promise.resolve();
     this.setState("connecting");
     this.sequencer = new FrameSequencer();
+    this.resolutionPaintTracker.reset();
     this.firstDecodedFrame = false;
     this.waitingForKeyframe = true;
     this.resetStats();
@@ -209,6 +217,10 @@ export class WebTransportClient {
     this.sendControl("quality", { level: Math.round(level), fps: Math.round(fps) });
   }
 
+  requestResolution(width: number, height: number): void {
+    this.sendControl("resolution", { width, height });
+  }
+
   requestKeyframe(): void {
     this.requestKeyframeIfAllowed();
   }
@@ -262,7 +274,7 @@ export class WebTransportClient {
       this.setState("disconnected");
       this.onSessionEnded?.(reason);
     } else if (message.type === "cursor") this.onCursor?.(message.data as CursorMetadata);
-    else if (message.type === "resolution-status") this.onResolutionStatus?.(message.data as ResolutionStatus);
+    else if (message.type === "resolution-status") this.handleResolutionStatus(message.data as ResolutionStatus);
     else if (message.type === "latency-pong") {
       const sentAt = (message.data as { t?: unknown } | undefined)?.t;
       if (typeof sentAt === "number") this.controlRttMs = performance.now() - sentAt;
@@ -299,12 +311,14 @@ export class WebTransportClient {
         this.bytesReceived += payload.byteLength;
         this.bytesWindow += payload.byteLength;
         const receiveTime = performance.now();
+        const arrivalOrdinal = this.resolutionPaintTracker.onFrameReceived();
         const frame: EncodedFrame = {
           seq,
           keyframe: parsed.keyframe || isH264Keyframe(payload),
           data: payload,
           receivedAt: receiveTime,
           captureTimestampUs: parsed.captureTimestampUs,
+          arrivalOrdinal,
         };
         this.sendControl("frame-ack", { seq, doneMs: receiveTime });
         this.acceptSequence(this.sequencer.push(frame, receiveTime));
@@ -316,7 +330,7 @@ export class WebTransportClient {
         const data: unknown = JSON.parse(new TextDecoder().decode(payload));
         if (generation !== this.generation) return;
         if (kind === 0x02) this.onCursor?.(data as CursorMetadata);
-        else this.onResolutionStatus?.(data as ResolutionStatus);
+        else this.handleResolutionStatus(data as ResolutionStatus);
       }
     } catch (error) {
       if (seq !== null && generation === this.generation) {
@@ -385,7 +399,12 @@ export class WebTransportClient {
     }
     const timestamp = frame.seq;
     const started = performance.now();
-    this.frameMetadata.set(timestamp, { receivedAt: frame.receivedAt, decodeStarted: started });
+    this.frameMetadata.set(timestamp, {
+      receivedAt: frame.receivedAt,
+      decodeStarted: started,
+      keyframe: frame.keyframe,
+      arrivalOrdinal: frame.arrivalOrdinal ?? 0,
+    });
     try {
       this.decoder.decode(new EncodedVideoChunk({
         type: frame.keyframe ? "key" : "delta",
@@ -457,6 +476,9 @@ export class WebTransportClient {
         canvas.height = frame.displayHeight;
       }
       context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      if (metadata && this.resolutionPaintTracker.onKeyframePainted(metadata.arrivalOrdinal, metadata.keyframe)) {
+        this.onKeyframePainted?.();
+      }
       if (metadata) {
         const now = performance.now();
         this.receiveToPaintTotal += now - metadata.receivedAt;
@@ -480,6 +502,11 @@ export class WebTransportClient {
     this.waitingForKeyframe = true;
     this.framesDropped++;
     this.requestKeyframeIfAllowed();
+  }
+
+  private handleResolutionStatus(status: ResolutionStatus): void {
+    this.resolutionPaintTracker.onResolutionStatus(status.state);
+    this.onResolutionStatus?.(status);
   }
 
   private startIntervals(transport: WebTransport, generation: number): void {
