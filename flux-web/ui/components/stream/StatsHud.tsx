@@ -41,6 +41,9 @@ export function StatsHud({ stats, enabled }: { stats: StreamStats | null; enable
           <Stat label="Receive → paint" value={stats?.receiveToPaintMs != null ? `${stats.receiveToPaintMs.toFixed(1)} ms` : "—"} />
           <Stat label="Decode" value={stats?.decodeMs != null ? `${stats.decodeMs.toFixed(1)} ms` : "—"} />
           <Stat label="Frames dropped" value={stats ? `${stats.framesDropped}` : "—"} hot={!!stats?.framesDropped} />
+          {stats?.audioBufferedMs !== undefined && (
+            <Stat label="Audio" value={`${Math.round(stats.audioBufferedMs)} ms buf · ${stats.audioUnderruns ?? 0} underruns`} />
+          )}
         </div>
       )}
     </section>

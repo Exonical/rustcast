@@ -33,6 +33,7 @@ next-env.d.ts
 *.dylib
 *.o
 *.d
+!containers/host/rootfs/**/*.d
 
 # ── Test / capture artifacts ──
 *.h264

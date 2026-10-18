@@ -19,6 +19,7 @@ tray = ["dep:tray-icon", "dep:muda"]
 # live portal + VA-API capabilities (otherwise it runs on the base probe).
 capture-pipewire = ["flux-capture/capture-pipewire"]
 capture-mutter = ["flux-capture/capture-mutter"]
+audio-pipewire = ["flux-audio/audio-pipewire"]
 encoder-vaapi = ["flux-encode/encoder-vaapi"]
 encoder-ffmpeg = ["flux-encode/encoder-ffmpeg"]
 encoder-vulkan = ["flux-encode/encoder-vulkan"]

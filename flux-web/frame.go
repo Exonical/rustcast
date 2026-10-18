@@ -25,6 +25,12 @@ type cursorMsg struct {
 	data     []byte
 }
 
+// audioMsg carries one Opus packet: data = [seq u32 BE][opus bytes].
+type audioMsg struct {
+	tsMicros uint64
+	data     []byte
+}
+
 func describeNALUs(data []byte) string {
 	var types []string
 	i := 0

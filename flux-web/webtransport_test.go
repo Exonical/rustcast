@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
@@ -305,6 +306,145 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	waitForTestCondition(t, time.Second, func() bool {
 		return len(sessions.list()) == 0 && registry.list()[0].Viewers == 0
 	})
+}
+
+func TestAudioControlMessageTogglesFlag(t *testing.T) {
+	s := &Session{}
+	s.audioEnabled.Store(true)
+	if err := s.handleControlMessage(controlMessage{
+		Type: "audio",
+		Data: json.RawMessage(`{"enabled":false}`),
+	}); err != nil {
+		t.Fatalf("handleControlMessage(audio) = %v", err)
+	}
+	if s.audioEnabled.Load() {
+		t.Fatal("audioEnabled still true after disable")
+	}
+	if err := s.handleControlMessage(controlMessage{
+		Type: "audio",
+		Data: json.RawMessage(`{"enabled":true}`),
+	}); err != nil || !s.audioEnabled.Load() {
+		t.Fatalf("audio re-enable failed: err=%v enabled=%v", err, s.audioEnabled.Load())
+	}
+	if err := s.handleControlMessage(controlMessage{
+		Type: "audio",
+		Data: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("audio control with missing field = %v", err)
+	}
+}
+
+func TestLoopbackWebTransportAudioStream(t *testing.T) {
+	registry := newMachineRegistry()
+	sessions := newSessionRegistry()
+	registry.seedStatic("default", "test", "127.0.0.1:0")
+	upstream := newMachineUpstream("", "default", func(string) {})
+	registry.mu.Lock()
+	registry.machines["default"].upstream = upstream
+	registry.mu.Unlock()
+	go upstream.framePusher()
+	defer upstream.stop()
+
+	certificates, err := newRelayCertificateManager("", "", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newWebTransportServer(registry, sessions, certificates)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(packetConn)
+	}()
+	defer func() {
+		_ = server.Close()
+		_ = packetConn.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Error("WebTransport server did not stop")
+		}
+	}()
+	time.Sleep(25 * time.Millisecond)
+
+	transport := &webtransport.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
+		QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+	}
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	target := (&url.URL{Scheme: "https", Host: packetConn.LocalAddr().String(), Path: "/wt", RawQuery: "machine=default"}).String()
+	_, clientSession, err := transport.Dial(ctx, target, nil)
+	if err != nil {
+		t.Fatalf("dial WebTransport session: %v", err)
+	}
+	defer clientSession.CloseWithError(0, "test complete")
+	control, err := clientSession.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open client control stream: %v", err)
+	}
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "latency-ping",
+		Data: json.RawMessage(`{"t":0}`),
+	})
+	connected := readTestControlMessage(t, control)
+	if connected.Type != "session" {
+		t.Fatalf("first control message type = %q, want session", connected.Type)
+	}
+	if pong := readTestControlMessage(t, control); pong.Type != "latency-pong" {
+		t.Fatalf("second control message type = %q, want latency-pong", pong.Type)
+	}
+	waitForTestCondition(t, 3*time.Second, func() bool {
+		return upstream.currentSession() != nil
+	})
+
+	opus := []byte{0xde, 0xad, 0xbe, 0xef}
+	upstreamPayload := append([]byte{0x00, 0x00, 0x00, 0x2a}, opus...)
+	upstream.sendAudio(audioMsg{tsMicros: 987654, data: upstreamPayload})
+	audio, err := clientSession.AcceptUniStream(ctx)
+	if err != nil {
+		t.Fatalf("accept audio stream: %v", err)
+	}
+	var header [17]byte
+	if _, err := io.ReadFull(audio, header[:]); err != nil {
+		t.Fatalf("read audio header: %v", err)
+	}
+	if header[0] != 0x04 || binary.BigEndian.Uint64(header[1:9]) != 987654 ||
+		binary.BigEndian.Uint32(header[9:13]) != 42 ||
+		binary.BigEndian.Uint32(header[13:17]) != uint32(len(opus)) {
+		t.Fatalf("unexpected audio stream header: %x", header)
+	}
+	received := make([]byte, len(opus))
+	if _, err := io.ReadFull(audio, received); err != nil {
+		t.Fatalf("read audio payload: %v", err)
+	}
+	if !bytes.Equal(received, opus) {
+		t.Fatalf("audio payload = %x, want %x", received, opus)
+	}
+
+	// Disabling audio stops forwarding.
+	writeTestControlMessage(t, control, controlMessage{
+		Type: "audio",
+		Data: json.RawMessage(`{"enabled":false}`),
+	})
+	waitForTestCondition(t, 3*time.Second, func() bool {
+		return !upstream.currentSession().audioEnabled.Load()
+	})
+	upstream.sendAudio(audioMsg{tsMicros: 1, data: upstreamPayload})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = clientSession.AcceptUniStream(ctx)
+	}()
+	select {
+	case <-done:
+		t.Fatal("audio stream forwarded while disabled")
+	case <-time.After(300 * time.Millisecond):
+	}
 }
 
 func TestLoopbackWebTransportClientCloseRemovesSession(t *testing.T) {

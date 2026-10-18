@@ -154,6 +154,47 @@ func TestReadFramesPoolsVideoButRetainsCursor(t *testing.T) {
 	}
 }
 
+func TestReadFramesDispatchesAudio(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	payload := []byte{0, 0, 0, 7, 0xaa, 0xbb, 0xcc}
+	go func() {
+		defer writer.Close()
+		var header [13]byte
+		header[0] = 0x04
+		binary.BigEndian.PutUint64(header[1:9], 4242)
+		binary.BigEndian.PutUint32(header[9:13], uint32(len(payload)))
+		_, _ = writer.Write(append(header[:], payload...))
+	}()
+	if err := u.readFrames(reader); !errors.Is(err, io.EOF) {
+		t.Fatalf("readFrames = %v, want EOF", err)
+	}
+	select {
+	case msg := <-u.audioChan:
+		if msg.tsMicros != 4242 || !bytes.Equal(msg.data, payload) {
+			t.Fatalf("audio message = %+v, want ts=4242 data=%x", msg, payload)
+		}
+	default:
+		t.Fatal("audio message not dispatched to audioChan")
+	}
+	if u.frameBuffers.count != 0 {
+		t.Fatal("audio payload entered the video buffer pool")
+	}
+}
+
+func TestSendAudioDropsOldest(t *testing.T) {
+	u := newMachineUpstream("", "", func(string) {})
+	u.audioChan = make(chan audioMsg, 2)
+	u.sendAudio(audioMsg{tsMicros: 1})
+	u.sendAudio(audioMsg{tsMicros: 2})
+	u.sendAudio(audioMsg{tsMicros: 3})
+	first := <-u.audioChan
+	if first.tsMicros != 2 {
+		t.Fatalf("first queued audio ts = %d, want 2 (oldest dropped)", first.tsMicros)
+	}
+}
+
 func TestQueueFrameReleasesEvictedAndStoppedFrames(t *testing.T) {
 	u := newMachineUpstream("", "", func(string) {})
 	u.frameChan = make(chan frameMsg, 1)

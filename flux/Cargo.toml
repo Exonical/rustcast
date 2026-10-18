@@ -116,3 +116,6 @@ uuid = { version = "1.26", features = ["v4", "serde"] }
 bitflags = { version = "2.13", features = ["serde"] }
 parking_lot = "0.12.5"
 crossbeam-channel = "0.5.17"
+opus = "0.3"
+pipewire = "0.10"
+libspa = "0.10"

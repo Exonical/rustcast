@@ -8,7 +8,8 @@
 //! Stream formats:
 //!   frame (server→client uni): [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload]
 //!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata,
-//!     type 0x03 = resolution transition status JSON
+//!     type 0x03 = resolution transition status JSON,
+//!     type 0x04 = Opus audio packet ([seq u32 BE][opus payload])
 //!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
 //!                                | [0x03][4-byte BE target bitrate kbps]
 //!                                | [0x04][4-byte BE viewer count]
@@ -176,6 +177,7 @@ pub fn make_endpoint(
 pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -196,10 +198,12 @@ pub async fn serve(
         tracing::info!("QUIC frame client connected: {}", connection.remote_address());
 
         let rx = h264_tx.subscribe();
+        let audio_rx = audio_tx.subscribe();
         let cursor_rx = cursor_rx.clone();
         tokio::spawn(handle_connection(
             connection,
             rx,
+            audio_rx,
             cursor_rx,
             idr_tx.clone(),
             bitrate_tx.clone(),
@@ -215,6 +219,7 @@ pub async fn serve(
 async fn handle_connection(
     connection: quinn::Connection,
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
+    mut audio_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -361,6 +366,16 @@ async fn handle_connection(
                     continue;
                 };
                 if !send_message(&connection, 0x02, cursor.0, payload).await {
+                    break;
+                }
+            }
+            result = audio_rx.recv() => {
+                let packet = match result {
+                    Ok(packet) => packet,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                if !send_message(&connection, 0x04, packet.0, packet.1.clone()).await {
                     break;
                 }
             }

@@ -259,6 +259,14 @@ pub struct AudioConfig {
 
     /// UDP port for audio RTP stream.
     pub rtp_port: u16,
+
+    /// Enable desktop audio capture and streaming to the relay.
+    #[serde(default = "default_audio_enabled")]
+    pub enabled: bool,
+}
+
+fn default_audio_enabled() -> bool {
+    true
 }
 
 impl Default for AudioConfig {
@@ -267,8 +275,9 @@ impl Default for AudioConfig {
             codec: AudioCodec::Opus,
             sample_rate: 48_000,
             channels: 2,
-            bitrate_kbps: 256,
+            bitrate_kbps: 128,
             rtp_port: 48000,
+            enabled: true,
         }
     }
 }

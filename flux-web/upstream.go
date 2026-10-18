@@ -28,6 +28,7 @@ type machineUpstream struct {
 	frameQueueMu  sync.Mutex
 	frameBuffers  frameBufferPool
 	cursorChan    chan cursorMsg
+	audioChan     chan audioMsg
 	commandChan   chan []byte
 	abr           *abrState
 	stopChan      chan struct{}
@@ -314,6 +315,7 @@ func newMachineUpstream(addr, id string, status func(string), metricChildren ...
 		id: id, addr: addr,
 		frameChan:   make(chan frameMsg, 120),
 		cursorChan:  make(chan cursorMsg, 1),
+		audioChan:   make(chan audioMsg, 50),
 		commandChan: make(chan []byte, 100),
 		stopChan:    make(chan struct{}),
 		status:      status,
@@ -469,6 +471,24 @@ func (u *machineUpstream) sendCursor(msg cursorMsg) {
 		}
 		select {
 		case u.cursorChan <- msg:
+		default:
+		}
+	}
+}
+
+// sendAudio queues an Opus packet for the session's forwardAudio loop,
+// dropping the oldest packet when the buffer is full (audio tolerates gaps
+// better than latency).
+func (u *machineUpstream) sendAudio(msg audioMsg) {
+	select {
+	case u.audioChan <- msg:
+	default:
+		select {
+		case <-u.audioChan:
+		default:
+		}
+		select {
+		case u.audioChan <- msg:
 		default:
 		}
 	}
@@ -639,6 +659,10 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
 		case 0x03:
 			u.sendResolutionStatus(data)
+		case 0x04:
+			u.metrics.upstreamAudioPackets.Inc()
+			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
+			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -742,6 +766,10 @@ func (u *machineUpstream) connectQUIC() error {
 			}
 		case 0x03:
 			u.sendResolutionStatus(data)
+		case 0x04:
+			u.metrics.upstreamAudioPackets.Inc()
+			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
+			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}

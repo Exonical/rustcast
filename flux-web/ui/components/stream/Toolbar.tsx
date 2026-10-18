@@ -11,7 +11,7 @@ import { Slider } from "@/components/ui/slider";
 import { targetBitrateKbps } from "@/lib/protocol";
 
 export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
-  qualityLevel, fpsCap, onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
+  qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio, onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
   onQualityChange, onFpsChange, onCommit, onResolution }: {
   machine: Machine;
   stats: StreamStats | null;
@@ -20,6 +20,9 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
   pointerLockEnabled: boolean;
   isPointerLocked: boolean;
   isFullscreen: boolean;
+  audioSupported: boolean;
+  audioMuted: boolean;
+  onToggleAudio: () => void;
   qualityLevel: number | null;
   fpsCap: number | null;
   onBack: () => void;
@@ -90,6 +93,12 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
           </PopoverContent>
         </Popover>
         <Button aria-label="Keyboard shortcuts" title="Keyboard shortcuts" onClick={onShortcuts} className="hidden h-9 w-9 rounded-xl p-0 sm:inline-flex">?</Button>
+        {audioSupported && (
+          <Button aria-label={audioMuted ? "Unmute" : "Mute"} aria-pressed={!audioMuted} title="Audio · Ctrl+Alt+Shift+M" onClick={onToggleAudio}
+            className="h-9 w-9 rounded-xl p-0">
+            <span className={audioMuted ? "line-through opacity-60" : undefined}>♪</span>
+          </Button>
+        )}
         <Button aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"} title="Fullscreen · Ctrl+Alt+Shift+F" onClick={onFullscreen} className="hidden h-9 w-9 rounded-xl p-0 sm:inline-flex">{isFullscreen ? "↙" : "↗"}</Button>
         <Button variant="danger" onClick={onBack} className="h-9 px-3 text-xs sm:px-4">Disconnect</Button>
       </div>

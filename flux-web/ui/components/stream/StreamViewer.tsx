@@ -6,6 +6,7 @@ import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overla
 import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget, isLocalKeyboardTarget } from "@/lib/local-controls";
 import { modifierFlags } from "@/lib/protocol";
+import { AudioPlayer } from "@/lib/audio-player";
 import type { Machine } from "@/lib/api";
 import { buildConnectUrl } from "@/lib/launch";
 import { Toolbar } from "@/components/stream/Toolbar";
@@ -108,6 +109,12 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const committedFps = useRef<number | null>(null);
   const initialControlsApplied = useRef(false);
   const connectOptions = useRef({ resolution, initialFps, initialQuality });
+  const audioSupported = useMemo(() => AudioPlayer.isSupported(), []);
+  const audioPlayerRef = useRef<AudioPlayer | null>(null);
+  const audioResumed = useRef(false);
+  const [audioMuted, setAudioMuted] = useState(() => {
+    try { return localStorage.getItem("flux.audio.muted") === "1"; } catch { return false; }
+  });
   const [cursor, setCursor] = useState<CursorMetadata>({
     position: null,
     hotspot: [0, 0],
@@ -187,13 +194,50 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     setResolutionStatus(null);
   }, []);
 
+  const toggleAudioMuted = useCallback(() => {
+    setAudioMuted((muted) => {
+      const next = !muted;
+      try { localStorage.setItem("flux.audio.muted", next ? "1" : "0"); } catch {}
+      const player = audioPlayerRef.current;
+      if (next) {
+        player?.setMuted(true);
+      } else {
+        player?.setMuted(false);
+        player?.reset();
+      }
+      clientRef.current?.setAudioEnabled(!next);
+      return next;
+    });
+  }, []);
+
+  const resumeAudioOnce = useCallback(() => {
+    if (audioResumed.current) return;
+    audioResumed.current = true;
+    void audioPlayerRef.current?.resume();
+  }, []);
+
   useEffect(() => {
     const { resolution: connectResolution, initialFps: connectInitialFps, initialQuality: connectInitialQuality } = connectOptions.current;
     const client = new WebTransportClient(machine.id, connectResolution);
     if (canvasRef.current) client.attachCanvas(canvasRef.current);
     clientRef.current = client;
+    let player: AudioPlayer | null = null;
+    if (audioSupported) {
+      player = new AudioPlayer();
+      audioPlayerRef.current = player;
+      void player.start().catch((error) => console.warn("audio playback unavailable", error));
+      try {
+        if (localStorage.getItem("flux.audio.muted") === "1") player.setMuted(true);
+      } catch {}
+      client.onAudio = (packet) => player?.push(packet);
+    }
     client.onStateChange = (state) => {
       setConnectionState(state);
+      if (state === "connected") {
+        try {
+          if (localStorage.getItem("flux.audio.muted") === "1") client.setAudioEnabled(false);
+        } catch {}
+      }
       if (state !== "connected") releaseAllInput();
       if (state === "connected" && !initialControlsApplied.current && (connectInitialFps !== undefined || connectInitialQuality !== undefined)) {
         initialControlsApplied.current = true;
@@ -204,7 +248,10 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         client.sendQuality(connectInitialQuality ?? 0, connectInitialFps ?? 0);
       }
     };
-    client.onStats = setStats;
+    client.onStats = (next) => {
+      const audio = audioPlayerRef.current?.stats();
+      setStats(audio ? { ...next, audioBufferedMs: audio.buffered_ms, audioUnderruns: audio.underruns } : next);
+    };
     client.onCursor = (next) => {
       setCursor((previous) => ({
         position: next.position,
@@ -243,10 +290,12 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       if (resolutionStatusTimer.current) clearTimeout(resolutionStatusTimer.current);
       resolutionStatusTimer.current = null;
       if (document.pointerLockElement === canvas) document.exitPointerLock();
+      player?.stop();
+      audioPlayerRef.current = null;
       client.disconnect();
       clientRef.current = null;
     };
-  }, [machine.id, releaseAllInput, clearResolutionStatus]);
+  }, [machine.id, releaseAllInput, clearResolutionStatus, audioSupported]);
 
   useEffect(() => {
     const client = clientRef.current;
@@ -408,6 +457,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocalControlTarget(e.target)) return;
     if (!clientRef.current) return;
+    resumeAudioOnce();
     containerRef.current?.focus({ preventScroll: true });
     e.preventDefault();
     const button = mapMouseButton(e.button);
@@ -420,7 +470,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       });
       heldButtons.current.add(button);
     }
-  }, [flushMove]);
+  }, [flushMove, resumeAudioOnce]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocalControlTarget(e.target)) return;
@@ -513,11 +563,13 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isLocalKeyboardTarget(e.target)) return;
+      resumeAudioOnce();
 
       if (isViewerChord(e)) {
         if (e.code === "KeyR") { e.preventDefault(); reconnect(); return; }
         if (e.code === "KeyS") { e.preventDefault(); setShowStats((visible) => !visible); return; }
         if (e.code === "KeyF") { e.preventDefault(); toggleFullscreen(); return; }
+        if (e.code === "KeyM") { e.preventDefault(); toggleAudioMuted(); return; }
       }
       if (e.code === "F11") { e.preventDefault(); toggleFullscreen(); return; }
 
@@ -580,7 +632,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       window.removeEventListener("blur", releaseAllInput);
       window.removeEventListener("pagehide", releaseAllInput);
     };
-  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen]);
+  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen, resumeAudioOnce, toggleAudioMuted]);
 
   const visibleControls = showControls || connectionState !== "connected" || !!endedReason;
 
@@ -610,6 +662,9 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         pointerLockEnabled={pointerLockEnabled}
         isPointerLocked={isPointerLocked}
         isFullscreen={isFullscreen}
+        audioSupported={audioSupported}
+        audioMuted={audioMuted}
+        onToggleAudio={toggleAudioMuted}
         qualityLevel={qualityLevel}
         fpsCap={fpsCap}
         onBack={onBack}
@@ -634,6 +689,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
             <ShortcutRow keys="Ctrl + Alt + Shift + R" label="Reconnect" />
             <ShortcutRow keys="Ctrl + Alt + Shift + S" label="Toggle stats" />
             <ShortcutRow keys="Ctrl + Alt + Shift + F" label="Toggle fullscreen" />
+            {audioSupported && <ShortcutRow keys="Ctrl + Alt + Shift + M" label="Mute audio" />}
             <ShortcutRow keys="Esc" label="Exit pointer lock" />
           </div>
         </div>

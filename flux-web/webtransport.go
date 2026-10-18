@@ -53,6 +53,7 @@ type Session struct {
 
 	controlMu           sync.Mutex
 	needsIDR            atomic.Bool
+	audioEnabled        atomic.Bool
 	hasStarted          atomic.Bool
 	initialIDRRequested atomic.Bool
 	nextSequence        atomic.Uint32
@@ -114,6 +115,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		control:     control,
 		sessionDone: make(chan struct{}),
 	}
+	session.audioEnabled.Store(true)
 	if conn, ok := r.Context().Value(quicConnContextKey{}).(*quic.Conn); ok {
 		session.quicConn = conn
 	}
@@ -223,6 +225,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	}
 	log.Printf("[webtransport] session started id=%s machine=%s client=%s mode=%dx%d", id, machineID, clientIP, width, height)
 	go forwardCursorUpdates(session)
+	go forwardAudio(session)
 	go session.runBandwidthEstimator()
 	session.readControlMessages()
 	session.releaseNow()
@@ -437,6 +440,15 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 			"height": resolution.Height,
 		})
 		machine.sendResolutionStatus(status)
+	case "audio":
+		var audio struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.Unmarshal(message.Data, &audio); err != nil {
+			return errors.New("invalid audio control")
+		}
+		s.audioEnabled.Store(audio.Enabled)
+		log.Printf("[control] audio enabled=%v", audio.Enabled)
 	case "latency-ping":
 		if err := s.writeControl(controlMessage{Type: "latency-pong", Data: message.Data}); err != nil {
 			return err
@@ -512,7 +524,51 @@ func forwardCursorUpdates(session *Session) {
 	}
 }
 
+func forwardAudio(session *Session) {
+	machine := session.getMachine()
+	if machine == nil {
+		return
+	}
+	for {
+		select {
+		case <-session.sessionDone:
+			return
+		case msg := <-machine.audioChan:
+			if !session.audioEnabled.Load() {
+				continue
+			}
+			// Upstream payload: [seq u32 BE][opus bytes].
+			if len(msg.data) < 4 {
+				continue
+			}
+			seq := binary.BigEndian.Uint32(msg.data[:4])
+			if err := session.sendAudioStream(msg.tsMicros, seq, msg.data[4:]); err != nil {
+				session.releaseNow()
+				_ = session.transport.CloseWithError(sessionErrorCode, err.Error())
+				return
+			}
+		}
+	}
+}
+
 func (s *Session) sendMetadataStream(kind byte, payload []byte) error {
+	header := make([]byte, 5)
+	header[0] = kind
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	return s.sendUniStream(header, payload)
+}
+
+// Audio stream layout: [0x04][ts u64 BE][seq u32 BE][len u32 BE][opus payload].
+func (s *Session) sendAudioStream(tsMicros uint64, seq uint32, payload []byte) error {
+	header := make([]byte, 17)
+	header[0] = 0x04
+	binary.BigEndian.PutUint64(header[1:9], tsMicros)
+	binary.BigEndian.PutUint32(header[9:13], seq)
+	binary.BigEndian.PutUint32(header[13:17], uint32(len(payload)))
+	return s.sendUniStream(header, payload)
+}
+
+func (s *Session) sendUniStream(header, payload []byte) error {
 	ctx := s.transport.Context()
 	stream, err := s.transport.OpenUniStreamSync(ctx)
 	if err != nil {
@@ -522,9 +578,6 @@ func (s *Session) sendMetadataStream(kind byte, payload []byte) error {
 		stream.CancelWrite(webtransport.StreamErrorCode(1))
 	})
 	defer stopCancel()
-	header := make([]byte, 5)
-	header[0] = kind
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
 	for _, part := range [][]byte{header, payload} {
 		for len(part) > 0 {
 			n, writeErr := stream.Write(part)

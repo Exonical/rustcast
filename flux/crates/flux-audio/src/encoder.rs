@@ -3,10 +3,13 @@
 //! Opus is the standard codec for low-latency audio streaming. It provides
 //! excellent quality at low bitrates and supports both voice and music content.
 
-use flux_core::error::Result;
+use flux_core::error::{FluxError, Result};
 use flux_core::frame::EncodedAudioPacket;
 
 use crate::traits::{AudioEncoder, AudioSamples};
+
+/// Maximum bytes a single Opus packet can take (spec limit 1275; headroom).
+const MAX_OPUS_PACKET: usize = 4000;
 
 /// Configuration for the Opus encoder.
 #[derive(Debug, Clone)]
@@ -33,8 +36,8 @@ impl Default for OpusEncoderConfig {
         Self {
             sample_rate: 48000,
             channels: 2,
-            bitrate_bps: 256_000,
-            frame_duration_ms: 5.0, // Low latency: 5ms frames
+            bitrate_bps: 128_000,
+            frame_duration_ms: 20.0,
             application: OpusApplication::Audio,
         }
     }
@@ -51,12 +54,12 @@ pub enum OpusApplication {
     LowDelay,
 }
 
-/// Opus audio encoder wrapping libopus via FFI.
+/// Opus audio encoder wrapping libopus.
 pub struct OpusEncoder {
-    _config: OpusEncoderConfig,
+    config: OpusEncoderConfig,
+    encoder: opus::Encoder,
     sequence: u64,
     samples_per_frame: usize,
-    // TODO: *mut OpusEncoder (FFI handle from opus_encoder_create)
 }
 
 impl OpusEncoder {
@@ -69,31 +72,41 @@ impl OpusEncoder {
             config.frame_duration_ms,
         );
 
-        let samples_per_frame =
-            (config.sample_rate as f32 * config.frame_duration_ms / 1000.0) as usize;
+        if !matches!(config.sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) {
+            return Err(FluxError::AudioEncode(format!(
+                "unsupported Opus sample rate: {}",
+                config.sample_rate
+            )));
+        }
+        let channels = match config.channels {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            other => {
+                return Err(FluxError::AudioEncode(format!(
+                    "unsupported Opus channel count: {other}"
+                )));
+            }
+        };
+        let application = match config.application {
+            OpusApplication::Voip => opus::Application::Voip,
+            OpusApplication::Audio => opus::Application::Audio,
+            OpusApplication::LowDelay => opus::Application::LowDelay,
+        };
 
-        // TODO: FFI initialization:
-        //
-        //   let application = match config.application {
-        //       OpusApplication::Voip => OPUS_APPLICATION_VOIP,
-        //       OpusApplication::Audio => OPUS_APPLICATION_AUDIO,
-        //       OpusApplication::LowDelay => OPUS_APPLICATION_RESTRICTED_LOWDELAY,
-        //   };
-        //
-        //   let mut error: c_int = 0;
-        //   let encoder = opus_encoder_create(
-        //       config.sample_rate as i32,
-        //       config.channels as i32,
-        //       application,
-        //       &mut error,
-        //   );
-        //
-        //   opus_encoder_ctl(encoder, OPUS_SET_BITRATE(config.bitrate_bps as i32));
-        //   opus_encoder_ctl(encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
-        //   opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(10)); // max quality
+        let mut encoder = opus::Encoder::new(config.sample_rate, channels, application)
+            .map_err(|e| FluxError::AudioEncode(format!("opus_encoder_create: {e}")))?;
+        encoder
+            .set_bitrate(opus::Bitrate::Bits(config.bitrate_bps as i32))
+            .map_err(|e| FluxError::AudioEncode(format!("OPUS_SET_BITRATE: {e}")))?;
+        encoder
+            .set_inband_fec(false)
+            .map_err(|e| FluxError::AudioEncode(format!("OPUS_SET_INBAND_FEC: {e}")))?;
+
+        let samples_per_frame = (config.sample_rate as f32 * config.frame_duration_ms / 1000.0) as usize;
 
         Ok(Self {
-            _config: config,
+            config,
+            encoder,
             sequence: 0,
             samples_per_frame,
         })
@@ -106,30 +119,29 @@ impl OpusEncoder {
 }
 
 impl AudioEncoder for OpusEncoder {
-    fn encode(&mut self, _samples: &AudioSamples) -> Result<EncodedAudioPacket> {
+    fn encode(&mut self, samples: &AudioSamples) -> Result<EncodedAudioPacket> {
+        let expected = self.samples_per_frame * self.config.channels as usize;
+        if samples.data.len() != expected {
+            return Err(FluxError::AudioEncode(format!(
+                "expected {expected} interleaved samples, got {}",
+                samples.data.len()
+            )));
+        }
+
+        let mut output = vec![0u8; MAX_OPUS_PACKET];
+        let written = self
+            .encoder
+            .encode_float(&samples.data, &mut output)
+            .map_err(|e| FluxError::AudioEncode(format!("opus_encode_float: {e}")))?;
+        output.truncate(written);
+
         self.sequence += 1;
-
-        // TODO: FFI encode:
-        //
-        //   let frame_size = self.samples_per_frame;
-        //   let mut output = vec![0u8; 4000]; // max Opus packet size
-        //
-        //   let encoded_bytes = opus_encode_float(
-        //       self.encoder,
-        //       samples.data.as_ptr(),
-        //       frame_size as i32,
-        //       output.as_mut_ptr(),
-        //       output.len() as i32,
-        //   );
-        //
-        //   output.truncate(encoded_bytes as usize);
-
         tracing::trace!("Opus encode frame {}", self.sequence);
 
         Ok(EncodedAudioPacket {
             sequence: self.sequence,
             timestamp: self.sequence * self.samples_per_frame as u64,
-            data: Vec::new(), // placeholder
+            data: output,
         })
     }
 

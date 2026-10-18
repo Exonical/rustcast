@@ -1,7 +1,7 @@
 # Agent notes
 
 ## Layout
-- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebTransport (HTTP/3) relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod. The host image builds Mesa 25.3.6 RADV/ANV with video codecs enabled (stage `mesa` in containers/host/Containerfile — Rocky strips VK_KHR_video_*) and flux-pod.yaml passes the host's /dev/dri render nodes through as CharDevice volumes.
+- `flux/` Rust workspace (server, capture, encode, input, transport, client). `flux-web/` Go WebTransport (HTTP/3) relay + Next.js viewer (`flux-web/ui`). `drivers/flux-idd/` Rust IddCx driver. `containers/` Rocky 10 GNOME host + relay pod. The host image builds Mesa 25.3.6 RADV/ANV with video codecs enabled (stage `mesa` in containers/host/Containerfile — Rocky strips VK_KHR_video_*) and flux-pod.yaml passes the host's /dev/dri render nodes through as CharDevice volumes. Desktop audio: the host image creates a PipeWire null sink `flux-sink` (rootfs/etc/pipewire/pipewire.conf.d) that flux-server captures and Opus-encodes (feature `audio-pipewire`); it travels as frame-server message type 0x04 and WebTransport uni-stream kind 0x04 to the browser's AudioWorklet player.
 
 ## Build / test
 - Relay: `cd flux-web && go vet ./... && go test ./...` (Go 1.27; the Windows checkout is CRLF, so `gofmt -l` flags every file — check an LF copy instead).

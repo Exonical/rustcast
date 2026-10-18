@@ -532,7 +532,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Each message carries the frame's capture timestamp (microseconds since
     // capture start) so downstream playout can pace by true capture spacing
     // rather than bursty network arrival time.
+    // Shared epoch for capture/audio timestamps so video and audio play out
+    // against the same clock.
+    let stream_epoch = Instant::now();
     let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(8);
+    let (audio_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(64);
     let (cursor_tx, _) = tokio::sync::watch::channel(Arc::new((
         0u64,
         flux_core::cursor::CursorMetadata::hidden(),
@@ -567,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             capture_loop(
                 h264_tx2,
+                stream_epoch,
                 cursor_tx2,
                 idr_rx,
                 bitrate_rx,
@@ -585,6 +590,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 runtime_status_capture,
             );
         })?;
+
+    // ── Desktop audio capture → Opus encode → broadcast ──
+    #[cfg(all(target_os = "linux", feature = "audio-pipewire"))]
+    if config.audio.enabled {
+        let audio_tx_thread = audio_tx.clone();
+        let audio_config = config.audio.clone();
+        std::thread::Builder::new()
+            .name("flux-audio".into())
+            .spawn(move || audio_loop(audio_tx_thread, stream_epoch, audio_config))
+            .map_err(|e| format!("spawn audio thread: {e}"))?;
+    }
 
     // ── Start TCP frame server (for Go relay) ─────────────
     let frame_port = config.server.signaling_port + 2; // e.g. 8555
@@ -645,6 +661,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(endpoint) => {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
                 let h264_tx = h264_tx.clone();
+                let audio_tx = audio_tx.clone();
                 let cursor_rx = cursor_tx.subscribe();
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
@@ -657,6 +674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     quic_frames::serve(
                         endpoint,
                         h264_tx,
+                        audio_tx,
                         cursor_rx,
                         idr_tx,
                         bitrate_tx,
@@ -686,6 +704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_server(
             frame_listener,
             h264_tx,
+            audio_tx.clone(),
             cursor_rx,
             idr_tx,
             bitrate_tx,
@@ -749,6 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -782,6 +802,7 @@ async fn frame_server(
             tracing::debug!("DSCP not set (normal on Windows): {}", e);
         }
         let mut rx = h264_tx.subscribe();
+        let mut audio_rx = audio_tx.subscribe();
         let mut cursor_rx = cursor_rx.clone();
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
@@ -969,6 +990,11 @@ async fn frame_server(
                         }
                         Err(_) => break,
                     },
+                    result = audio_rx.recv() => match result {
+                        Ok(d) => (0x04, d),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
                     result = resolution_status_rx.recv() => match result {
                         Ok(status) => (0x03, status),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1022,6 +1048,83 @@ where
         written += n;
     }
     Ok(())
+}
+
+/// Desktop audio pipeline: PipeWire capture → framer → Opus → broadcast.
+/// Payload sent to the frame server is [seq u32 BE][Opus bytes] with the
+/// capture timestamp in microseconds relative to `stream_epoch`. Never fatal:
+/// any failure just leaves the server running without audio.
+#[cfg(all(target_os = "linux", feature = "audio-pipewire"))]
+fn audio_loop(
+    audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    stream_epoch: Instant,
+    config: flux_core::config::AudioConfig,
+) {
+    use flux_audio::traits::AudioEncoder;
+
+    let mut capture = match flux_audio::create_audio_capture() {
+        Ok(capture) => capture,
+        Err(e) => {
+            tracing::warn!("Audio capture unavailable: {e}");
+            return;
+        }
+    };
+    if let Err(e) = capture.start(None) {
+        tracing::warn!("Audio capture failed to start: {e}");
+        return;
+    }
+    let mut encoder = match flux_audio::create_audio_encoder(flux_audio::encoder::OpusEncoderConfig {
+        sample_rate: config.sample_rate,
+        channels: config.channels,
+        bitrate_bps: config.bitrate_kbps.saturating_mul(1000),
+        application: flux_audio::encoder::OpusApplication::Audio,
+        ..Default::default()
+    }) {
+        Ok(encoder) => encoder,
+        Err(e) => {
+            tracing::warn!("Opus encoder unavailable: {e}");
+            let _ = capture.stop();
+            return;
+        }
+    };
+    tracing::info!(
+        "Audio encoder ready: Opus {}Hz {}ch {}kbps 20ms",
+        config.sample_rate,
+        config.channels,
+        config.bitrate_kbps
+    );
+    let mut framer = flux_audio::AudioFramer::new(encoder.samples_per_frame(), config.channels, config.sample_rate);
+    let mut last_warn = Instant::now() - Duration::from_secs(60);
+    loop {
+        let samples = match capture.next_samples() {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::warn!("Audio capture ended: {e}");
+                break;
+            }
+        };
+        for chunk in framer.push(samples) {
+            // Keep draining capture even with no relay clients.
+            if audio_tx.receiver_count() == 0 {
+                continue;
+            }
+            match encoder.encode(&chunk) {
+                Ok(packet) => {
+                    let mut payload = Vec::with_capacity(4 + packet.data.len());
+                    payload.extend_from_slice(&(packet.sequence as u32).to_be_bytes());
+                    payload.extend_from_slice(&packet.data);
+                    let ts = chunk.timestamp.saturating_duration_since(stream_epoch).as_micros() as u64;
+                    let _ = audio_tx.send(Arc::new((ts, payload)));
+                }
+                Err(e) => {
+                    if last_warn.elapsed() >= Duration::from_secs(5) {
+                        tracing::warn!("Audio encode error: {e}");
+                        last_warn = Instant::now();
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The ordered H.264 encoder backends to try for this build/platform: the
@@ -1745,6 +1848,7 @@ fn restart_for_downscale(
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    stream_epoch: Instant,
     cursor_tx: tokio::sync::watch::Sender<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_rx: std::sync::mpsc::Receiver<()>,
     bitrate_rx: std::sync::mpsc::Receiver<u32>,
@@ -1844,7 +1948,7 @@ fn capture_loop(
             return;
         }
     };
-    let loop_start = std::time::Instant::now();
+    let loop_start = stream_epoch;
     let cursor_dimensions = Arc::new(std::sync::RwLock::new((
         primary.native_resolution.width,
         primary.native_resolution.height,

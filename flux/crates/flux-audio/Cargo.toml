@@ -12,3 +12,16 @@ thiserror = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 byteorder = { workspace = true }
+# Opus codec: links the system libopus via pkg-config.
+opus = { workspace = true }
+
+[features]
+default = []
+# Real Linux audio capture backend: a live PipeWire stream against a monitor
+# source (flux-sink). Pulls in system libpipewire-0.3 / libspa-0.2, so it is
+# optional and only meaningful on Linux.
+audio-pipewire = ["dep:pipewire", "dep:libspa"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true, optional = true }
+libspa = { workspace = true, optional = true }

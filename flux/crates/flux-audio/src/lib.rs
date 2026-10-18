@@ -1,7 +1,9 @@
 pub mod capture;
 pub mod encoder;
+pub mod framer;
 pub mod traits;
 
+pub use framer::AudioFramer;
 pub use traits::{AudioCaptureSession, AudioEncoder};
 
 use flux_core::error::Result;

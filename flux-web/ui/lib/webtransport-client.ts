@@ -3,6 +3,7 @@ import { browserFamily } from "./browser-family";
 import { FrameSequencer, type EncodedFrame, type SequenceResult } from "./frame-sequencer";
 import { ResolutionPaintTracker } from "./resolution-paint";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
+import { parseAudioHeader } from "./audio-framing";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "failed";
 
@@ -18,6 +19,8 @@ export interface StreamStats {
   receiveToPaintMs: number | null;
   decodeMs: number | null;
   framesDropped: number;
+  audioBufferedMs?: number;
+  audioUnderruns?: number;
 }
 
 export interface CursorBitmap {
@@ -26,6 +29,12 @@ export interface CursorBitmap {
   stride: number;
   format: number;
   pixels: string;
+}
+
+export interface AudioPacket {
+  seq: number;
+  tsMicros: bigint;
+  data: Uint8Array;
 }
 
 export interface CursorMetadata {
@@ -112,6 +121,8 @@ export class WebTransportClient {
   sessionId: string | null = null;
   private bytesReceived = 0;
   private bytesWindow = 0;
+  private audioBytesWindow = 0;
+  private audioBytesReceived = 0;
   private framesWindow = 0;
   private framesDropped = 0;
   private packetsLost = 0;
@@ -134,6 +145,7 @@ export class WebTransportClient {
   onStateChange: ((state: ConnectionState) => void) | null = null;
   onStats: ((stats: StreamStats) => void) | null = null;
   onCursor: ((cursor: CursorMetadata) => void) | null = null;
+  onAudio: ((packet: AudioPacket) => void) | null = null;
   onResolutionStatus: ((status: ResolutionStatus) => void) | null = null;
   onKeyframePainted: (() => void) | null = null;
   onSessionId: ((id: string) => void) | null = null;
@@ -224,6 +236,10 @@ export class WebTransportClient {
   requestResolution(width: number, height: number): void {
     this.resolution = { width, height };
     this.sendControl("resolution", { width, height });
+  }
+
+  setAudioEnabled(enabled: boolean): void {
+    this.sendControl("audio", { enabled });
   }
 
   requestKeyframe(): void {
@@ -336,6 +352,14 @@ export class WebTransportClient {
         if (generation !== this.generation) return;
         if (kind === 0x02) this.onCursor?.(data as CursorMetadata);
         else this.handleResolutionStatus(data as ResolutionStatus);
+      } else if (kind === 0x04) {
+        const header = await reader.readExactly(16);
+        const parsed = parseAudioHeader(header);
+        const payload = await reader.readExactly(parsed.payloadLength);
+        if (generation !== this.generation) return;
+        this.audioBytesReceived += payload.byteLength;
+        this.audioBytesWindow += payload.byteLength;
+        this.onAudio?.({ seq: parsed.seq, tsMicros: parsed.tsMicros, data: payload });
       }
     } catch (error) {
       if (seq !== null && generation === this.generation) {
