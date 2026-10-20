@@ -1,0 +1,19 @@
+{
+  "yaml.customTags": [
+    "!AtIndex scalar",
+    "!Condition sequence",
+    "!Context scalar",
+    "!Enumerate sequence",
+    "!Env scalar",
+    "!Env sequence",
+    "!Find sequence",
+    "!Format sequence",
+    "!If sequence",
+    "!Index scalar",
+    "!KeyOf scalar",
+    "!Value scalar"
+  ],
+  "yaml.schemas": {
+    "https://goauthentik.io/blueprints/schema.json": "containers/authentik/blueprints/*.yaml"
+  }
+}
