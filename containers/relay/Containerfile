@@ -20,7 +20,8 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 go build -trimpath -o /out/flux-web .
 
 FROM ${ROCKY_IMAGE}
-RUN useradd --system --create-home --home-dir /app flux-web
+RUN useradd --system --create-home --home-dir /app flux-web \
+    && mkdir -p /var/lib/flux-relay && chown flux-web:flux-web /var/lib/flux-relay
 WORKDIR /app
 COPY --from=relay /out/flux-web /app/flux-web
 COPY --from=ui /ui/out /app/ui/out

@@ -9,9 +9,12 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 import { targetBitrateKbps } from "@/lib/protocol";
+import { policyLabel } from "@/lib/clipboard";
 
 export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
-  qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio, onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
+  qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio,
+  clipboardSupported, clipboardPolicy, clipboardFlash, onClipboardSync,
+  onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
   onQualityChange, onFpsChange, onCommit, onResolution }: {
   machine: Machine;
   stats: StreamStats | null;
@@ -23,6 +26,10 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
   audioSupported: boolean;
   audioMuted: boolean;
   onToggleAudio: () => void;
+  clipboardSupported: boolean;
+  clipboardPolicy: string;
+  clipboardFlash: boolean;
+  onClipboardSync: () => void;
   qualityLevel: number | null;
   fpsCap: number | null;
   onBack: () => void;
@@ -99,6 +106,13 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
             <span className={audioMuted ? "line-through opacity-60" : undefined}>♪</span>
           </Button>
         )}
+        <Button
+          aria-label="Clipboard"
+          disabled={!clipboardSupported}
+          title={clipboardSupported ? `Clipboard: ${policyLabel(clipboardPolicy)}` : "Clipboard requires HTTPS"}
+          onClick={onClipboardSync}
+          className={`h-9 w-9 rounded-xl p-0 transition-colors ${clipboardFlash ? "bg-red-400/25 text-red-200" : ""} ${clipboardPolicy === "off" ? "opacity-50" : ""}`}
+        >⧉</Button>
         <Button aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"} title="Fullscreen · Ctrl+Alt+Shift+F" onClick={onFullscreen} className="hidden h-9 w-9 rounded-xl p-0 sm:inline-flex">{isFullscreen ? "↙" : "↗"}</Button>
         <Button variant="danger" onClick={onBack} className="h-9 px-3 text-xs sm:px-4">Disconnect</Button>
       </div>

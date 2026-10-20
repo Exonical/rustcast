@@ -17,6 +17,8 @@ type sessionInfo struct {
 	MachineName string    `json:"machine_name"`
 	ClientIP    string    `json:"client_ip"`
 	UserAgent   string    `json:"user_agent"`
+	User        string    `json:"user,omitempty"`
+	UserSub     string    `json:"user_sub,omitempty"`
 	StartedAt   time.Time `json:"started_at"`
 	Width       uint32    `json:"width"`
 	Height      uint32    `json:"height"`
@@ -24,6 +26,7 @@ type sessionInfo struct {
 
 type sessionEntry struct {
 	info    sessionInfo
+	sess    *Session
 	end     func(reason string)
 	endOnce sync.Once
 }
@@ -45,8 +48,8 @@ func (r *sessionRegistry) newID() (string, error) {
 	return hex.EncodeToString(bytes[:]), nil
 }
 
-func (r *sessionRegistry) add(info sessionInfo, end func(reason string)) {
-	entry := &sessionEntry{info: info, end: end}
+func (r *sessionRegistry) add(info sessionInfo, sess *Session, end func(reason string)) {
+	entry := &sessionEntry{info: info, sess: sess, end: end}
 	r.mu.Lock()
 	r.m[info.ID] = entry
 	r.mu.Unlock()
@@ -71,6 +74,25 @@ func (r *sessionRegistry) list() []sessionInfo {
 	return result
 }
 
+// sessionViewer pairs a live session with its audit metadata.
+type sessionViewer struct {
+	info sessionInfo
+	sess *Session
+}
+
+// sessionsFor returns the active sessions bound to a machine.
+func (r *sessionRegistry) sessionsFor(machineID string) []sessionViewer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []sessionViewer
+	for _, entry := range r.m {
+		if entry.info.MachineID == machineID && entry.sess != nil {
+			out = append(out, sessionViewer{info: entry.info, sess: entry.sess})
+		}
+	}
+	return out
+}
+
 func (r *sessionRegistry) disconnect(id string) bool {
 	r.mu.Lock()
 	entry := r.m[id]
@@ -86,12 +108,11 @@ func (r *sessionRegistry) disconnect(id string) bool {
 	return true
 }
 
-func registerSessionRoutes(r *gin.Engine, sessions *sessionRegistry) {
-	// These endpoints are intentionally unauthenticated, like the machine routes.
-	r.GET("/api/sessions", func(c *gin.Context) {
+func registerSessionRoutes(api, admin *gin.RouterGroup, sessions *sessionRegistry) {
+	api.GET("/sessions", func(c *gin.Context) {
 		c.JSON(http.StatusOK, sessions.list())
 	})
-	r.POST("/api/sessions/:id/disconnect", func(c *gin.Context) {
+	admin.POST("/sessions/:id/disconnect", func(c *gin.Context) {
 		if !sessions.disconnect(c.Param("id")) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 			return

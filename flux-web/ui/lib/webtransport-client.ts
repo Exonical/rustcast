@@ -4,6 +4,7 @@ import { FrameSequencer, type EncodedFrame, type SequenceResult } from "./frame-
 import { ResolutionPaintTracker } from "./resolution-paint";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
 import { parseAudioHeader } from "./audio-framing";
+import { CLIPBOARD_MIME, type ClipboardPayload, type ClipboardStatus } from "./clipboard";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "failed";
 
@@ -83,6 +84,26 @@ interface DiscoveryResponse {
   host: string;
   port: number;
   certHashes: string[];
+  ticket?: string;
+}
+
+export function webtransportURL(discovery: DiscoveryResponse, opts: {
+  hostname: string;
+  machineId?: string | null;
+  userAgent?: string;
+  resolution?: { width: number; height: number } | null;
+}): URL {
+  const host = discovery.host || opts.hostname;
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const url = new URL(`https://${urlHost}:${discovery.port}/wt`);
+  if (opts.machineId) url.searchParams.set("machine", opts.machineId);
+  if (opts.userAgent) url.searchParams.set("user_agent", opts.userAgent);
+  if (discovery.ticket) url.searchParams.set("ticket", discovery.ticket);
+  if (opts.resolution) {
+    url.searchParams.set("width", String(opts.resolution.width));
+    url.searchParams.set("height", String(opts.resolution.height));
+  }
+  return url;
 }
 
 interface FrameMetadata {
@@ -151,6 +172,12 @@ export class WebTransportClient {
   onSessionId: ((id: string) => void) | null = null;
   onError: ((message: string) => void) | null = null;
   onSessionEnded: ((reason: string) => void) | null = null;
+  onClipboard: ((payload: ClipboardPayload) => void) | null = null;
+  onClipboardStatus: ((status: ClipboardStatus) => void) | null = null;
+  private clipboardWaiter: {
+    resolve: (status: ClipboardStatus | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
 
   constructor(
     private readonly machineId?: string,
@@ -183,17 +210,19 @@ export class WebTransportClient {
     this.resetStats();
     try {
       const response = await fetch("/api/webtransport");
+      if (response.status === 401) {
+        // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- /auth/login is a relay route, not a Next page
+        window.location.assign("/auth/login?next=" + encodeURIComponent(location.pathname + location.search));
+        throw new Error("unauthenticated");
+      }
       if (!response.ok) throw new Error(`WebTransport discovery failed: ${response.status}`);
       const discovery = await response.json() as DiscoveryResponse;
-      const host = discovery.host || location.hostname;
-      const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-      const url = new URL(`https://${urlHost}:${discovery.port}/wt`);
-      if (this.machineId) url.searchParams.set("machine", this.machineId);
-      if (typeof navigator !== "undefined" && navigator.userAgent) url.searchParams.set("user_agent", navigator.userAgent);
-      if (this.resolution) {
-        url.searchParams.set("width", String(this.resolution.width));
-        url.searchParams.set("height", String(this.resolution.height));
-      }
+      const url = webtransportURL(discovery, {
+        hostname: location.hostname,
+        machineId: this.machineId,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
+        resolution: this.resolution,
+      });
       const hashes = (discovery.certHashes ?? []).map((hash) => ({
         algorithm: "sha-256",
         value: Uint8Array.from(atob(hash), (character) => character.charCodeAt(0)),
@@ -240,6 +269,33 @@ export class WebTransportClient {
 
   setAudioEnabled(enabled: boolean): void {
     this.sendControl("audio", { enabled });
+  }
+
+  sendClipboard(text: string): void {
+    this.sendControl("clipboard", { mime: CLIPBOARD_MIME, data: text });
+  }
+
+  /** Send clipboard text, then wait up to `timeoutMs` for the relay's
+   *  `clipboard-status` verdict (null on timeout). */
+  sendClipboardAndWait(text: string, timeoutMs = 150): Promise<ClipboardStatus | null> {
+    this.cancelClipboardWaiter();
+    const wait = new Promise<ClipboardStatus | null>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.clipboardWaiter?.resolve === resolve) this.clipboardWaiter = null;
+        resolve(null);
+      }, timeoutMs);
+      this.clipboardWaiter = { resolve, timer };
+    });
+    this.sendClipboard(text);
+    return wait;
+  }
+
+  private cancelClipboardWaiter(): void {
+    if (this.clipboardWaiter) {
+      clearTimeout(this.clipboardWaiter.timer);
+      this.clipboardWaiter.resolve(null);
+      this.clipboardWaiter = null;
+    }
   }
 
   requestKeyframe(): void {
@@ -294,6 +350,17 @@ export class WebTransportClient {
       this.closeCurrent();
       this.setState("disconnected");
       this.onSessionEnded?.(reason);
+    } else if (message.type === "clipboard") {
+      this.onClipboard?.(message.data as ClipboardPayload);
+    } else if (message.type === "clipboard-status") {
+      const status = message.data as ClipboardStatus;
+      const waiter = this.clipboardWaiter;
+      this.clipboardWaiter = null;
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(status);
+      }
+      this.onClipboardStatus?.(status);
     } else if (message.type === "cursor") this.onCursor?.(message.data as CursorMetadata);
     else if (message.type === "resolution-status") this.handleResolutionStatus(message.data as ResolutionStatus);
     else if (message.type === "latency-pong") {
@@ -661,6 +728,7 @@ export class WebTransportClient {
     this.clientStatsInterval = null;
     this.controlWriter?.close().catch(() => {});
     this.controlWriter = null;
+    this.cancelClipboardWaiter();
     if (this.pendingPaint) this.pendingPaint.frame.close();
     this.pendingPaint = null;
     if (this.decoder && this.decoder.state !== "closed") this.decoder.close();

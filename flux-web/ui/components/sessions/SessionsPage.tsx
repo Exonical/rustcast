@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/compone
 import { EmptyState } from "@/components/ui/empty-state";
 import { Skeleton } from "@/components/ui/skeleton";
 import { disconnectSession, useMachines, useSessions, type SessionInfo } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { formatDuration, shortUserAgent } from "@/lib/format";
 
 export function SessionsPage() {
@@ -19,6 +20,8 @@ export function SessionsPage() {
   const [selected, setSelected] = useState<SessionInfo | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { me } = useAuth();
+  const canDisconnect = !me?.auth_enabled || me?.admin === true;
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -66,7 +69,7 @@ export function SessionsPage() {
                 <td className="px-5 py-4"><span className="font-mono text-xs text-zinc-300">{session.width && session.height ? `${session.width}×${session.height}` : "Native"}</span></td>
                 <td className="px-5 py-4 text-xs text-zinc-500">{new Date(session.started_at).toLocaleTimeString()}</td>
                 <td className="px-5 py-4 font-mono text-xs text-zinc-300">{formatDuration((now - Date.parse(session.started_at)) / 1000)}</td>
-                <td className="px-5 py-4 text-right"><Button variant="danger" className="px-3 py-2 text-xs" onClick={() => { setSelected(session); setError(null); }}>Disconnect</Button></td>
+                <td className="px-5 py-4 text-right">{canDisconnect && <Button variant="danger" className="px-3 py-2 text-xs" onClick={() => { setSelected(session); setError(null); }}>Disconnect</Button>}</td>
               </tr>
             ))}
           </tbody>
@@ -84,7 +87,7 @@ export function SessionsPage() {
               <MobileStat label="Started" value={new Date(session.started_at).toLocaleTimeString()} />
               <MobileStat label="Duration" value={formatDuration((now - Date.parse(session.started_at)) / 1000)} />
             </div>
-            <Button variant="danger" className="w-full" onClick={() => { setSelected(session); setError(null); }}>Disconnect session</Button>
+            {canDisconnect && <Button variant="danger" className="w-full" onClick={() => { setSelected(session); setError(null); }}>Disconnect session</Button>}
           </Card>
         ))}
       </div>

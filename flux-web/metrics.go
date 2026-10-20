@@ -61,6 +61,7 @@ type relayMetrics struct {
 	idrRequests          *prometheus.CounterVec
 	sessionsStarted      *prometheus.CounterVec
 	sessionRejections    *prometheus.CounterVec
+	clipboardEvents      *prometheus.CounterVec
 	frameSend            *prometheus.HistogramVec
 	queueWait            *prometheus.HistogramVec
 	timeToFirstFrame     *prometheus.HistogramVec
@@ -146,6 +147,7 @@ func newRelayMetrics() *relayMetrics {
 		idrRequests:          prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_idr_requests_total", Help: "IDR requests by reason and gate result."}, []string{"machine", "reason", "result"}),
 		sessionsStarted:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_sessions_started_total", Help: "Viewer sessions accepted for a machine."}, []string{"machine"}),
 		sessionRejections:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_session_rejections_total", Help: "WebTransport sessions rejected by the relay."}, []string{"machine", "reason"}),
+		clipboardEvents:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_clipboard_events_total", Help: "Clipboard events by direction and enforcement result."}, []string{"machine", "direction", "result"}),
 		frameSend:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_frame_send_seconds", Help: "Time spent sending a video frame stream.", Buckets: prometheus.ExponentialBuckets(0.001, 2, 12)}, []string{"machine", "type"}),
 		queueWait:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_queue_wait_seconds", Help: "Time a video frame waited in the relay queue.", Buckets: prometheus.ExponentialBuckets(0.001, 2, 12)}, []string{"machine"}),
 		timeToFirstFrame:     prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_time_to_first_frame_seconds", Help: "Time from session acceptance until the first frame was written.", Buckets: prometheus.ExponentialBuckets(0.05, 2, 10)}, []string{"machine"}),
@@ -162,7 +164,7 @@ func newRelayMetrics() *relayMetrics {
 		m.viewers, m.upstreamConnected, m.rtt, m.packetLoss, m.queueDelay, m.bweTarget, m.encoderTarget,
 		m.upstreamFrames, m.upstreamBytes, m.upstreamAudioPackets, m.upstreamAudioBytes,
 		m.upstreamReconnects, m.framesSent, m.bytesSent, m.framesReset,
-		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.frameSend, m.queueWait,
+		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.clipboardEvents, m.frameSend, m.queueWait,
 		m.timeToFirstFrame, m.clientFPS, m.clientDecode, m.clientReceivePaint, m.clientBitrate,
 		m.clientFramesDropped, m.clientInfo,
 	)
@@ -226,15 +228,30 @@ func (m *relayMetrics) reject(machine, reason string) {
 }
 
 func (m *relayMetrics) deleteMachine(id string) {
+	m.deleteMachineVectors(id, true)
+}
+
+// deleteUpstreamMachine clears per-machine vectors when an upstream connection
+// drops. Clipboard event counters are kept: they record audited history, not
+// live connection state, and must survive upstream reconnects.
+func (m *relayMetrics) deleteUpstreamMachine(id string) {
+	m.deleteMachineVectors(id, false)
+}
+
+func (m *relayMetrics) deleteMachineVectors(id string, includeClipboard bool) {
 	labels := prometheus.Labels{"machine": id}
-	for _, vector := range []interface{ DeletePartialMatch(prometheus.Labels) int }{
+	vectors := []interface{ DeletePartialMatch(prometheus.Labels) int }{
 		m.viewers, m.upstreamConnected, m.rtt, m.packetLoss, m.queueDelay, m.bweTarget, m.encoderTarget,
 		m.upstreamFrames, m.upstreamBytes, m.upstreamAudioPackets, m.upstreamAudioBytes,
 		m.upstreamReconnects, m.framesSent, m.bytesSent, m.framesReset,
 		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.frameSend, m.queueWait,
 		m.timeToFirstFrame, m.clientFPS, m.clientDecode, m.clientReceivePaint, m.clientBitrate,
 		m.clientFramesDropped, m.clientInfo,
-	} {
+	}
+	if includeClipboard {
+		vectors = append(vectors, m.clipboardEvents)
+	}
+	for _, vector := range vectors {
 		vector.DeletePartialMatch(labels)
 	}
 }

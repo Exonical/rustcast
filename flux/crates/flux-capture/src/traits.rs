@@ -84,6 +84,11 @@ pub trait CaptureSession: Send {
         None
     }
 
+    /// Clipboard sync backend tied to this capture session, if any.
+    fn clipboard_backend(&self) -> Option<Arc<dyn ClipboardBackend>> {
+        None
+    }
+
     /// Hand a fully consumed frame back so the backend can reuse its CPU
     /// buffer for a later frame. Backends without a buffer pool just drop it.
     fn recycle_frame(&mut self, frame: CapturedFrame) {
@@ -92,4 +97,52 @@ pub trait CaptureSession: Send {
 
     /// Signal the capture backend to stop. The session becomes invalid after this call.
     fn stop(&mut self) -> Result<()>;
+}
+
+/// A remote clipboard text change observed by the capture backend
+/// (host→client direction).
+#[derive(Debug, Clone)]
+pub struct ClipboardEvent {
+    /// MIME type the event was read as (always a text mime in v1).
+    pub mime: String,
+    /// Clipboard contents.
+    pub data: String,
+}
+
+/// Clipboard synchronization backend tied to a capture session.
+pub trait ClipboardBackend: Send + Sync {
+    /// Announce `text` as the remote clipboard selection (client→host).
+    fn set_text(&self, text: String) -> Result<()>;
+
+    /// Subscribe to host-side clipboard changes.
+    fn events(&self) -> tokio::sync::broadcast::Receiver<ClipboardEvent>;
+}
+
+/// Indirection so a clipboard backend swapped with a recreated capture session
+/// stays reachable, mirroring [`flux_input::InputSink`].
+#[derive(Clone, Default)]
+pub struct ClipboardSink {
+    inner: Arc<std::sync::RwLock<Option<Arc<dyn ClipboardBackend>>>>,
+}
+
+impl ClipboardSink {
+    pub fn set_backend(&self, backend: Option<Arc<dyn ClipboardBackend>>) {
+        if let Ok(mut slot) = self.inner.write() {
+            *slot = backend;
+        }
+    }
+
+    /// Forward client clipboard text to the current backend; a no-op when the
+    /// session has no clipboard support.
+    pub fn set_text(&self, text: String) -> Result<()> {
+        let backend = self
+            .inner
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned());
+        match backend {
+            Some(backend) => backend.set_text(text),
+            None => Ok(()),
+        }
+    }
 }

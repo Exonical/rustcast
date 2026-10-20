@@ -537,6 +537,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream_epoch = Instant::now();
     let (h264_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(8);
     let (audio_tx, _) = tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(64);
+    let clipboard = ClipboardCtx {
+        sink: flux_capture::traits::ClipboardSink::default(),
+        events: tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(16).0,
+        epoch: stream_epoch,
+        enabled: config.clipboard.enabled,
+        max_bytes: config.clipboard.max_bytes,
+    };
     let (cursor_tx, _) = tokio::sync::watch::channel(Arc::new((
         0u64,
         flux_core::cursor::CursorMetadata::hidden(),
@@ -566,6 +573,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolution_status_tx_capture = resolution_status_tx.clone();
     let initial_mode = config.video.virtual_display;
     let gpu_vendor_capture = gpu_vendor.clone();
+    let clipboard_capture = clipboard.clone();
     std::thread::Builder::new()
         .name("flux-capture".into())
         .spawn(move || {
@@ -578,6 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 quality_rx,
                 resolution_rx,
                 input_rx,
+                clipboard_capture,
                 capture_fps,
                 config.video.default_fps_cap,
                 forced_encoder,
@@ -662,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
                 let h264_tx = h264_tx.clone();
                 let audio_tx = audio_tx.clone();
+                let clipboard = clipboard.clone();
                 let cursor_rx = cursor_tx.subscribe();
                 let idr_tx = idr_tx.clone();
                 let bitrate_tx = bitrate_tx.clone();
@@ -675,6 +685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         endpoint,
                         h264_tx,
                         audio_tx,
+                        clipboard,
                         cursor_rx,
                         idr_tx,
                         bitrate_tx,
@@ -705,6 +716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame_listener,
             h264_tx,
             audio_tx.clone(),
+            clipboard.clone(),
             cursor_rx,
             idr_tx,
             bitrate_tx,
@@ -764,11 +776,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Type 0x01 is an H.264 access unit; type 0x02 is cursor JSON metadata.
 /// Control commands: 0x01 IDR, 0x02 input, 0x03 bitrate, 0x04 viewer count,
 /// and 0x05 quality/FPS ([quality level, FPS cap], each 0 means automatic),
-/// and 0x06 resolution ([2-byte BE width, 2-byte BE height], refresh fixed at 60).
+/// and 0x06 resolution ([2-byte BE width, 2-byte BE height], refresh fixed at 60),
+/// and 0x07 clipboard ([4-byte BE len][JSON {"mime","data"}]).
+/// Outbound message type 0x05 is a clipboard payload with the same JSON shape.
 async fn frame_server(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    clipboard: ClipboardCtx,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -803,6 +818,8 @@ async fn frame_server(
         }
         let mut rx = h264_tx.subscribe();
         let mut audio_rx = audio_tx.subscribe();
+        let mut clipboard_rx = clipboard.events.subscribe();
+        let clipboard = clipboard.clone();
         let mut cursor_rx = cursor_rx.clone();
         let idr_tx = idr_tx.clone();
         let bitrate_tx = bitrate_tx.clone();
@@ -915,6 +932,34 @@ async fn frame_server(
                             }
                             let _ = quality_tx.send((level[0], level[1]));
                         }
+                        0x07 => {
+                            // Clipboard set: [len u32][JSON {"mime","data"}]
+                            let mut len_buf = [0u8; 4];
+                            if reader.read_exact(&mut len_buf).await.is_err() {
+                                break;
+                            }
+                            let len = u32::from_be_bytes(len_buf) as usize;
+                            if len > clipboard.max_bytes.saturating_add(4096) {
+                                tracing::warn!("Clipboard command too large: {} bytes", len);
+                                break;
+                            }
+                            let mut payload = vec![0u8; len];
+                            if reader.read_exact(&mut payload).await.is_err() {
+                                break;
+                            }
+                            if clipboard.enabled {
+                                match parse_clipboard_set(&payload, clipboard.max_bytes) {
+                                    Ok(msg) => {
+                                        if let Err(e) = clipboard.sink.set_text(msg.data) {
+                                            tracing::warn!("Clipboard set failed: {}", e);
+                                        }
+                                    }
+                                    Err(reason) => {
+                                        tracing::warn!("Rejected client clipboard: {}", reason);
+                                    }
+                                }
+                            }
+                        }
                         0x06 => {
                             let mut dimensions = [0u8; 4];
                             if reader.read_exact(&mut dimensions).await.is_err() {
@@ -992,6 +1037,11 @@ async fn frame_server(
                     },
                     result = audio_rx.recv() => match result {
                         Ok(d) => (0x04, d),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    },
+                    result = clipboard_rx.recv() => match result {
+                        Ok(d) => (0x05, d),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
@@ -1516,6 +1566,99 @@ fn replug_capture(
     Ok((target, session))
 }
 
+/// Clipboard wire payload shared by frame-server message `0x05`
+/// (host→client) and control command `0x07` (client→host):
+/// `{"mime":"text/plain;charset=utf-8","data":"<utf-8 text>"}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ClipboardMessage {
+    pub mime: String,
+    pub data: String,
+}
+
+/// Text MIME types accepted in a client→host `0x07` command — the set
+/// negotiated with Mutter's `EnableClipboard`.
+pub const CLIPBOARD_MIMES: [&str; 5] = [
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+fn clipboard_mime_ok(mime: &str) -> bool {
+    CLIPBOARD_MIMES.contains(&mime)
+}
+
+/// Parse a `0x07` control payload; `Err` carries a short reason for logging.
+fn parse_clipboard_set(payload: &[u8], max_bytes: usize) -> std::result::Result<ClipboardMessage, &'static str> {
+    if payload.len() > max_bytes.saturating_add(4096) {
+        return Err("clipboard command exceeds size cap");
+    }
+    let msg: ClipboardMessage = serde_json::from_slice(payload).map_err(|_| "invalid clipboard JSON")?;
+    if !clipboard_mime_ok(&msg.mime) {
+        return Err("unsupported clipboard MIME type");
+    }
+    if msg.data.len() > max_bytes {
+        return Err("clipboard payload exceeds size cap");
+    }
+    Ok(msg)
+}
+
+/// Clipboard wiring shared by the TCP/QUIC frame servers and the capture
+/// thread: client→host sets go through `sink`, host→client events are
+/// broadcast on `events` as serialized `ClipboardMessage` JSON.
+#[derive(Clone)]
+struct ClipboardCtx {
+    sink: flux_capture::traits::ClipboardSink,
+    events: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    epoch: Instant,
+    enabled: bool,
+    max_bytes: usize,
+}
+
+/// Route clipboard sync through the capture session's backend, when it has
+/// one, and spawn a forwarder turning backend events into `0x05` frames.
+fn attach_clipboard(ctx: &ClipboardCtx, session: &dyn flux_capture::traits::CaptureSession) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        if !ctx.enabled {
+            ctx.sink.set_backend(None);
+            return;
+        }
+        let backend = session.clipboard_backend();
+        ctx.sink.set_backend(backend.clone());
+        if let Some(backend) = backend {
+            let mut events = backend.events();
+            let tx = ctx.events.clone();
+            let epoch = ctx.epoch;
+            match std::thread::Builder::new()
+                .name("flux-clipboard".into())
+                .spawn(move || {
+                    while let Ok(event) = events.blocking_recv() {
+                        let payload = match serde_json::to_vec(&ClipboardMessage {
+                            mime: event.mime,
+                            data: event.data,
+                        }) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!("clipboard event serialize failed: {e}");
+                                continue;
+                            }
+                        };
+                        let ts = epoch.elapsed().as_micros() as u64;
+                        tracing::info!("clipboard 0x05 broadcast {} bytes", payload.len());
+                        let _ = tx.send(Arc::new((ts, payload)));
+                    }
+                }) {
+                Ok(_) => tracing::info!("Clipboard sync attached to capture session"),
+                Err(e) => tracing::warn!("failed to spawn clipboard forwarder: {e}"),
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    let _ = (ctx, session);
+}
+
 /// Route input through the capture session's own injection backend, when it has one.
 fn attach_input_backend(
     input_sink: &flux_input::InputSink,
@@ -1533,6 +1676,7 @@ struct CaptureStarter<'a> {
     capture: &'a dyn flux_capture::traits::ScreenCapture,
     cursor_sink: &'a flux_capture::traits::CursorUpdateSink,
     input_sink: &'a flux_input::InputSink,
+    clipboard: &'a ClipboardCtx,
     target_fps: u32,
 }
 
@@ -1550,6 +1694,7 @@ impl CaptureStarter<'_> {
             Some(self.cursor_sink.clone()),
         )?;
         attach_input_backend(self.input_sink, session.as_ref());
+        attach_clipboard(self.clipboard, session.as_ref());
         Ok(session)
     }
 
@@ -1855,6 +2000,7 @@ fn capture_loop(
     quality_rx: std::sync::mpsc::Receiver<(u8, u8)>,
     resolution_rx: std::sync::mpsc::Receiver<ModeRequest>,
     input_rx: std::sync::mpsc::Receiver<(std::time::Instant, flux_input::InputEvent)>,
+    clipboard: ClipboardCtx,
     target_fps: u32,
     default_fps_cap: u32,
     forced_backend: Option<flux_core::types::EncoderBackend>,
@@ -2030,6 +2176,7 @@ fn capture_loop(
         capture: capture.as_ref(),
         cursor_sink: &cursor_sink,
         input_sink: &input_sink,
+        clipboard: &clipboard,
         target_fps,
     };
     let mut session = match starter.start(&primary, primary.native_resolution) {
@@ -2893,12 +3040,56 @@ mod capture_restart_tests {
             height: 1,
         })
         .expect("input sink");
+        let clipboard = ClipboardCtx {
+            sink: flux_capture::traits::ClipboardSink::default(),
+            events: tokio::sync::broadcast::channel::<Arc<(u64, Vec<u8>)>>(4).0,
+            epoch: Instant::now(),
+            enabled: true,
+            max_bytes: 1024 * 1024,
+        };
         f(&CaptureStarter {
             capture,
             cursor_sink: &cursor_sink,
             input_sink: &input_sink,
+            clipboard: &clipboard,
             target_fps: 60,
         });
+    }
+
+    #[test]
+    fn clipboard_message_json_round_trips() {
+        let msg = ClipboardMessage {
+            mime: "text/plain;charset=utf-8".into(),
+            data: "héllo".into(),
+        };
+        let json = serde_json::to_vec(&msg).unwrap();
+        let parsed: ClipboardMessage = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn parse_clipboard_set_enforces_mime_and_size() {
+        let ok = parse_clipboard_set(
+            br#"{"mime":"text/plain;charset=utf-8","data":"clip"}"#,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(ok.data, "clip");
+
+        assert_eq!(
+            parse_clipboard_set(br#"{"mime":"image/png","data":"x"}"#, 1024 * 1024).unwrap_err(),
+            "unsupported clipboard MIME type"
+        );
+        assert!(parse_clipboard_set(b"not json", 1024 * 1024).is_err());
+
+        let big = format!(
+            r#"{{"mime":"text/plain;charset=utf-8","data":"{}"}}"#,
+            "x".repeat(2 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_clipboard_set(big.as_bytes(), 1024 * 1024).unwrap_err(),
+            "clipboard command exceeds size cap"
+        );
     }
 
     #[test]

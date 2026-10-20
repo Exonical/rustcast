@@ -8,7 +8,10 @@
 //! PipeWire node id; afterwards the thread forwards input commands received
 //! over a channel so the hot path never blocks on D-Bus.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -18,11 +21,13 @@ use flux_core::error::{FluxError, Result};
 use flux_core::types::{DesktopRect, Resolution};
 use flux_input::{InputBackend, mouse::MouseButton};
 use futures::StreamExt;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
 use crate::session::CursorMode;
+use crate::traits::{ClipboardBackend, ClipboardEvent};
 
 const RD_NAME: &str = "org.gnome.Mutter.RemoteDesktop";
 const RD_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
@@ -35,6 +40,51 @@ const DC_NAME: &str = "org.gnome.Mutter.DisplayConfig";
 const DC_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum clipboard payload the host reads or writes, matching the relay's
+/// default `max_bytes` policy.
+pub const CLIPBOARD_MAX_BYTES: usize = 1024 * 1024;
+
+/// Text MIME types negotiated with Mutter's RemoteDesktop clipboard, in
+/// preference order: `text/plain;charset=utf-8` is canonical for the wire,
+/// the rest are legacy X11 aliases a compositor may still advertise.
+pub const TEXT_MIMES: [&str; 5] = [
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
+
+/// Pick the best text MIME out of a `SelectionOwnerChanged` `mime-types` list.
+pub fn best_text_mime(mimes: &[String]) -> Option<&str> {
+    TEXT_MIMES
+        .iter()
+        .find(|m| mimes.iter().any(|have| have == *m))
+        .copied()
+}
+
+/// Extract `session-is-owner` / `mime-types` from a `SelectionOwnerChanged`
+/// body.
+pub fn owner_changed_params(body: &HashMap<String, OwnedValue>) -> (bool, Vec<String>) {
+    let is_owner = is_true(body.get("session-is-owner"));
+    // Mutter delivers `mime-types` as `(as)` — a structure whose single field
+    // is the string array.
+    let mime_value = body.get("mime-types").map(|v| &**v);
+    let arr_opt: Option<&Value<'_>> = match mime_value {
+        Some(v @ Value::Array(_)) => Some(v),
+        Some(Value::Structure(st)) => st.fields().first(),
+        _ => None,
+    };
+    let mimes: Vec<String> = match arr_opt {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| String::try_from(v.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    (is_owner, mimes)
+}
 
 /// Mutter `cursor-mode` option value: 0 hidden, 1 embedded, 2 metadata.
 pub fn cursor_mode_value(mode: CursorMode) -> u32 {
@@ -188,6 +238,7 @@ enum Cmd {
     Button { button: i32, down: bool },
     Axis { axis: u32, steps: i32 },
     Key { keycode: u32, down: bool },
+    SetClipboard { text: String },
     Shutdown,
 }
 
@@ -222,6 +273,7 @@ pub struct MutterSession {
     source: MutterSource,
     node_id: u32,
     tx: UnboundedSender<Cmd>,
+    clipboard_events: broadcast::Sender<ClipboardEvent>,
     size: Arc<StreamSize>,
     closed: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -235,11 +287,13 @@ impl MutterSession {
     pub fn start(source: MutterSource, cursor_mode: CursorMode, initial_size: Resolution) -> Result<Self> {
         let (tx, rx) = unbounded_channel::<Cmd>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u32, String)>>();
+        let (clipboard_events, _) = broadcast::channel::<ClipboardEvent>(16);
+        let thread_events = clipboard_events.clone();
         let closed = Arc::new(AtomicBool::new(false));
         let thread_closed = Arc::clone(&closed);
         let handle = std::thread::Builder::new()
             .name("flux-mutter".into())
-            .spawn(move || run_thread(source, cursor_mode, rx, ready_tx, thread_closed))
+            .spawn(move || run_thread(source, cursor_mode, rx, ready_tx, thread_closed, thread_events))
             .map_err(|e| FluxError::Capture(format!("failed to spawn Mutter thread: {e}")))?;
 
         match ready_rx.recv() {
@@ -255,6 +309,7 @@ impl MutterSession {
                     source,
                     node_id,
                     tx,
+                    clipboard_events,
                     size: Arc::new(StreamSize::new(initial_size)),
                     closed,
                     handle: Some(handle),
@@ -297,6 +352,37 @@ impl MutterSession {
             closed: Arc::clone(&self.closed),
             warned: AtomicBool::new(false),
         })
+    }
+
+    /// Clipboard backend using this session's RemoteDesktop clipboard
+    /// integration; `None` if the compositor rejected `EnableClipboard`.
+    pub fn clipboard_backend(&self) -> Arc<dyn ClipboardBackend> {
+        Arc::new(MutterClipboard {
+            tx: self.tx.clone(),
+            events: self.clipboard_events.clone(),
+            closed: Arc::clone(&self.closed),
+        })
+    }
+}
+
+struct MutterClipboard {
+    tx: UnboundedSender<Cmd>,
+    events: broadcast::Sender<ClipboardEvent>,
+    closed: Arc<AtomicBool>,
+}
+
+impl ClipboardBackend for MutterClipboard {
+    fn set_text(&self, text: String) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.tx
+            .send(Cmd::SetClipboard { text })
+            .map_err(|_| FluxError::Capture("Mutter session is gone".into()))
+    }
+
+    fn events(&self) -> broadcast::Receiver<ClipboardEvent> {
+        self.events.subscribe()
     }
 }
 
@@ -381,11 +467,15 @@ type ClosedStream = zbus::proxy::SignalStream<'static>;
 
 struct Handshake {
     conn: Connection,
+    rd_path: OwnedObjectPath,
     rd_session: Proxy<'static>,
     stream_path: OwnedObjectPath,
     node_id: u32,
     rd_closed: ClosedStream,
     sc_closed: ClosedStream,
+    owner_changed: ClosedStream,
+    transfers: ClosedStream,
+    clipboard_enabled: bool,
 }
 
 fn run_thread(
@@ -394,6 +484,7 @@ fn run_thread(
     rx: UnboundedReceiver<Cmd>,
     ready_tx: std::sync::mpsc::Sender<Result<(u32, String)>>,
     closed: Arc<AtomicBool>,
+    clipboard_events: broadcast::Sender<ClipboardEvent>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -402,14 +493,21 @@ fn run_thread(
             return;
         }
     };
-    runtime.block_on(async move {
+    // A LocalSet lets clipboard read/write handlers spawn `!Send` tasks that
+    // share the Rc<RefCell<ClipboardState>> without stalling input forwarding.
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async move {
         let Handshake {
             conn,
+            rd_path,
             rd_session,
             stream_path,
             node_id,
             mut rd_closed,
             mut sc_closed,
+            mut owner_changed,
+            mut transfers,
+            clipboard_enabled,
         } = match handshake(source, cursor_mode).await {
             Ok(v) => v,
             Err(e) => {
@@ -418,7 +516,21 @@ fn run_thread(
             }
         };
         let _ = ready_tx.send(Ok((node_id, stream_path.to_string())));
-        forward_commands(&rd_session, stream_path.as_str(), rx, &mut rd_closed, &mut sc_closed, &closed).await;
+        forward_commands(
+            &conn,
+            &rd_path,
+            &rd_session,
+            stream_path.as_str(),
+            rx,
+            &mut rd_closed,
+            &mut sc_closed,
+            &mut owner_changed,
+            &mut transfers,
+            clipboard_enabled,
+            &closed,
+            clipboard_events,
+        )
+        .await;
         if !closed.load(Ordering::Acquire)
             && let Err(e) = rd_session.call::<_, _, ()>("Stop", &()).await
         {
@@ -434,7 +546,7 @@ async fn handshake(source: MutterSource, cursor_mode: CursorMode) -> Result<Hand
 
     let rd = Proxy::new(&conn, RD_NAME, RD_PATH, RD_NAME).await.map_err(cap_err)?;
     let rd_path: OwnedObjectPath = rd.call("CreateSession", &()).await.map_err(cap_err)?;
-    let rd_session = Proxy::new(&conn, RD_NAME, rd_path, RD_SESSION_IFACE)
+    let rd_session = Proxy::new(&conn, RD_NAME, rd_path.clone(), RD_SESSION_IFACE)
         .await
         .map_err(cap_err)?;
     let session_id: String = rd_session.get_property("SessionId").await.map_err(cap_err)?;
@@ -459,8 +571,31 @@ async fn handshake(source: MutterSource, cursor_mode: CursorMode) -> Result<Hand
     let mut added = stream.receive_signal("PipeWireStreamAdded").await.map_err(cap_err)?;
     let rd_closed = rd_session.receive_signal("Closed").await.map_err(cap_err)?;
     let sc_closed = sc_session.receive_signal("Closed").await.map_err(cap_err)?;
+    let owner_changed = rd_session
+        .receive_signal("SelectionOwnerChanged")
+        .await
+        .map_err(cap_err)?;
+    let transfers = rd_session
+        .receive_signal("SelectionTransfer")
+        .await
+        .map_err(cap_err)?;
 
     rd_session.call::<_, _, ()>("Start", &()).await.map_err(cap_err)?;
+
+    // Clipboard is best-effort: text sync augments the session but must never
+    // keep capture from starting.
+    let mut enable_opts: HashMap<&str, Value<'_>> = HashMap::new();
+    enable_opts.insert("mime-types", Value::from(TEXT_MIMES.to_vec()));
+    let clipboard_enabled = match rd_session
+        .call::<_, _, ()>("EnableClipboard", &(enable_opts,))
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("Mutter EnableClipboard failed (clipboard sync off): {e}");
+            false
+        }
+    };
 
     let msg = tokio::time::timeout(STREAM_TIMEOUT, added.next())
         .await
@@ -473,11 +608,15 @@ async fn handshake(source: MutterSource, cursor_mode: CursorMode) -> Result<Hand
 
     Ok(Handshake {
         conn,
+        rd_path,
         rd_session,
         stream_path,
         node_id,
         rd_closed,
         sc_closed,
+        owner_changed,
+        transfers,
+        clipboard_enabled,
     })
 }
 
@@ -493,39 +632,238 @@ fn is_object_gone(error: &zbus::Error) -> bool {
     )
 }
 
+/// Clipboard state shared between the command loop and spawned read/write
+/// tasks (the mutter thread runs a current-thread runtime, so `Rc`/`RefCell`
+/// suffice).
+#[derive(Default)]
+struct ClipboardState {
+    /// Text announced via `SetSelection`, pending a `SelectionTransfer` write.
+    pending: Option<String>,
+    /// Last text seen in either direction; identical repeats are dropped so a
+    /// host announcing back what a client pasted does not echo.
+    last: Option<String>,
+}
+
+/// Read a `SelectionRead` fd to EOF, capped at `CLIPBOARD_MAX_BYTES`. The fd
+/// is non-blocking: poll for readability (owner writes after SelectionRead
+/// returns), with an overall 10 s timeout.
+#[cfg(target_os = "linux")]
+async fn read_clipboard_fd(file: std::fs::File) -> std::io::Result<Vec<u8>> {
+    let async_fd = tokio::io::unix::AsyncFd::new(file)?;
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while data.len() <= CLIPBOARD_MAX_BYTES {
+        let mut guard = tokio::time::timeout_at(deadline, async_fd.readable())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "clipboard read timed out")
+            })??;
+        match guard.try_io(|inner| inner.get_ref().read(&mut chunk)) {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => data.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => continue,
+        }
+    }
+    data.truncate(CLIPBOARD_MAX_BYTES);
+    Ok(data)
+}
+
+/// Read a `SelectionRead` fd to EOF, capped at `CLIPBOARD_MAX_BYTES`.
+#[cfg(test)]
+fn read_fd_capped(mut file: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while data.len() <= CLIPBOARD_MAX_BYTES {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+    }
+    data.truncate(CLIPBOARD_MAX_BYTES);
+    Ok(data)
+}
+
 async fn forward_commands(
+    conn: &Connection,
+    rd_path: &OwnedObjectPath,
     rd: &Proxy<'_>,
     stream_path: &str,
     mut rx: UnboundedReceiver<Cmd>,
     rd_closed: &mut ClosedStream,
     sc_closed: &mut ClosedStream,
+    owner_changed: &mut ClosedStream,
+    transfers: &mut ClosedStream,
+    clipboard_enabled: bool,
     closed: &AtomicBool,
+    clipboard_events: broadcast::Sender<ClipboardEvent>,
 ) {
+    let state = Rc::new(RefCell::new(ClipboardState::default()));
     loop {
-        let cmd = tokio::select! {
-            cmd = rx.recv() => match cmd {
-                Some(cmd) => cmd,
-                None => break,
-            },
-            _ = rd_closed.next() => {
-                mark_closed(closed, "RemoteDesktop session Closed signal");
-                return;
-            }
-            _ = sc_closed.next() => {
-                mark_closed(closed, "ScreenCast session Closed signal");
-                return;
-            }
+        enum Ev {
+            Cmd(Option<Cmd>),
+            OwnerChanged(Option<zbus::message::Message>),
+            Transfer(Option<zbus::message::Message>),
+            Closed(&'static str),
+        }
+        let ev = tokio::select! {
+            cmd = rx.recv() => Ev::Cmd(cmd),
+            msg = owner_changed.next() => Ev::OwnerChanged(msg),
+            msg = transfers.next() => Ev::Transfer(msg),
+            _ = rd_closed.next() => Ev::Closed("RemoteDesktop session Closed signal"),
+            _ = sc_closed.next() => Ev::Closed("ScreenCast session Closed signal"),
         };
-        let result = match cmd {
-            Cmd::Shutdown => break,
-            Cmd::Motion { dx, dy } => rd.call::<_, _, ()>("NotifyPointerMotionRelative", &(dx, dy)).await,
-            Cmd::Absolute { x, y } => {
+        let result = match ev {
+            Ev::Closed(reason) => {
+                mark_closed(closed, reason);
+                return;
+            }
+            Ev::Cmd(None) => break,
+            Ev::Cmd(Some(Cmd::Shutdown)) => break,
+            Ev::Cmd(Some(Cmd::Motion { dx, dy })) => rd
+                .call::<_, _, ()>("NotifyPointerMotionRelative", &(dx, dy))
+                .await,
+            Ev::Cmd(Some(Cmd::Absolute { x, y })) => {
                 rd.call::<_, _, ()>("NotifyPointerMotionAbsolute", &(stream_path, x, y))
                     .await
             }
-            Cmd::Button { button, down } => rd.call::<_, _, ()>("NotifyPointerButton", &(button, down)).await,
-            Cmd::Axis { axis, steps } => rd.call::<_, _, ()>("NotifyPointerAxisDiscrete", &(axis, steps)).await,
-            Cmd::Key { keycode, down } => rd.call::<_, _, ()>("NotifyKeyboardKeycode", &(keycode, down)).await,
+            Ev::Cmd(Some(Cmd::Button { button, down })) => {
+                rd.call::<_, _, ()>("NotifyPointerButton", &(button, down)).await
+            }
+            Ev::Cmd(Some(Cmd::Axis { axis, steps })) => {
+                rd.call::<_, _, ()>("NotifyPointerAxisDiscrete", &(axis, steps)).await
+            }
+            Ev::Cmd(Some(Cmd::Key { keycode, down })) => {
+                rd.call::<_, _, ()>("NotifyKeyboardKeycode", &(keycode, down)).await
+            }
+            Ev::Cmd(Some(Cmd::SetClipboard { text })) => {
+                if !clipboard_enabled {
+                    continue;
+                }
+                if text.len() > CLIPBOARD_MAX_BYTES {
+                    tracing::warn!("dropping oversized client clipboard ({} bytes)", text.len());
+                    continue;
+                }
+                {
+                    let mut s = state.borrow_mut();
+                    s.last = Some(text.clone());
+                    s.pending = Some(text);
+                }
+                let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+                opts.insert("mime-types", Value::from(TEXT_MIMES.to_vec()));
+                rd.call::<_, _, ()>("SetSelection", &(opts,)).await
+            }
+            Ev::OwnerChanged(msg) => {
+                let Some(msg) = msg else { continue };
+                if !clipboard_enabled || clipboard_events.receiver_count() == 0 {
+                    tracing::info!(
+                        "clipboard owner change skipped: enabled={clipboard_enabled} receivers={}",
+                        clipboard_events.receiver_count()
+                    );
+                    continue;
+                }
+                let body: HashMap<String, OwnedValue> = match msg.body().deserialize() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("bad SelectionOwnerChanged body: {e}");
+                        continue;
+                    }
+                };
+                let (is_owner, mimes) = owner_changed_params(&body);
+                // session-is-owner: the change is our own SetSelection echo.
+                tracing::info!("clipboard owner change: is_owner={is_owner} mimes={mimes:?}");
+                if is_owner {
+                    continue;
+                }
+                let Some(mime) = best_text_mime(&mimes).map(str::to_owned) else {
+                    continue;
+                };
+                let conn = conn.clone();
+                let rd_path = rd_path.clone();
+                let state = Rc::clone(&state);
+                let events = clipboard_events.clone();
+                tokio::task::spawn_local(async move {
+                    let rd = match Proxy::new(&conn, RD_NAME, rd_path, RD_SESSION_IFACE).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("clipboard read proxy failed: {e}");
+                            return;
+                        }
+                    };
+                    let fd: zbus::zvariant::OwnedFd =
+                        match rd.call("SelectionRead", &(mime.as_str(),)).await {
+                            Ok(fd) => fd,
+                            Err(e) => {
+                                tracing::warn!("SelectionRead failed: {e}");
+                                return;
+                            }
+                        };
+                    // The fd is a non-blocking pipe: data arrives only after
+                    // the clipboard owner answers the SelectionTransfer, so
+                    // poll for readability instead of reading once.
+                    let data = match read_clipboard_fd(std::fs::File::from(
+                        std::os::fd::OwnedFd::from(fd),
+                    ))
+                    .await
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!("clipboard read failed: {e}");
+                            return;
+                        }
+                    };
+                    let Ok(text) = String::from_utf8(data) else {
+                        tracing::warn!("clipboard data is not valid UTF-8; dropping");
+                        return;
+                    };
+                    {
+                        let mut s = state.borrow_mut();
+                        if s.last.as_deref() == Some(text.as_str()) {
+                            return;
+                        }
+                        s.last = Some(text.clone());
+                    }
+                    tracing::info!("clipboard read emitted {} bytes (mime {mime})", text.len());
+                    let _ = events.send(ClipboardEvent { mime, data: text });
+                });
+                continue;
+            }
+            Ev::Transfer(msg) => {
+                let Some(msg) = msg else { continue };
+                let (mime, serial): (String, u32) = match msg.body().deserialize() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("bad SelectionTransfer body: {e}");
+                        continue;
+                    }
+                };
+                if best_text_mime(&[mime.clone()]).is_none() {
+                    continue;
+                }
+                let pending = state.borrow().pending.clone();
+                let Some(text) = pending else { continue };
+                let conn = conn.clone();
+                let rd_path = rd_path.clone();
+                tokio::task::spawn_local(async move {
+                    let rd = match Proxy::new(&conn, RD_NAME, rd_path, RD_SESSION_IFACE).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("clipboard write proxy failed: {e}");
+                            return;
+                        }
+                    };
+                    let success = write_clipboard(&rd, &mime, serial, &text).await;
+                    if let Err(e) = rd
+                        .call::<_, _, ()>("SelectionWriteDone", &(serial, success))
+                        .await
+                    {
+                        tracing::warn!("SelectionWriteDone failed: {e}");
+                    }
+                });
+                continue;
+            }
         };
         if let Err(e) = result {
             if is_object_gone(&e) {
@@ -533,6 +871,34 @@ async fn forward_commands(
                 return;
             }
             tracing::warn!("Mutter input notify failed: {e}");
+        }
+    }
+}
+
+/// `SelectionWrite` → write bytes → `SelectionWriteDone(serial, ok)`.
+async fn write_clipboard(rd: &Proxy<'_>, _mime: &str, serial: u32, text: &str) -> bool {
+    let fd: zbus::zvariant::OwnedFd = match rd.call("SelectionWrite", &(serial,)).await {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!("SelectionWrite failed: {e}");
+            return false;
+        }
+    };
+    let text = text.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::from(std::os::fd::OwnedFd::from(fd));
+        file.write_all(text.as_bytes()).map(|_| file.flush())
+    })
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            tracing::warn!("clipboard fd write failed: {e}");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("clipboard write task failed: {e}");
+            false
         }
     }
 }
@@ -563,6 +929,49 @@ mod tests {
         input.key(30, true).unwrap();
         input.pointer_absolute(0.5, 0.5).unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn best_text_mime_prefers_canonical_order() {
+        assert_eq!(
+            best_text_mime(&["STRING".into(), "text/plain;charset=utf-8".into(), "text/plain".into()]),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(best_text_mime(&["image/png".into()]), None);
+        assert_eq!(best_text_mime(&[]), None);
+    }
+
+    #[test]
+    fn owner_changed_params_reads_flags_and_mimes() {
+        let mut body = HashMap::<String, OwnedValue>::new();
+        body.insert("session-is-owner".into(), OwnedValue::try_from(Value::from(false)).unwrap());
+        body.insert(
+            "mime-types".into(),
+            OwnedValue::try_from(Value::from(vec!["text/plain", "UTF8_STRING"])).unwrap(),
+        );
+        let (owner, mimes) = owner_changed_params(&body);
+        assert!(!owner);
+        assert_eq!(mimes, ["text/plain", "UTF8_STRING"]);
+
+        body.insert("session-is-owner".into(), OwnedValue::try_from(Value::from(true)).unwrap());
+        assert!(owner_changed_params(&body).0);
+        assert!(owner_changed_params(&HashMap::new()).1.is_empty());
+
+        // `(as)`-wrapped `mime-types`, as delivered by live Mutter signals.
+        body.insert(
+            "mime-types".into(),
+            OwnedValue::try_from(Value::from((vec!["text/plain"],))).unwrap(),
+        );
+        assert_eq!(owner_changed_params(&body).1, ["text/plain"]);
+    }
+
+    #[test]
+    fn read_fd_capped_truncates_at_limit() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let payload = vec![b'x'; CLIPBOARD_MAX_BYTES + 4096];
+        std::thread::spawn(move || writer.write_all(&payload).map(|_| writer.flush()));
+        let data = read_fd_capped(reader).unwrap();
+        assert_eq!(data.len(), CLIPBOARD_MAX_BYTES);
     }
 
     #[test]

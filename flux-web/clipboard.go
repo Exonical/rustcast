@@ -1,0 +1,244 @@
+package main
+
+// Clipboard stage 1: text-only clipboard sync between browser and host.
+//
+// Wire shapes:
+//   browser→relay control:  {"type":"clipboard","data":{"mime":..,"data":..}}
+//   relay→browser control:  same "clipboard" message, plus "clipboard-status"
+//                           {"direction","result","policy"} after each send
+//                           and on connect.
+//   relay→host command 0x07: [0x07][len u32 BE][JSON {"mime","data"}]
+//   host→relay frame 0x05:   [type][ts][len][JSON {"mime","data"}]
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+// clipWireMime is the only MIME type accepted in v1 (the host also advertises
+// legacy text aliases internally, but the wire normalizes to this).
+const clipWireMime = "text/plain;charset=utf-8"
+
+// clipboardPayload is the JSON body of clipboard frames/commands.
+type clipboardPayload struct {
+	Mime string `json:"mime"`
+	Data string `json:"data"`
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// clipboardRate limits host→relay clipboard events to limit per second.
+type clipboardRate struct {
+	mu          sync.Mutex
+	windowStart time.Time
+	count       int
+}
+
+const clipboardRateLimit = 10 // events per second per upstream
+
+func (r *clipboardRate) allow() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if now.Sub(r.windowStart) >= time.Second {
+		r.windowStart = now
+		r.count = 0
+	}
+	r.count++
+	return r.count <= clipboardRateLimit
+}
+
+// clipStatusMessage builds the `clipboard-status` control message the relay
+// sends after every client send and on session connect.
+func clipStatusMessage(direction, result, policy string) controlMessage {
+	return controlMessage{
+		Type: "clipboard-status",
+		Data: mustJSON(map[string]string{
+			"direction": direction,
+			"result":    result,
+			"policy":    policy,
+		}),
+	}
+}
+
+// clipboardPayloadMessage builds the `clipboard` control message sent to
+// viewers carrying host→client clipboard text.
+func clipboardPayloadMessage(msg clipboardPayload) controlMessage {
+	return controlMessage{
+		Type: "clipboard",
+		Data: mustJSON(msg),
+	}
+}
+
+func (s *Session) machineName() string {
+	if machine := s.getMachine(); machine != nil && machine.deps != nil && machine.deps.name != nil {
+		return machine.deps.name(machine.id)
+	}
+	return ""
+}
+
+func (s *Session) auditFields() (sessionID, userSub, userName, clientIP string) {
+	sessionID = s.id
+	if s.user != nil {
+		userSub = s.user.Sub
+		userName = s.user.Name
+		if userName == "" {
+			userName = s.user.Email
+		}
+	}
+	clientIP = s.clientIP
+	return
+}
+
+func (s *Session) auditClipboard(store *store, direction, mime string, data []byte, result string, capture bool) {
+	if store == nil {
+		return
+	}
+	sessionID, userSub, userName, clientIP := s.auditFields()
+	machine := s.getMachine()
+	machineID, machineName := "", ""
+	if machine != nil {
+		machineID = machine.id
+		machineName = s.machineName()
+	}
+	if err := store.insertAudit(auditEvent{
+		MachineID: machineID, MachineName: machineName,
+		SessionID: sessionID, UserSub: userSub, UserName: userName,
+		ClientIP: clientIP, Direction: direction,
+		Mime: mime, Data: data, Result: result,
+	}, capture); err != nil {
+		log.Printf("[clipboard] audit insert failed machine=%s: %v", machineID, err)
+	}
+	if machine != nil && machine.metrics != nil && machine.metrics.owner != nil {
+		machine.metrics.owner.clipboardEvents.WithLabelValues(machineID, direction, result).Inc()
+	}
+}
+
+// handleClipboard processes a viewer `{"type":"clipboard"}` control message:
+// validate, enforce per-machine policy, audit, forward 0x07 upstream, and
+// always answer with `clipboard-status`.
+func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
+	machine := s.getMachine()
+	if machine == nil {
+		return errors.New("no active machine session")
+	}
+	policy := defaultMachinePolicy()
+	if store != nil {
+		policy = store.getPolicy(machine.id)
+	}
+	status := func(result string) error {
+		return s.writeControl(clipStatusMessage(clipDirClientToHost, result, policy.Mode))
+	}
+
+	var msg clipboardPayload
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Mime != clipWireMime || !utf8.ValidString(msg.Data) {
+		s.auditClipboard(store, clipDirClientToHost, "", nil, clipResultInvalid, policy.CaptureContent)
+		return status(clipResultInvalid)
+	}
+	data := []byte(msg.Data)
+	if int64(len(data)) > policy.MaxBytes {
+		s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultTooLarge, policy.CaptureContent)
+		return status(clipResultTooLarge)
+	}
+	if !policy.allows(clipDirClientToHost) {
+		s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultBlocked, policy.CaptureContent)
+		return status(clipResultBlocked)
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return status(clipResultInvalid)
+	}
+	cmd := make([]byte, 5+len(payload))
+	cmd[0] = 0x07
+	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(payload)))
+	copy(cmd[5:], payload)
+	if !machine.send(cmd) {
+		log.Printf("[control] upstream command channel full, dropped clipboard set")
+	}
+	s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultOK, policy.CaptureContent)
+	return status(clipResultOK)
+}
+
+// handleClipboardFrame processes a host→relay 0x05 frame: rate-limit, parse,
+// enforce host_to_client policy, fan out to the machine's viewers as a
+// `clipboard` control message, and audit once per delivered viewer (one row
+// when there are no viewers or the event is rejected).
+func (u *machineUpstream) handleClipboardFrame(data []byte) {
+	if u.deps == nil || !u.clipRate.allow() {
+		return
+	}
+	store := u.deps.store
+	policy := defaultMachinePolicy()
+	if store != nil {
+		policy = store.getPolicy(u.id)
+	}
+	machineName := ""
+	if u.deps.name != nil {
+		machineName = u.deps.name(u.id)
+	}
+
+	// record counts the event once per upstream event and writes one audit
+	// row per listed viewer (or a single viewer-less row when empty).
+	record := func(direction, result, mime string, payload []byte, viewers []auditEvent) {
+		u.metrics.owner.clipboardEvents.WithLabelValues(u.id, direction, result).Inc()
+		if store == nil {
+			return
+		}
+		if len(viewers) == 0 {
+			viewers = []auditEvent{{}}
+		}
+		for _, base := range viewers {
+			ev := base
+			ev.MachineID, ev.MachineName = u.id, machineName
+			ev.Direction, ev.Mime, ev.Data, ev.Result = direction, mime, payload, result
+			if err := store.insertAudit(ev, policy.CaptureContent); err != nil {
+				log.Printf("[clipboard] audit insert failed machine=%s: %v", u.id, err)
+			}
+		}
+	}
+
+	var msg clipboardPayload
+	if err := json.Unmarshal(data, &msg); err != nil || msg.Mime == "" || !utf8.ValidString(msg.Data) {
+		record(clipDirHostToClient, clipResultInvalid, "", nil, nil)
+		return
+	}
+	payload := []byte(msg.Data)
+	result := clipResultOK
+	switch {
+	case int64(len(payload)) > policy.MaxBytes:
+		result = clipResultTooLarge
+	case !policy.allows(clipDirHostToClient):
+		result = clipResultBlocked
+	}
+	if result != clipResultOK {
+		record(clipDirHostToClient, result, msg.Mime, payload, nil)
+		return
+	}
+
+	viewers := u.deps.sessions.sessionsFor(u.id)
+	control := clipboardPayloadMessage(msg)
+	delivered := make([]auditEvent, 0, len(viewers))
+	for _, viewer := range viewers {
+		if err := viewer.sess.writeControl(control); err != nil {
+			log.Printf("[clipboard] forward to session %s failed: %v", viewer.info.ID, err)
+			continue
+		}
+		delivered = append(delivered, auditEvent{
+			SessionID: viewer.info.ID,
+			UserSub:   viewer.info.UserSub,
+			UserName:  viewer.info.User,
+			ClientIP:  viewer.info.ClientIP,
+		})
+	}
+	record(clipDirHostToClient, clipResultOK, msg.Mime, payload, delivered)
+}

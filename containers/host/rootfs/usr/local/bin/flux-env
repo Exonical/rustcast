@@ -10,6 +10,8 @@ get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
   echo "FLUX_RELAY_URL=$(get FLUX_RELAY_URL | grep . || echo http://127.0.0.1:8080)"
   echo "FLUX_ADVERTISE_HOST=$(get FLUX_ADVERTISE_HOST | grep . || echo 127.0.0.1)"
   echo "RUST_LOG=$(get RUST_LOG | grep . || echo info)"
+  token=$(get FLUX_RELAY_TOKEN || true)
+  if [ -n "$token" ]; then echo "FLUX_RELAY_TOKEN=$token"; fi
   api=$(get FLUX_CAPTURE_API || true)
   if [ -n "$api" ]; then echo "FLUX_CAPTURE_API=$api"; fi
 } > /etc/flux/env

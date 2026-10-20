@@ -47,6 +47,18 @@ func main() {
 	serveMetrics(os.Getenv("FLUX_METRICS_ADDR"), registry.metrics)
 	registry.seedStatic("default", "Configured Flux Server", frameServerAddr)
 
+	clipboardStore, err := openStore(storeDirFromEnv())
+	if err != nil {
+		log.Fatalf("open clipboard store: %v", err)
+	}
+	defer clipboardStore.Close()
+	clipboardStore.startRetentionPurge(context.Background(), auditRetentionDays())
+	registry.attachDeps(&relayDeps{
+		store:    clipboardStore,
+		sessions: sessions,
+		name:     registry.displayName,
+	})
+
 	certificates, err := newRelayCertificateManager(
 		os.Getenv("FLUX_TLS_CERT"),
 		os.Getenv("FLUX_TLS_KEY"),
@@ -55,7 +67,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("load WebTransport TLS certificate: %v", err)
 	}
-	wtServer := newWebTransportServer(registry, sessions, certificates)
+	authService, err := newAuthService(context.Background(), authConfigFromEnv())
+	if err != nil {
+		log.Fatalf("OIDC provider init: %v", err)
+	}
+	wtServer := newWebTransportServer(registry, sessions, certificates, authService, clipboardStore)
 	udpConn, err := listenWebTransportUDP()
 	if err != nil {
 		log.Fatalf("listen for WebTransport: %v", err)
@@ -70,7 +86,7 @@ func main() {
 	go certificates.runRotation(rotationCtx)
 
 	webAddr := ":8080"
-	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"))
+	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"), authService, clipboardStore)
 	httpHandler := http.Handler(r)
 	httpsAddr := strings.TrimSpace(os.Getenv("FLUX_HTTPS_ADDR"))
 	if httpsAddr == "" {
@@ -101,20 +117,38 @@ func newWebHandler(
 	sessions *sessionRegistry,
 	certificates *relayCertificateManager,
 	publicHost string,
+	authService *authService,
+	clipboardStore *store,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	r.Use(cors.Default())
-	registerMachineRoutes(r, registry)
-	registerSessionRoutes(r, sessions)
-	r.GET("/api/webtransport", func(c *gin.Context) {
+	authService.registerRoutes(r)
+	api := r.Group("/api", authService.requireUser())
+	admin := r.Group("/api", authService.requireUser(), authService.requireAdmin())
+	registerMachineRoutes(api, r.Group("/api", authService.requireMachineToken()), registry)
+	registerSessionRoutes(api, admin, sessions)
+	registerPolicyRoutes(admin, registry, authService)
+	api.GET("/webtransport", func(c *gin.Context) {
+		user := authService.userFrom(c)
 		c.JSON(http.StatusOK, gin.H{
 			"host":       publicHost,
 			"port":       webTransportPort,
 			"certHashes": certificates.certificateHashes(),
+			"ticket":     authService.issueTicket(user),
 		})
 	})
-	r.NoRoute(gin.WrapH(http.FileServer(http.Dir("./ui/out"))))
+	api.GET("/me", func(c *gin.Context) {
+		user := authService.userFrom(c)
+		c.JSON(http.StatusOK, gin.H{
+			"sub":          user.Sub,
+			"email":        user.Email,
+			"name":         user.Name,
+			"admin":        user.Admin,
+			"auth_enabled": authService.enabled,
+		})
+	})
+	r.NoRoute(gin.WrapH(authService.staticGuard(http.FileServer(http.Dir("./ui/out")))))
 	return r
 }
 

@@ -45,6 +45,8 @@ type machineUpstream struct {
 	idrStats      idrStats
 	metrics       *machineMetrics
 	connectedOnce atomic.Bool
+	deps          *relayDeps
+	clipRate      clipboardRate
 }
 
 const (
@@ -303,7 +305,7 @@ func nextFrame(ch <-chan frameMsg, current frameMsg, now time.Time) (frameMsg, b
 	return latestFrame(ch, current)
 }
 
-func newMachineUpstream(addr, id string, status func(string), metricChildren ...*machineMetrics) *machineUpstream {
+func newMachineUpstream(addr, id string, deps *relayDeps, status func(string), metricChildren ...*machineMetrics) *machineUpstream {
 	var metrics *machineMetrics
 	if len(metricChildren) > 0 {
 		metrics = metricChildren[0]
@@ -321,6 +323,7 @@ func newMachineUpstream(addr, id string, status func(string), metricChildren ...
 		status:      status,
 		idrGate:     newIDRRequestGate(time.Now),
 		metrics:     metrics,
+		deps:        deps,
 	}
 	u.idrStats.metrics = metrics
 	u.abr = &abrState{commandChan: u.commandChan, metrics: metrics}
@@ -352,7 +355,7 @@ func (u *machineUpstream) stop() {
 				frame.release()
 			default:
 				u.frameQueueMu.Unlock()
-				u.metrics.owner.deleteMachine(u.id)
+				u.metrics.owner.deleteUpstreamMachine(u.id)
 				return
 			}
 		}
@@ -663,6 +666,8 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			u.metrics.upstreamAudioPackets.Inc()
 			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
+		case 0x05:
+			u.handleClipboardFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -770,6 +775,8 @@ func (u *machineUpstream) connectQUIC() error {
 			u.metrics.upstreamAudioPackets.Inc()
 			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
+		case 0x05:
+			u.handleClipboardFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}

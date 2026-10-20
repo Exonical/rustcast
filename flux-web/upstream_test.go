@@ -102,7 +102,7 @@ func TestLatestFrameReleasesOnlyDiscardedPayloads(t *testing.T) {
 }
 
 func TestReadPayloadReturnsTruncatedVideoBuffer(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	frame, err := u.readPayload(bytes.NewReader([]byte{1, 2}), 0x01, 5)
 	if !errors.Is(err, io.ErrUnexpectedEOF) || frame.data != nil || u.frameBuffers.count != 1 {
 		t.Fatalf("readPayload = (%+v, %v), cached=%d", frame, err, u.frameBuffers.count)
@@ -120,7 +120,7 @@ func TestReadPayloadReturnsTruncatedVideoBuffer(t *testing.T) {
 }
 
 func TestReadFramesPoolsVideoButRetainsCursor(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	reader, writer := net.Pipe()
 	defer reader.Close()
 	go func() {
@@ -155,7 +155,7 @@ func TestReadFramesPoolsVideoButRetainsCursor(t *testing.T) {
 }
 
 func TestReadFramesDispatchesAudio(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	reader, writer := net.Pipe()
 	defer reader.Close()
 	payload := []byte{0, 0, 0, 7, 0xaa, 0xbb, 0xcc}
@@ -184,7 +184,7 @@ func TestReadFramesDispatchesAudio(t *testing.T) {
 }
 
 func TestSendAudioDropsOldest(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	u.audioChan = make(chan audioMsg, 2)
 	u.sendAudio(audioMsg{tsMicros: 1})
 	u.sendAudio(audioMsg{tsMicros: 2})
@@ -196,7 +196,7 @@ func TestSendAudioDropsOldest(t *testing.T) {
 }
 
 func TestQueueFrameReleasesEvictedAndStoppedFrames(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	u.frameChan = make(chan frameMsg, 1)
 	first := pooledFrame(&u.frameBuffers, pFrame(1))
 	second := pooledFrame(&u.frameBuffers, pFrame(2))
@@ -215,7 +215,7 @@ func TestQueueFrameReleasesEvictedAndStoppedFrames(t *testing.T) {
 }
 
 func TestConcurrentQueueAndStop(t *testing.T) {
-	u := newMachineUpstream("", "", func(string) {})
+	u := newMachineUpstream("", "", nil, func(string) {})
 	u.frameChan = make(chan frameMsg, 1)
 	var producers sync.WaitGroup
 	started := make(chan struct{}, 2)
@@ -345,7 +345,7 @@ func TestLatestFrameReportsDiscardedFrames(t *testing.T) {
 
 func TestGatedSkipRequestsRecoveryIDRThroughGate(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
-	u := newMachineUpstream("", "", nil)
+	u := newMachineUpstream("", "", nil, nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 	session := &Session{}
 	session.needsIDR.Store(true)
@@ -373,7 +373,7 @@ func TestGatedSkipRequestsRecoveryIDRThroughGate(t *testing.T) {
 }
 
 func TestGatedSkipDoesNotSkipIDR(t *testing.T) {
-	u := newMachineUpstream("", "", nil)
+	u := newMachineUpstream("", "", nil, nil)
 	session := &Session{}
 	session.needsIDR.Store(true)
 	if u.skipFrameUntilIDR(session, true) {
@@ -394,7 +394,7 @@ func idrFrame(ts uint64) frameMsg {
 
 func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
-	u := newMachineUpstream("", "", nil)
+	u := newMachineUpstream("", "", nil, nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 
 	for range 6 {
@@ -421,7 +421,7 @@ func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 
 func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
-	u := newMachineUpstream("", "", nil)
+	u := newMachineUpstream("", "", nil, nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 	session := &Session{}
 
@@ -441,7 +441,7 @@ func TestInitialIDRRequestBypassesGateOncePerSession(t *testing.T) {
 
 func TestIDRStatsSeparatesGrantedFromSuppressedByReason(t *testing.T) {
 	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
-	u := newMachineUpstream("", "", nil)
+	u := newMachineUpstream("", "", nil, nil)
 	u.idrGate = newIDRRequestGate(func() time.Time { return now })
 
 	u.requestIDR(idrReasonViewerRequest) // granted

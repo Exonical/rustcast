@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/base64"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,23 +19,24 @@ var errMachineInUse = &machineError{"machine already in use"}
 const machineExpiry = 15 * time.Second
 
 type machineInfo struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	DisplayName    string    `json:"display_name,omitempty"`
-	FrameEndpoint  string    `json:"frame_endpoint"`
-	OS             string    `json:"os,omitempty"`
-	GPUVendor      string    `json:"gpu_vendor,omitempty"`
-	EncoderBackend string    `json:"encoder_backend,omitempty"`
-	VirtualDisplay bool      `json:"virtual_display"`
-	Width          uint32    `json:"width,omitempty"`
-	Height         uint32    `json:"height,omitempty"`
-	TargetFPS      uint32    `json:"target_fps,omitempty"`
-	DefaultFPS     uint32    `json:"default_fps,omitempty"`
-	TargetBitrate  uint32    `json:"target_bitrate_kbps,omitempty"`
-	Viewers        int       `json:"viewers"`
-	LastSeen       time.Time `json:"last_seen"`
-	Status         string    `json:"status"`
-	UpstreamStatus string    `json:"upstream_status"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	DisplayName     string    `json:"display_name,omitempty"`
+	FrameEndpoint   string    `json:"frame_endpoint"`
+	OS              string    `json:"os,omitempty"`
+	GPUVendor       string    `json:"gpu_vendor,omitempty"`
+	EncoderBackend  string    `json:"encoder_backend,omitempty"`
+	VirtualDisplay  bool      `json:"virtual_display"`
+	Width           uint32    `json:"width,omitempty"`
+	Height          uint32    `json:"height,omitempty"`
+	TargetFPS       uint32    `json:"target_fps,omitempty"`
+	DefaultFPS      uint32    `json:"default_fps,omitempty"`
+	TargetBitrate   uint32    `json:"target_bitrate_kbps,omitempty"`
+	Viewers         int       `json:"viewers"`
+	ClipboardPolicy string    `json:"clipboard_policy"`
+	LastSeen        time.Time `json:"last_seen"`
+	Status          string    `json:"status"`
+	UpstreamStatus  string    `json:"upstream_status"`
 }
 
 type machineRegistration struct {
@@ -56,10 +61,27 @@ type machineRecord struct {
 	upstream *machineUpstream
 }
 
+// relayDeps carries the shared clipboard dependencies (policy/audit store and
+// the session registry for viewer fan-out) into lazily created upstreams.
+type relayDeps struct {
+	store    *store
+	sessions *sessionRegistry
+	name     func(machineID string) string
+}
+
 type machineRegistry struct {
 	mu       sync.Mutex
 	machines map[string]*machineRecord
 	metrics  *relayMetrics
+	deps     *relayDeps
+}
+
+// attachDeps wires clipboard persistence/fan-out dependencies; called once
+// from main (and from tests that exercise clipboard paths).
+func (r *machineRegistry) attachDeps(d *relayDeps) {
+	r.mu.Lock()
+	r.deps = d
+	r.mu.Unlock()
 }
 
 func newMachineRegistry() *machineRegistry {
@@ -161,6 +183,11 @@ func (r *machineRegistry) list() []machineInfo {
 		if m.upstream != nil {
 			info.Viewers = m.upstream.viewers
 		}
+		if r.deps != nil && r.deps.store != nil {
+			info.ClipboardPolicy = r.deps.store.getPolicy(info.ID).Mode
+		} else {
+			info.ClipboardPolicy = clipModeBoth
+		}
 		result = append(result, info)
 	}
 	r.mu.Unlock()
@@ -213,7 +240,7 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 	}
 	if m.upstream == nil {
 		machineMetrics := r.metrics.machine(m.ID)
-		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, func(status string) {
+		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, r.deps, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
 		}, machineMetrics)
 		if m.TargetBitrate != 0 {
@@ -273,19 +300,21 @@ type machineError struct{ message string }
 
 func (e *machineError) Error() string { return e.message }
 
-func registerMachineRoutes(r *gin.Engine, registry *machineRegistry) {
-	r.POST("/api/machines/register", func(c *gin.Context) {
+// registerMachineRoutes mounts viewer APIs under api (user-gated) and the
+// host-facing registration APIs under machines (bearer-token gated) so the
+// two auth schemes don't stack.
+func registerMachineRoutes(api, machines *gin.RouterGroup, registry *machineRegistry) {
+	machines.POST("/machines/register", func(c *gin.Context) {
 		var input machineRegistration
 		if err := c.ShouldBindJSON(&input); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid registration: " + err.Error()})
 			return
 		}
 		input.FrameEndpoint = rewriteFrameEndpoint(c, input.FrameEndpoint)
-		// These endpoints are intentionally unauthenticated in this PR.
 		m := registry.upsert(input, false)
 		c.JSON(http.StatusOK, m.machineInfo)
 	})
-	r.POST("/api/machines/:id/heartbeat", func(c *gin.Context) {
+	machines.POST("/machines/:id/heartbeat", func(c *gin.Context) {
 		var input machineRegistration
 		if err := c.ShouldBindJSON(&input); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid heartbeat: " + err.Error()})
@@ -299,16 +328,109 @@ func registerMachineRoutes(r *gin.Engine, registry *machineRegistry) {
 		m := registry.upsert(input, false)
 		c.JSON(http.StatusOK, m.machineInfo)
 	})
-	r.POST("/api/machines/:id/deregister", func(c *gin.Context) {
+	machines.POST("/machines/:id/deregister", func(c *gin.Context) {
 		if !registry.deregister(c.Param("id")) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "machine not found"})
 			return
 		}
 		c.Status(http.StatusNoContent)
 	})
-	r.GET("/api/machines", func(c *gin.Context) {
+	api.GET("/machines", func(c *gin.Context) {
 		c.JSON(http.StatusOK, registry.list())
 	})
+}
+
+// registerPolicyRoutes exposes the admin-only clipboard policy + audit API.
+// Every handler is a 503 when the store was never attached (misdeployment).
+func registerPolicyRoutes(admin *gin.RouterGroup, registry *machineRegistry, auth *authService) {
+	admin.GET("/machines/:id/policy", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "clipboard store unavailable"})
+			return
+		}
+		c.JSON(http.StatusOK, st.getPolicy(c.Param("id")))
+	})
+
+	admin.PUT("/machines/:id/policy", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "clipboard store unavailable"})
+			return
+		}
+		var p machinePolicy
+		if err := c.ShouldBindJSON(&p); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy body"})
+			return
+		}
+		updatedBy := "unknown"
+		if user := auth.userFrom(c); user != nil {
+			updatedBy = user.Sub
+			if user.Name != "" {
+				updatedBy = fmt.Sprintf("%s (%s)", user.Sub, user.Name)
+			}
+		}
+		if err := st.putPolicy(c.Param("id"), p, updatedBy); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, st.getPolicy(c.Param("id")))
+	})
+
+	admin.GET("/audit/clipboard", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "clipboard store unavailable"})
+			return
+		}
+		limit, _ := strconv.ParseInt(c.DefaultQuery("limit", "100"), 10, 64)
+		before, _ := strconv.ParseInt(c.Query("before"), 10, 64)
+		rows, err := st.listAudit(c.Query("machine"), limit, before)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, rows)
+	})
+
+	admin.GET("/audit/clipboard/:id", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "clipboard store unavailable"})
+			return
+		}
+		id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid audit id"})
+			return
+		}
+		row, content, err := st.getAuditContent(id)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "audit row not found"})
+			return
+		}
+		resp := gin.H{"row": row}
+		switch {
+		case len(content) == 0:
+			resp["content"] = nil
+		case utf8.Valid(content):
+			resp["content"] = string(content)
+			resp["encoding"] = "utf-8"
+		default:
+			resp["content"] = base64.StdEncoding.EncodeToString(content)
+			resp["encoding"] = "base64"
+		}
+		c.JSON(http.StatusOK, resp)
+	})
+}
+
+func (r *machineRegistry) depsStore() *store {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.deps == nil {
+		return nil
+	}
+	return r.deps.store
 }
 
 func rewriteFrameEndpoint(c *gin.Context, endpoint string) string {

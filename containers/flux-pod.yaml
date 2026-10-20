@@ -18,6 +18,22 @@ spec:
         # Host browsers use the published WebTransport UDP port at this address.
         - name: FLUX_WT_PUBLIC_HOST
           value: "127.0.0.1"
+        # OIDC login (Authentik runs in this pod; values injected by run.sh).
+        - name: FLUX_OIDC_ISSUER
+          value: "http://localhost:9000/application/o/flux/"
+        - name: FLUX_OIDC_CLIENT_ID
+          value: "flux-relay"
+        - name: FLUX_OIDC_CLIENT_SECRET
+          value: "%%FLUX_OIDC_CLIENT_SECRET%%"
+        - name: FLUX_SESSION_SECRET
+          value: "%%FLUX_SESSION_SECRET%%"
+        - name: FLUX_RELAY_TOKEN
+          value: "%%FLUX_RELAY_TOKEN%%"
+        - name: FLUX_DATA_DIR
+          value: "/var/lib/flux-relay"
+      volumeMounts:
+        - name: relay-data
+          mountPath: /var/lib/flux-relay
       ports:
         - containerPort: 8080
           hostPort: 8080
@@ -42,6 +58,8 @@ spec:
           value: "http://127.0.0.1:8080"
         - name: FLUX_ADVERTISE_HOST
           value: "127.0.0.1"
+        - name: FLUX_RELAY_TOKEN
+          value: "%%FLUX_RELAY_TOKEN%%"
         - name: RUST_LOG
           value: "info"
       volumeMounts:
@@ -49,6 +67,82 @@ spec:
           mountPath: /dev/dri/renderD128
         - name: dri-render-igpu
           mountPath: /dev/dri/renderD129
+    - name: authentik-postgres
+      image: docker.io/library/postgres:16-alpine
+      env:
+        - name: POSTGRES_USER
+          value: "authentik"
+        - name: POSTGRES_DB
+          value: "authentik"
+        - name: POSTGRES_PASSWORD
+          value: "%%PG_PASS%%"
+      volumeMounts:
+        - name: authentik-postgres
+          mountPath: /var/lib/postgresql/data
+    - name: authentik-redis
+      image: docker.io/library/redis:7-alpine
+      command: ["redis-server", "--save", "", "--appendonly", "no"]
+    - name: authentik-server
+      image: ghcr.io/goauthentik/server:2025.12.6
+      args: ["server"]
+      env:
+        - name: AUTHENTIK_SECRET_KEY
+          value: "%%AUTHENTIK_SECRET_KEY%%"
+        - name: AUTHENTIK_POSTGRESQL__HOST
+          value: "127.0.0.1"
+        - name: AUTHENTIK_POSTGRESQL__USER
+          value: "authentik"
+        - name: AUTHENTIK_POSTGRESQL__NAME
+          value: "authentik"
+        - name: AUTHENTIK_POSTGRESQL__PASSWORD
+          value: "%%PG_PASS%%"
+        - name: AUTHENTIK_REDIS__HOST
+          value: "127.0.0.1"
+        - name: AUTHENTIK_LISTEN__HTTP
+          value: "0.0.0.0:9000"
+        - name: AUTHENTIK_BOOTSTRAP_PASSWORD
+          value: "%%AUTHENTIK_BOOTSTRAP_PASSWORD%%"
+        - name: AUTHENTIK_BOOTSTRAP_TOKEN
+          value: "%%AUTHENTIK_BOOTSTRAP_TOKEN%%"
+        - name: AUTHENTIK_BOOTSTRAP_EMAIL
+          value: "akadmin@localhost"
+        # Consumed by the flux blueprint via !Env.
+        - name: FLUX_OIDC_CLIENT_SECRET
+          value: "%%FLUX_OIDC_CLIENT_SECRET%%"
+      ports:
+        - containerPort: 9000
+          hostPort: 9000
+          protocol: TCP
+      volumeMounts:
+        - name: authentik-media
+          mountPath: /media
+        - name: authentik-blueprints
+          mountPath: /blueprints/custom
+          readOnly: true
+    - name: authentik-worker
+      image: ghcr.io/goauthentik/server:2025.12.6
+      args: ["worker"]
+      env:
+        - name: AUTHENTIK_SECRET_KEY
+          value: "%%AUTHENTIK_SECRET_KEY%%"
+        - name: AUTHENTIK_POSTGRESQL__HOST
+          value: "127.0.0.1"
+        - name: AUTHENTIK_POSTGRESQL__USER
+          value: "authentik"
+        - name: AUTHENTIK_POSTGRESQL__NAME
+          value: "authentik"
+        - name: AUTHENTIK_POSTGRESQL__PASSWORD
+          value: "%%PG_PASS%%"
+        - name: AUTHENTIK_REDIS__HOST
+          value: "127.0.0.1"
+        - name: FLUX_OIDC_CLIENT_SECRET
+          value: "%%FLUX_OIDC_CLIENT_SECRET%%"
+      volumeMounts:
+        - name: authentik-media
+          mountPath: /media
+        - name: authentik-blueprints
+          mountPath: /blueprints/custom
+          readOnly: true
   volumes:
     - name: dri-render-dgpu
       hostPath:
@@ -58,3 +152,16 @@ spec:
       hostPath:
         path: /dev/dri/renderD129
         type: CharDevice
+    - name: authentik-postgres
+      persistentVolumeClaim:
+        claimName: flux-authentik-postgres
+    - name: authentik-media
+      persistentVolumeClaim:
+        claimName: flux-authentik-media
+    - name: relay-data
+      persistentVolumeClaim:
+        claimName: flux-relay-data
+    - name: authentik-blueprints
+      hostPath:
+        path: "%%BLUEPRINT_DIR%%"
+        type: Directory

@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
+import { useAuth } from "@/lib/auth";
+import { logout } from "@/lib/api";
 
 function Brand() {
   return (
@@ -27,9 +29,11 @@ export function AppShell({ children, relayOnline, activeSessions }: {
   activeSessions: number;
 }) {
   const pathname = usePathname();
+  const { me } = useAuth();
   const nav = [
     { href: "/", label: "Machines", icon: "▦" },
     { href: "/sessions/", label: "Sessions", icon: "◷", count: activeSessions },
+    ...(me?.admin ? [{ href: "/audit/", label: "Audit", icon: "⧉" }] : []),
   ];
   return (
     <div className="min-h-screen bg-[#090a0d] text-zinc-100">
@@ -49,12 +53,27 @@ export function AppShell({ children, relayOnline, activeSessions }: {
             );
           })}
         </nav>
-        <div className="mt-auto rounded-2xl border border-white/[0.06] bg-white/[0.025] p-3.5">
-          <div className="flex items-center gap-2">
-            <span className={`h-2 w-2 rounded-full ${relayOnline ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,.7)]" : "bg-red-400"}`} />
-            <span className="text-xs font-medium text-zinc-300">Relay {relayOnline ? "connected" : "unreachable"}</span>
+        <div className="mt-auto space-y-2">
+          {me?.auth_enabled === false && (
+            <p className="rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-2.5 py-1.5 text-center text-[10px] font-medium text-amber-200">auth disabled</p>
+          )}
+          <div className="rounded-2xl border border-white/[0.06] bg-white/[0.025] p-3.5">
+            {me && (
+              <div className="mb-3 flex items-center justify-between gap-2 border-b border-white/[0.06] pb-3">
+                <span className="truncate text-xs font-medium text-zinc-200" title={me.email || me.sub}>{me.name || me.email || me.sub}</span>
+                {me.auth_enabled !== false && (
+                  <button onClick={() => void logout()} className="shrink-0 rounded-md px-2 py-1 text-[10px] font-medium text-zinc-500 hover:bg-white/[0.06] hover:text-zinc-200">
+                    Sign out
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <span className={`h-2 w-2 rounded-full ${relayOnline ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,.7)]" : "bg-red-400"}`} />
+              <span className="text-xs font-medium text-zinc-300">Relay {relayOnline ? "connected" : "unreachable"}</span>
+            </div>
+            <p className="mt-2 text-[10px] leading-4 text-zinc-600">Self-hosted remote desktop</p>
           </div>
-          <p className="mt-2 text-[10px] leading-4 text-zinc-600">Self-hosted remote desktop</p>
         </div>
       </aside>
       <div className="min-h-screen lg:pl-[248px]">

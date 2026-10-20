@@ -14,8 +14,8 @@ import (
 func TestSessionRegistryListOrderAndRemove(t *testing.T) {
 	registry := newSessionRegistry()
 	start := time.Now()
-	registry.add(sessionInfo{ID: "later", StartedAt: start.Add(time.Second)}, nil)
-	registry.add(sessionInfo{ID: "earlier", StartedAt: start}, nil)
+	registry.add(sessionInfo{ID: "later", StartedAt: start.Add(time.Second)}, nil, nil)
+	registry.add(sessionInfo{ID: "earlier", StartedAt: start}, nil, nil)
 
 	listed := registry.list()
 	if len(listed) != 2 || listed[0].ID != "earlier" || listed[1].ID != "later" {
@@ -31,7 +31,7 @@ func TestSessionRegistryListOrderAndRemove(t *testing.T) {
 func TestSessionRegistryDisconnectCallsEndOnce(t *testing.T) {
 	registry := newSessionRegistry()
 	var calls atomic.Int32
-	registry.add(sessionInfo{ID: "session"}, func(reason string) {
+	registry.add(sessionInfo{ID: "session"}, nil, func(reason string) {
 		if reason != "disconnected by operator" {
 			t.Errorf("disconnect reason = %q", reason)
 		}
@@ -62,8 +62,8 @@ func TestSessionRoutesListAndDisconnect(t *testing.T) {
 		StartedAt:   time.Unix(1, 0).UTC(),
 		Width:       1280,
 		Height:      720,
-	}, func(string) { endCalls.Add(1) })
-	registerSessionRoutes(router, registry)
+	}, nil, func(string) { endCalls.Add(1) })
+	registerSessionRoutes(router.Group("/api"), router.Group("/api"), registry)
 
 	listResponse := httptest.NewRecorder()
 	router.ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))

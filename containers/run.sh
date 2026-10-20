@@ -16,6 +16,27 @@ if [ -z "$public_host" ] && podman machine inspect >/dev/null 2>&1; then
   public_host="$(podman machine ssh "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null | tr -d '\r\n' || true)"
 fi
 
+# Authentik/OIDC secrets live outside git; generate them once per checkout.
+env_file="$here/.env.authentik"
+if [ ! -f "$env_file" ]; then
+  gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
+  {
+    echo "AUTHENTIK_SECRET_KEY=$(gen_secret)"
+    echo "PG_PASS=$(gen_secret)"
+    echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$(gen_secret)"
+    echo "AUTHENTIK_BOOTSTRAP_TOKEN=$(gen_secret)"
+    echo "FLUX_OIDC_CLIENT_SECRET=$(gen_secret)"
+    echo "FLUX_SESSION_SECRET=$(gen_secret)"
+    echo "FLUX_RELAY_TOKEN=$(gen_secret)"
+  } > "$env_file"
+  chmod 600 "$env_file"
+  echo "Generated $env_file (akadmin password, OIDC secrets; gitignored)."
+fi
+set -a
+# shellcheck disable=SC1090
+. "$env_file"
+set +a
+
 pod_yaml="$here/flux-pod.yaml"
 cert_dir=""
 if command -v mkcert >/dev/null 2>&1; then
@@ -81,6 +102,19 @@ fi
 if [ -n "$public_host" ]; then
   echo "WebTransport public host: $public_host"
 fi
+
+templated="$(mktemp --suffix=.yaml)"
+sed \
+  -e "s|%%AUTHENTIK_SECRET_KEY%%|$AUTHENTIK_SECRET_KEY|g" \
+  -e "s|%%PG_PASS%%|$PG_PASS|g" \
+  -e "s|%%AUTHENTIK_BOOTSTRAP_PASSWORD%%|$AUTHENTIK_BOOTSTRAP_PASSWORD|g" \
+  -e "s|%%AUTHENTIK_BOOTSTRAP_TOKEN%%|$AUTHENTIK_BOOTSTRAP_TOKEN|g" \
+  -e "s|%%FLUX_OIDC_CLIENT_SECRET%%|$FLUX_OIDC_CLIENT_SECRET|g" \
+  -e "s|%%FLUX_SESSION_SECRET%%|$FLUX_SESSION_SECRET|g" \
+  -e "s|%%FLUX_RELAY_TOKEN%%|$FLUX_RELAY_TOKEN|g" \
+  -e "s|%%BLUEPRINT_DIR%%|$here/authentik/blueprints|g" \
+  "$pod_yaml" > "$templated"
+pod_yaml="$templated"
 
 podman kube down "$here/flux-pod.yaml" >/dev/null 2>&1 || true
 podman kube play "$pod_yaml"

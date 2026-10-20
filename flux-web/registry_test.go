@@ -113,7 +113,7 @@ func TestMachineRegistryListIncludesViewerCount(t *testing.T) {
 func TestHeartbeatRejectsPathIDMismatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	registerMachineRoutes(r, newMachineRegistry())
+	registerMachineRoutes(r.Group("/api"), r.Group("/api", passthroughAuth), newMachineRegistry())
 	body, _ := json.Marshal(testRegistration("body-id"))
 	request := httptest.NewRequest(http.MethodPost, "/api/machines/path-id/heartbeat", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")

@@ -178,6 +178,7 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
+    clipboard: crate::ClipboardCtx,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -199,11 +200,15 @@ pub async fn serve(
 
         let rx = h264_tx.subscribe();
         let audio_rx = audio_tx.subscribe();
+        let clipboard_rx = clipboard.events.subscribe();
+        let clipboard = clipboard.clone();
         let cursor_rx = cursor_rx.clone();
         tokio::spawn(handle_connection(
             connection,
             rx,
             audio_rx,
+            clipboard_rx,
+            clipboard,
             cursor_rx,
             idr_tx.clone(),
             bitrate_tx.clone(),
@@ -220,6 +225,8 @@ async fn handle_connection(
     connection: quinn::Connection,
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut audio_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
+    mut clipboard_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
+    clipboard: crate::ClipboardCtx,
     mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
@@ -250,6 +257,7 @@ async fn handle_connection(
             let quality_tx = quality_tx.clone();
             let resolution_tx = resolution_tx.clone();
             let input_tx = input_tx.clone();
+            let clipboard = clipboard.clone();
             let privacy_connection = privacy_connection.clone();
             tokio::spawn(read_commands(
                 recv,
@@ -258,6 +266,7 @@ async fn handle_connection(
                 quality_tx,
                 resolution_tx,
                 input_tx,
+                clipboard,
                 privacy_connection,
             ));
         }
@@ -376,6 +385,16 @@ async fn handle_connection(
                     Err(_) => break,
                 };
                 if !send_message(&connection, 0x04, packet.0, packet.1.clone()).await {
+                    break;
+                }
+            }
+            result = clipboard_rx.recv() => {
+                let event = match result {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                if !send_message(&connection, 0x05, event.0, event.1.clone()).await {
                     break;
                 }
             }
@@ -570,6 +589,7 @@ async fn read_commands(
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
     resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
     input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
+    clipboard: crate::ClipboardCtx,
     privacy_connection: Option<PrivacyConnection>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -635,6 +655,34 @@ async fn read_commands(
                     return;
                 }
                 let _ = quality_tx.send((levels[0], levels[1]));
+            }
+            0x07 => {
+                // Clipboard set: [len u32][JSON {"mime","data"}]
+                let mut len_buf = [0u8; 4];
+                if recv.read_exact(&mut len_buf).await.is_err() {
+                    return;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                if len > clipboard.max_bytes.saturating_add(4096) {
+                    tracing::warn!("QUIC clipboard command too large: {} bytes", len);
+                    return;
+                }
+                let mut payload = vec![0u8; len];
+                if recv.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                if clipboard.enabled {
+                    match crate::parse_clipboard_set(&payload, clipboard.max_bytes) {
+                        Ok(msg) => {
+                            if let Err(e) = clipboard.sink.set_text(msg.data) {
+                                tracing::warn!("QUIC clipboard set failed: {}", e);
+                            }
+                        }
+                        Err(reason) => {
+                            tracing::warn!("Rejected QUIC clipboard: {}", reason);
+                        }
+                    }
+                }
             }
             0x06 => {
                 let mut dimensions = [0u8; 4];

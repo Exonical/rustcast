@@ -26,6 +26,10 @@ pub struct FluxConfig {
     /// Input forwarding settings.
     pub input: InputConfig,
 
+    /// Clipboard synchronization settings.
+    #[serde(default)]
+    pub clipboard: ClipboardConfig,
+
     /// Security / crypto settings.
     pub security: SecurityConfig,
 
@@ -62,6 +66,7 @@ impl Default for FluxConfig {
             video: VideoConfig::default(),
             audio: AudioConfig::default(),
             input: InputConfig::default(),
+            clipboard: ClipboardConfig::default(),
             security: SecurityConfig::default(),
             relay: RelayConfig::default(),
         }
@@ -78,6 +83,11 @@ pub struct RelayConfig {
     /// relay replaces loopback or unspecified hosts with the sender's source IP.
     #[serde(default)]
     pub advertise_host: Option<String>,
+
+    /// Optional bearer token sent with registration/heartbeat requests.
+    /// Overridden by the FLUX_RELAY_TOKEN environment variable.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +288,34 @@ impl Default for AudioConfig {
             bitrate_kbps: 128,
             rtp_port: 48000,
             enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    /// Enable Mutter RemoteDesktop clipboard sync.
+    #[serde(default = "default_clipboard_enabled")]
+    pub enabled: bool,
+
+    /// Maximum clipboard payload in bytes.
+    #[serde(default = "default_clipboard_max_bytes")]
+    pub max_bytes: usize,
+}
+
+fn default_clipboard_enabled() -> bool {
+    true
+}
+
+fn default_clipboard_max_bytes() -> usize {
+    1024 * 1024
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_clipboard_enabled(),
+            max_bytes: default_clipboard_max_bytes(),
         }
     }
 }

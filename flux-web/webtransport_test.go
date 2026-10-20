@@ -96,7 +96,7 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	registry := newMachineRegistry()
 	sessions := newSessionRegistry()
 	registry.seedStatic("default", "test", "127.0.0.1:0")
-	upstream := newMachineUpstream("", "default", func(string) {})
+	upstream := newMachineUpstream("", "default", nil, func(string) {})
 	registry.mu.Lock()
 	registry.machines["default"].upstream = upstream
 	registry.mu.Unlock()
@@ -107,7 +107,7 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -160,6 +160,7 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if connected.Type != "session" {
 		t.Fatalf("first control message type = %q, want session", connected.Type)
 	}
+	expectClipboardStatus(t, control)
 	var sessionID struct {
 		ID string `json:"id"`
 	}
@@ -338,7 +339,7 @@ func TestLoopbackWebTransportAudioStream(t *testing.T) {
 	registry := newMachineRegistry()
 	sessions := newSessionRegistry()
 	registry.seedStatic("default", "test", "127.0.0.1:0")
-	upstream := newMachineUpstream("", "default", func(string) {})
+	upstream := newMachineUpstream("", "default", nil, func(string) {})
 	registry.mu.Lock()
 	registry.machines["default"].upstream = upstream
 	registry.mu.Unlock()
@@ -349,7 +350,7 @@ func TestLoopbackWebTransportAudioStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -395,6 +396,7 @@ func TestLoopbackWebTransportAudioStream(t *testing.T) {
 	if connected.Type != "session" {
 		t.Fatalf("first control message type = %q, want session", connected.Type)
 	}
+	expectClipboardStatus(t, control)
 	if pong := readTestControlMessage(t, control); pong.Type != "latency-pong" {
 		t.Fatalf("second control message type = %q, want latency-pong", pong.Type)
 	}
@@ -451,7 +453,7 @@ func TestLoopbackWebTransportClientCloseRemovesSession(t *testing.T) {
 	registry := newMachineRegistry()
 	sessions := newSessionRegistry()
 	registry.seedStatic("default", "test", "127.0.0.1:0")
-	upstream := newMachineUpstream("", "default", func(string) {})
+	upstream := newMachineUpstream("", "default", nil, func(string) {})
 	registry.mu.Lock()
 	registry.machines["default"].upstream = upstream
 	registry.mu.Unlock()
@@ -462,7 +464,7 @@ func TestLoopbackWebTransportClientCloseRemovesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -547,6 +549,14 @@ func writeTestControlMessage(t *testing.T, stream io.Writer, message controlMess
 	copy(record[4:], payload)
 	if _, err := stream.Write(record); err != nil {
 		t.Fatalf("write control message: %v", err)
+	}
+}
+
+func expectClipboardStatus(t *testing.T, stream io.Reader) {
+	t.Helper()
+	status := readTestControlMessage(t, stream)
+	if status.Type != "clipboard-status" {
+		t.Fatalf("post-session control message type = %q, want clipboard-status", status.Type)
 	}
 }
 

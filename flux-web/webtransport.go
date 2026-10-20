@@ -39,6 +39,11 @@ type Session struct {
 	control   *webtransport.Stream
 	quicConn  *quic.Conn
 	id        string
+	user      *identity
+	clientIP  string
+	store     *store
+	// writeFn overrides writeControl in tests; nil uses the real stream.
+	writeFn func(controlMessage) error
 
 	machine           *machineUpstream
 	metrics           *machineMetrics
@@ -65,7 +70,7 @@ type controlMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
-func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager) *webtransport.Server {
+func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, auth *authService, store *store) *webtransport.Server {
 	mux := http.NewServeMux()
 	server := &webtransport.Server{
 		H3: &http3.Server{
@@ -84,13 +89,27 @@ func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry,
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
 	mux.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
-		handleWebTransport(w, r, server, registry, sessions)
+		handleWebTransport(w, r, server, registry, sessions, auth, store)
 	})
 	return server
 }
 
-func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry) {
+func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry, auth *authService, store *store) {
+	// WebTransport doesn't carry the session cookie; redeem a one-time
+	// ticket issued by /api/webtransport when auth is enabled.
 	machineID := r.URL.Query().Get("machine")
+	if machineID == "" {
+		machineID = "default"
+	}
+	var user *identity
+	if auth != nil && auth.enabled {
+		user = auth.consumeTicket(r.URL.Query().Get("ticket"))
+		if user == nil {
+			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
+			http.Error(w, "unauthenticated", http.StatusUnauthorized)
+			return
+		}
+	}
 	if machineID == "" {
 		machineID = "default"
 	}
@@ -114,6 +133,8 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		transport:   transport,
 		control:     control,
 		sessionDone: make(chan struct{}),
+		user:        user,
+		store:       store,
 	}
 	session.audioEnabled.Store(true)
 	if conn, ok := r.Context().Value(quicConnContextKey{}).(*quic.Conn); ok {
@@ -189,7 +210,18 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	if userAgent == "" {
 		userAgent = r.URL.Query().Get("user_agent")
 	}
+	var userName, userSub string
+	if user != nil {
+		userSub = user.Sub
+		userName = user.Name
+		if userName == "" {
+			userName = user.Email
+		}
+	}
+	session.clientIP = clientIP
 	sessions.add(sessionInfo{
+		User:        userName,
+		UserSub:     userSub,
 		ID:          id,
 		MachineID:   machineID,
 		MachineName: registry.displayName(machineID),
@@ -198,7 +230,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		StartedAt:   time.Now(),
 		Width:       width,
 		Height:      height,
-	}, func(reason string) {
+	}, session, func(reason string) {
 		if err := session.writeControl(controlMessage{
 			Type: "session-ended",
 			Data: mustJSON(map[string]string{"reason": reason}),
@@ -223,7 +255,16 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		session.fail("failed to initialize session")
 		return
 	}
-	log.Printf("[webtransport] session started id=%s machine=%s client=%s mode=%dx%d", id, machineID, clientIP, width, height)
+	// Tell the viewer the current clipboard policy up front (empty direction,
+	// ok result) so the UI can gate its clipboard UI without a first send.
+	policyMode := clipModeBoth
+	if store != nil {
+		policyMode = store.getPolicy(machineID).Mode
+	}
+	if err := session.writeControl(clipStatusMessage("", clipResultOK, policyMode)); err != nil {
+		log.Printf("[webtransport] clipboard-status for session %s failed: %v", id, err)
+	}
+	log.Printf("[webtransport] session started id=%s machine=%s client=%s user=%q mode=%dx%d", id, machineID, clientIP, userName, width, height)
 	go forwardCursorUpdates(session)
 	go forwardAudio(session)
 	go session.runBandwidthEstimator()
@@ -311,6 +352,9 @@ func mustJSON(value any) json.RawMessage {
 }
 
 func (s *Session) writeControl(message controlMessage) error {
+	if s.writeFn != nil {
+		return s.writeFn(message)
+	}
 	payload, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -449,6 +493,8 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 		}
 		s.audioEnabled.Store(audio.Enabled)
 		log.Printf("[control] audio enabled=%v", audio.Enabled)
+	case "clipboard":
+		return s.handleClipboard(message.Data, s.store)
 	case "latency-ping":
 		if err := s.writeControl(controlMessage{Type: "latency-pong", Data: message.Data}); err != nil {
 			return err

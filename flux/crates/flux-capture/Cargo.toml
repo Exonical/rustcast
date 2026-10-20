@@ -11,7 +11,7 @@ flux-input = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 

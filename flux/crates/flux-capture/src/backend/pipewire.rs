@@ -349,6 +349,10 @@ mod real {
             Some(self.mutter.input_backend())
         }
 
+        fn clipboard_backend(&self) -> Option<std::sync::Arc<dyn crate::traits::ClipboardBackend>> {
+            Some(self.mutter.clipboard_backend())
+        }
+
         fn recycle_frame(&mut self, frame: CapturedFrame) {
             self.inner.recycle_frame(frame);
         }

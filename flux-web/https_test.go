@@ -24,7 +24,7 @@ func TestWebHTTPSApiUsesTrustedRelayCertificate(t *testing.T) {
 		t.Fatal("relay certificate is missing")
 	}
 
-	handler := newWebHandler(newMachineRegistry(), newSessionRegistry(), certificates, "localhost")
+	handler := newWebHandler(newMachineRegistry(), newSessionRegistry(), certificates, "localhost", disabledAuth(t), nil)
 	server := httptest.NewUnstartedServer(withAltSvc(handler))
 	server.TLS = webHTTPSTLSConfig(certificates)
 	server.TLS.Certificates = []tls.Certificate{*certificate}
@@ -98,7 +98,7 @@ func TestHTTPPageRequestsRedirectToHTTPS(t *testing.T) {
 func TestHTTPMachineAPIRequestsAreNotRedirected(t *testing.T) {
 	router := gin.New()
 	registry := newMachineRegistry()
-	registerMachineRoutes(router, registry)
+	registerMachineRoutes(router.Group("/api"), router.Group("/api", passthroughAuth), registry)
 	handler := withHTTPSRedirect(router, ":8443")
 	body, err := json.Marshal(testRegistration("machine-1"))
 	if err != nil {

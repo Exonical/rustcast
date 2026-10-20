@@ -7,6 +7,7 @@ import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget, isLocalKeyboardTarget } from "@/lib/local-controls";
 import { modifierFlags } from "@/lib/protocol";
 import { AudioPlayer } from "@/lib/audio-player";
+import { ClipboardDedup, PendingRemoteClipboard, isPasteChord, policyAllowsClientSend, withinSizeCap } from "@/lib/clipboard";
 import type { Machine } from "@/lib/api";
 import { buildConnectUrl } from "@/lib/launch";
 import { Toolbar } from "@/components/stream/Toolbar";
@@ -127,6 +128,15 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     boxWidth: number;
     boxHeight: number;
   } | null>(null);
+  const [clipboardSupported] = useState(() => typeof navigator !== "undefined" && !!navigator.clipboard);
+  const [clipboardPolicy, setClipboardPolicy] = useState("both");
+  const [clipboardToast, setClipboardToast] = useState<string | null>(null);
+  const [clipboardFlash, setClipboardFlash] = useState(false);
+  const clipboardPolicyRef = useRef("both");
+  const clipboardDedup = useRef(new ClipboardDedup());
+  const pendingRemoteClipboard = useRef(new PendingRemoteClipboard());
+  const clipboardToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clipboardFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heldKeys = useRef(new Map<string, { scan_code: number; key_code: number }>());
   const heldButtons = useRef(new Set<"Left" | "Right" | "Middle" | "Back" | "Forward">());
@@ -216,6 +226,50 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     void audioPlayerRef.current?.resume();
   }, []);
 
+  const showClipboardToast = useCallback((message: string) => {
+    setClipboardToast(message);
+    if (clipboardToastTimer.current) clearTimeout(clipboardToastTimer.current);
+    clipboardToastTimer.current = setTimeout(() => {
+      clipboardToastTimer.current = null;
+      setClipboardToast(null);
+    }, 4000);
+  }, []);
+
+  const flashClipboardBlocked = useCallback(() => {
+    setClipboardFlash(true);
+    if (clipboardFlashTimer.current) clearTimeout(clipboardFlashTimer.current);
+    clipboardFlashTimer.current = setTimeout(() => {
+      clipboardFlashTimer.current = null;
+      setClipboardFlash(false);
+    }, 800);
+  }, []);
+
+  const flushRemoteClipboard = useCallback(() => {
+    if (!navigator.clipboard) return;
+    void pendingRemoteClipboard.current.flushWith(async (text) => {
+      await navigator.clipboard.writeText(text);
+      clipboardDedup.current.noteSent(text);
+    });
+  }, []);
+
+  const sendLocalClipboard = useCallback(async () => {
+    const client = clientRef.current;
+    if (!client || !navigator.clipboard) return;
+    if (!policyAllowsClientSend(clipboardPolicyRef.current)) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text || !clipboardDedup.current.shouldSendLocal(text)) return;
+      if (!withinSizeCap(text)) {
+        showClipboardToast("Clipboard too large to send (1 MiB limit)");
+        flashClipboardBlocked();
+        return;
+      }
+      client.sendClipboard(text);
+    } catch {
+      // Clipboard read denied — nothing to sync.
+    }
+  }, [showClipboardToast, flashClipboardBlocked]);
+
   useEffect(() => {
     const { resolution: connectResolution, initialFps: connectInitialFps, initialQuality: connectInitialQuality } = connectOptions.current;
     const client = new WebTransportClient(machine.id, connectResolution);
@@ -276,6 +330,24 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       setConnectionState("failed");
     };
     client.onSessionId = setSessionId;
+    client.onClipboard = (payload) => {
+      if (!payload || typeof payload.data !== "string") return;
+      pendingRemoteClipboard.current.store(payload.data);
+      flushRemoteClipboard();
+    };
+    client.onClipboardStatus = (status) => {
+      clipboardPolicyRef.current = status.policy;
+      setClipboardPolicy(status.policy);
+      if (status.result === "blocked") {
+        showClipboardToast("Clipboard blocked by policy");
+        flashClipboardBlocked();
+      } else if (status.result === "too_large") {
+        showClipboardToast("Clipboard too large for the machine's limit");
+        flashClipboardBlocked();
+      } else if (status.result === "invalid") {
+        showClipboardToast("Clipboard content rejected");
+      }
+    };
     client.onSessionEnded = (reason) => {
       releaseAllInput();
       setEndedReason(reason);
@@ -294,8 +366,20 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       audioPlayerRef.current = null;
       client.disconnect();
       clientRef.current = null;
+      if (clipboardToastTimer.current) clearTimeout(clipboardToastTimer.current);
+      if (clipboardFlashTimer.current) clearTimeout(clipboardFlashTimer.current);
+      clipboardToastTimer.current = null;
+      clipboardFlashTimer.current = null;
+      pendingRemoteClipboard.current = new PendingRemoteClipboard();
     };
-  }, [machine.id, releaseAllInput, clearResolutionStatus, audioSupported]);
+  }, [machine.id, releaseAllInput, clearResolutionStatus, audioSupported, flushRemoteClipboard, showClipboardToast, flashClipboardBlocked]);
+
+  useEffect(() => {
+    if (!clipboardSupported) return;
+    const syncOnFocus = () => void sendLocalClipboard();
+    window.addEventListener("focus", syncOnFocus);
+    return () => window.removeEventListener("focus", syncOnFocus);
+  }, [clipboardSupported, sendLocalClipboard]);
 
   useEffect(() => {
     const client = clientRef.current;
@@ -458,6 +542,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     if (isLocalControlTarget(e.target)) return;
     if (!clientRef.current) return;
     resumeAudioOnce();
+    flushRemoteClipboard();
     containerRef.current?.focus({ preventScroll: true });
     e.preventDefault();
     const button = mapMouseButton(e.button);
@@ -470,7 +555,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       });
       heldButtons.current.add(button);
     }
-  }, [flushMove, resumeAudioOnce]);
+  }, [flushMove, resumeAudioOnce, flushRemoteClipboard]);
 
   const handleMouseUp = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocalControlTarget(e.target)) return;
@@ -564,6 +649,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isLocalKeyboardTarget(e.target)) return;
       resumeAudioOnce();
+      flushRemoteClipboard();
 
       if (isViewerChord(e)) {
         if (e.code === "KeyR") { e.preventDefault(); reconnect(); return; }
@@ -583,6 +669,37 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         }
         const keyId = e.code || e.key;
         const scanCode = scanCodeFor(e.code) ?? 0;
+        if (isPasteChord(e) && clipboardSupported && policyAllowsClientSend(clipboardPolicyRef.current)) {
+          const client = clientRef.current;
+          void (async () => {
+            try {
+              const text = await navigator.clipboard.readText();
+              if (text && clipboardDedup.current.shouldSendLocal(text)) {
+                if (!withinSizeCap(text)) {
+                  showClipboardToast("Clipboard too large to send (1 MiB limit)");
+                  flashClipboardBlocked();
+                } else {
+                  // Wait ≤150ms for the relay's clipboard-status so the host
+                  // applies the text before the paste keystroke lands.
+                  await client.sendClipboardAndWait(text, 150);
+                }
+              }
+            } catch {
+              // Clipboard read denied — still forward the keystroke.
+            }
+            heldKeys.current.set(keyId, { scan_code: scanCode, key_code: e.keyCode });
+            client.sendInput({
+              Keyboard: {
+                KeyDown: {
+                  scan_code: scanCode,
+                  key_code: e.keyCode,
+                  modifiers: modifierFlags(e)
+                }
+              }
+            });
+          })();
+          return;
+        }
         heldKeys.current.set(keyId, { scan_code: scanCode, key_code: e.keyCode });
         clientRef.current.sendInput({
           Keyboard: {
@@ -632,7 +749,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       window.removeEventListener("blur", releaseAllInput);
       window.removeEventListener("pagehide", releaseAllInput);
     };
-  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen, resumeAudioOnce, toggleAudioMuted]);
+  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen, resumeAudioOnce, toggleAudioMuted, clipboardSupported, flushRemoteClipboard, showClipboardToast, flashClipboardBlocked]);
 
   const visibleControls = showControls || connectionState !== "connected" || !!endedReason;
 
@@ -665,6 +782,10 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         audioSupported={audioSupported}
         audioMuted={audioMuted}
         onToggleAudio={toggleAudioMuted}
+        clipboardSupported={clipboardSupported}
+        clipboardPolicy={clipboardPolicy}
+        clipboardFlash={clipboardFlash}
+        onClipboardSync={() => void sendLocalClipboard()}
         qualityLevel={qualityLevel}
         fpsCap={fpsCap}
         onBack={onBack}
@@ -692,6 +813,12 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
             {audioSupported && <ShortcutRow keys="Ctrl + Alt + Shift + M" label="Mute audio" />}
             <ShortcutRow keys="Esc" label="Exit pointer lock" />
           </div>
+        </div>
+      )}
+
+      {clipboardToast && (
+        <div data-local-control role="status" className="absolute bottom-8 left-1/2 z-40 -translate-x-1/2 rounded-xl border border-white/10 bg-[#101318]/95 px-4 py-2 text-xs font-medium text-zinc-200 shadow-2xl backdrop-blur-xl">
+          {clipboardToast}
         </div>
       )}
 

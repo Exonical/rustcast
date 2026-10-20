@@ -107,6 +107,10 @@ pub fn start(
         default_fps: config.video.default_fps_cap.min(config.video.max_fps).min(144),
         target_bitrate_kbps: 0,
     };
+    let token = std::env::var("FLUX_RELAY_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.relay.token.clone());
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
     if let Ok(mut snapshot) = status.write() {
@@ -148,14 +152,24 @@ pub fn start(
                 &heartbeat
             };
             first = false;
-            if let Err(error) = client.post(url).json(&current).send().await {
+            let request = client.post(url).json(&current);
+            let request = match &token {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            };
+            if let Err(error) = request.send().await {
                 tracing::warn!("Relay registration request failed for {url}: {error}");
             }
             tokio::select! {
                 _ = interval.tick() => {},
                 Some(()) = notify_rx.recv() => {},
                 _ = &mut stop_rx => {
-                    let _ = client.post(&deregister).send().await;
+                    let request = client.post(&deregister);
+                    let request = match &token {
+                        Some(token) => request.bearer_auth(token),
+                        None => request,
+                    };
+                    let _ = request.send().await;
                     return;
                 }
             }
