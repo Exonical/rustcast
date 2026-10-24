@@ -108,6 +108,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const resolutionStatusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const committedQuality = useRef<number | null>(null);
   const committedFps = useRef<number | null>(null);
+  const appliedUrlControls = useRef({ fps: initialFps ?? null, quality: initialQuality ?? null });
   const initialControlsApplied = useRef(false);
   const connectOptions = useRef({ resolution, initialFps, initialQuality });
   const audioSupported = useMemo(() => AudioPlayer.isSupported(), []);
@@ -392,10 +393,13 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     }
     const nextFps = initialFps ?? null;
     const nextQuality = initialQuality ?? null;
-    if (committedFps.current === nextFps && committedQuality.current === nextQuality) return;
+    const applied = appliedUrlControls.current;
+    if (applied.fps === nextFps && applied.quality === nextQuality) return;
     setFpsCap(nextFps);
     setQualityLevel(nextQuality);
     if (connectionState !== "connected") return;
+    appliedUrlControls.current = { fps: nextFps, quality: nextQuality };
+    if (committedFps.current === nextFps && committedQuality.current === nextQuality) return;
     committedFps.current = nextFps;
     committedQuality.current = nextQuality;
     client.sendQuality(nextQuality ?? 0, nextFps ?? 0);
