@@ -1088,8 +1088,10 @@ name = "flux-hostd"
 version = "0.1.0"
 dependencies = [
  "flux-core",
+ "flux-crypto",
  "nix 0.30.1",
  "pam-client",
+ "quinn",
  "rustls",
  "serde",
  "serde_json",

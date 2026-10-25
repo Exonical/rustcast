@@ -17,6 +17,13 @@ pub struct RuntimeStatus {
     pub encode_width: u32,
     pub encode_height: u32,
     pub target_bitrate_kbps: u32,
+    /// Whether this host performs OS logins (flux-hostd).
+    pub supports_login: bool,
+    /// "idle" | "active" | "locked"
+    pub login_state: String,
+    pub logged_in_user: Option<String>,
+    /// Hex SHA-256 of the QUIC listener's certificate, when present.
+    pub quic_cert_sha256: Option<String>,
     pub registration_notify: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
@@ -39,6 +46,14 @@ struct Registration {
     target_fps: u32,
     default_fps: u32,
     target_bitrate_kbps: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    supports_login: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    login_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logged_in_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quic_cert_sha256: Option<String>,
 }
 
 pub fn start(
@@ -106,6 +121,10 @@ pub fn start(
         target_fps: config.video.max_fps.min(144),
         default_fps: config.video.default_fps_cap.min(config.video.max_fps).min(144),
         target_bitrate_kbps: 0,
+        supports_login: false,
+        login_state: String::new(),
+        logged_in_user: None,
+        quic_cert_sha256: None,
     };
     let token = std::env::var("FLUX_RELAY_TOKEN")
         .ok()
@@ -140,6 +159,10 @@ pub fn start(
                 if let Some(virtual_display) = snapshot.captured_virtual_display {
                     current.virtual_display = virtual_display;
                 }
+                current.supports_login = snapshot.supports_login;
+                current.login_state = snapshot.login_state.clone();
+                current.logged_in_user = snapshot.logged_in_user.clone();
+                current.quic_cert_sha256 = snapshot.quic_cert_sha256.clone();
                 if snapshot.encode_width != 0 {
                     current.width = snapshot.encode_width;
                     current.height = snapshot.encode_height;

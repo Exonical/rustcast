@@ -7,6 +7,7 @@
 
 mod osuser;
 mod pam_session;
+mod quic;
 mod proto;
 mod rate;
 mod session;
@@ -45,10 +46,44 @@ struct Shared {
     manager: SessionManager,
     limiter: Mutex<LoginRateLimiter>,
     status: Arc<RwLock<RuntimeStatus>>,
+    relay_token: Option<String>,
+}
+
+/// Constant-time comparison for the relay token.
+fn timing_safe_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Sync the registration heartbeat's login fields with the session manager.
+fn update_login_status(shared: &Shared, active: bool) {
+    if let Ok(mut s) = shared.status.write() {
+        match shared.manager.state() {
+            SessionState::Active { user } if active => {
+                s.login_state = "active".into();
+                s.logged_in_user = Some(user);
+            }
+            SessionState::Active { user } => {
+                s.login_state = "active".into();
+                s.logged_in_user = Some(user);
+            }
+            SessionState::Locked { user } => {
+                s.login_state = "locked".into();
+                s.logged_in_user = Some(user);
+            }
+            _ => {
+                s.login_state = "idle".into();
+                s.logged_in_user = None;
+            }
+        }
+        if let Some(notify) = &s.registration_notify {
+            let _ = notify.send(());
+        }
+    }
 }
 
 #[tokio::main]
@@ -91,6 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let status = Arc::new(RwLock::new(RuntimeStatus {
         encoder_backend: Some("pending".into()),
+        supports_login: true,
+        login_state: "idle".into(),
         ..Default::default()
     }));
     let platform = PlatformInfo::detect();
@@ -108,11 +145,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(cfg.frame_addr).await?;
     tracing::info!("flux-hostd listening on tcp://{}", cfg.frame_addr);
 
+    // QUIC endpoint on the same port (UDP); its cert fingerprint is included
+    // in registration so the relay can pin it.
+    let quic_endpoint = match quic::make_endpoint(cfg.frame_addr) {
+        Ok((endpoint, fingerprint)) => {
+            tracing::info!("flux-hostd listening on quic://{}", cfg.frame_addr);
+            if let Ok(mut s) = status.write() {
+                s.quic_cert_sha256 = Some(fingerprint);
+            }
+            Some(endpoint)
+        }
+        Err(e) => {
+            tracing::warn!("QUIC listener unavailable: {e}");
+            None
+        }
+    };
+
     let shared = Arc::new(Shared {
         cfg,
         manager: SessionManager::new(idle_logout),
         limiter: Mutex::new(LoginRateLimiter::new(MAX_LOGIN_FAILURES, LOGIN_COOLDOWN)),
         status,
+        relay_token: config.relay.token.clone(),
     });
 
     // SIGTERM → log out the OS session (pam_close_session + stop target).
@@ -135,6 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         _ = accept_loop(listener, shared.clone()) => {}
         _ = shutdown => {}
+        _ = async {
+            if let Some(endpoint) = quic_endpoint {
+                quic::serve(endpoint, shared.clone()).await;
+            }
+        } => {}
     }
     Ok(())
 }
@@ -143,6 +202,16 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Plaintext TCP is loopback-only unless explicitly allowed;
+                // remote peers must use QUIC.
+                if !peer.ip().is_loopback()
+                    && env("FLUX_FRAME_ALLOW_PLAINTEXT").as_deref() != Some("true")
+                {
+                    tracing::warn!(
+                        "rejecting plaintext TCP from non-loopback {peer};                          set FLUX_FRAME_ALLOW_PLAINTEXT=true to allow"
+                    );
+                    continue;
+                }
                 let _ = stream.set_nodelay(true);
                 let shared = shared.clone();
                 tokio::spawn(async move {
@@ -159,11 +228,10 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    peer: IpAddr,
-    shared: Arc<Shared>,
-) -> std::io::Result<()> {
+async fn handle_connection<S>(mut stream: S, peer: IpAddr, shared: Arc<Shared>) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Cooldown: stalled acceptance for rate-limited peers.
     loop {
         let blocked = shared.limiter.lock().unwrap().is_blocked(peer);
@@ -174,7 +242,30 @@ async fn handle_connection(
         tokio::time::sleep(LOGIN_COOLDOWN).await;
     }
 
-    let (mut rd, mut wr) = stream.split();
+    let (mut rd, mut wr) = tokio::io::split(&mut stream);
+
+    // Relay authentication: when FLUX_RELAY_TOKEN is set, the relay must send
+    // a hello command (0x0A) carrying the token as its first bytes.
+    if let Some(token) = &shared.relay_token {
+        let hello = tokio::time::timeout(
+            Duration::from_secs(5),
+            proto::read_raw_command(&mut rd),
+        )
+        .await;
+        let ok = matches!(hello, Ok(Ok(Some(cmd)))
+            if cmd.ty == proto::CMD_HELLO
+                && cmd.bytes.len() == 5 + token.len()
+                && timing_safe_eq(&cmd.bytes[5..], token.as_bytes()));
+        if !ok {
+            tracing::warn!("rejected unauthenticated peer {peer}");
+            return Ok(());
+        }
+    } else {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!("FLUX_RELAY_TOKEN unset; frame port accepts unauthenticated clients");
+        });
+    }
 
     enum Login<'a> {
         Fresh {
@@ -271,6 +362,7 @@ async fn handle_connection(
                             .await?;
                             return Ok(());
                         }
+                        update_login_status(&shared, true);
                         break Login::Reattach {
                             user: username,
                         };
@@ -354,6 +446,7 @@ async fn handle_connection(
             shared
                 .manager
                 .open(user, outcome.session.expect("fresh login opens pam session"));
+            update_login_status(&shared, true);
             spawn_agent_watcher(uid, name.clone(), shared.clone());
             proto::write_login_frame(
                 &mut wr,
@@ -379,6 +472,7 @@ async fn handle_connection(
     };
     schedule_idle_logout(shared.clone());
     shared.manager.lock();
+    update_login_status(&shared, false);
     match end {
         // Relay dropped: the OS session stays alive but locked.
         ProxyEnd::Disconnected => return Ok(()),
@@ -387,6 +481,7 @@ async fn handle_connection(
         ProxyEnd::Locked => continue,
     }
     }
+    Ok(())
 }
 
 /// Read 0x08 responses (dropping other commands) until one arrives or the
@@ -433,7 +528,13 @@ async fn drive_pam(
         let event = event.ok();
         match event {
             Some(PamEvent::Prompt { style, message }) => {
+                // Info/error messages are display-only: send the frame and
+                // move on to the next PAM event without blocking on the client.
+                let needs_reply = matches!(style, PromptStyle::EchoOn | PromptStyle::EchoOff);
                 proto::write_login_frame(wr, &LoginFrame::Prompt { style, message }).await?;
+                if !needs_reply {
+                    continue;
+                }
                 match read_response(rd).await? {
                     Some(resp) => {
                         if responses.send(resp).is_err() {
@@ -637,9 +738,13 @@ fn schedule_idle_logout(shared: Arc<Shared>) {
     if timeout.is_zero() {
         return;
     }
+    let generation = shared.manager.generation();
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
-        if matches!(shared.manager.state(), SessionState::Locked { .. }) {
+        // Only fire if nothing re-attached or logged out in the meantime.
+        if shared.manager.generation() == generation
+            && matches!(shared.manager.state(), SessionState::Locked { .. })
+        {
             tracing::info!("idle logout timeout reached; logging out");
             logout_current(&shared).await;
         }
@@ -671,6 +776,20 @@ async fn logout_current(shared: &Shared) {
         })
         .await;
         drop(sess.pam_guard.take());
+        // The agent is gone: registration falls back to "pending" metadata
+        // and nobody is logged in.
+        if let Ok(mut s) = shared.status.write() {
+            s.encoder_backend = None;
+            s.display_name = None;
+            s.encode_width = 0;
+            s.encode_height = 0;
+            s.captured_virtual_display = None;
+            s.login_state = "idle".into();
+            s.logged_in_user = None;
+            if let Some(notify) = &s.registration_notify {
+                let _ = notify.send(());
+            }
+        }
         tracing::info!("logged out {name}");
     }
 }

@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,35 +26,37 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id            string
-	addr          string
-	frameChan     chan frameMsg
-	frameQueueMu  sync.Mutex
-	frameBuffers  frameBufferPool
-	cursorChan    chan cursorMsg
-	audioChan     chan audioMsg
-	commandChan   chan []byte
-	abr           *abrState
-	stopChan      chan struct{}
-	stopOnce      sync.Once
-	viewers       int // Protected by machineRegistry.mu.
-	viewerCount   atomic.Uint32
-	mu            sync.Mutex
-	session       *Session
-	lastCursor    *cursorMsg
-	conn          net.Conn
-	cancel        context.CancelFunc
-	status        func(string)
-	idrGate       idrRequestGate
-	idrStats      idrStats
-	metrics       *machineMetrics
-	connectedOnce atomic.Bool
-	deps          *relayDeps
-	clipRate      clipboardRate
-	loginMu       sync.Mutex
-	login         loginInfo
-	lastPrompt    *loginFrameJSON
-	loginSpoken   bool
+	id             string
+	addr           string
+	frameChan      chan frameMsg
+	frameQueueMu   sync.Mutex
+	frameBuffers   frameBufferPool
+	cursorChan     chan cursorMsg
+	audioChan      chan audioMsg
+	commandChan    chan []byte
+	abr            *abrState
+	stopChan       chan struct{}
+	stopOnce       sync.Once
+	viewers        int // Protected by machineRegistry.mu.
+	viewerCount    atomic.Uint32
+	mu             sync.Mutex
+	session        *Session
+	lastCursor     *cursorMsg
+	conn           net.Conn
+	cancel         context.CancelFunc
+	status         func(string)
+	idrGate        idrRequestGate
+	idrStats       idrStats
+	metrics        *machineMetrics
+	connectedOnce  atomic.Bool
+	deps           *relayDeps
+	clipRate       clipboardRate
+	loginMu        sync.Mutex
+	login          loginInfo
+	lastPrompt     *loginFrameJSON
+	loginSpoken    bool
+	supportsLogin  bool
+	quicCertSHA256 string
 }
 
 const (
@@ -684,8 +690,24 @@ func (u *machineUpstream) connectQUIC() error {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"flux-frames"},
+		NextProtos: []string{"flux-frames"},
+	}
+	if u.quicCertSHA256 == "" {
+		log.Printf("[frame:%s] WARN: no registered cert fingerprint; skipping TLS verification", u.id)
+		tlsConf.InsecureSkipVerify = true
+	} else {
+		expected := u.quicCertSHA256
+		tlsConf.InsecureSkipVerify = true // we verify manually below
+		tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no peer certificate")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if hex.EncodeToString(sum[:]) != expected {
+				return fmt.Errorf("quic certificate fingerprint mismatch")
+			}
+			return nil
+		}
 	}
 	conn, err := quic.DialAddr(dialCtx, u.addr, tlsConf, &quic.Config{
 		MaxIdleTimeout:  15 * time.Second,
@@ -696,6 +718,7 @@ func (u *machineUpstream) connectQUIC() error {
 	}
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
 	u.status("connected")
+	u.sendHello()
 	u.markConnected()
 	ctx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
@@ -957,4 +980,17 @@ func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool)
 		return time.Since(start), false, err
 	}
 	return time.Since(start), false, nil
+}
+
+// sendHello authenticates this relay to flux-hostd (command 0x0A + token).
+func (u *machineUpstream) sendHello() {
+	token := os.Getenv("FLUX_RELAY_TOKEN")
+	if token == "" {
+		return
+	}
+	cmd := make([]byte, 5+len(token))
+	cmd[0] = 0x0A
+	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(token)))
+	copy(cmd[5:], token)
+	u.send(cmd)
 }

@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 flux-core = { workspace = true, features = ["registration"] }
+flux-crypto = { workspace = true }
+quinn = { workspace = true }
 
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -54,6 +54,7 @@ pub enum OpusApplication {
     LowDelay,
 }
 
+#[cfg(feature = "opus")]
 /// Opus audio encoder wrapping libopus.
 pub struct OpusEncoder {
     config: OpusEncoderConfig,
@@ -147,6 +148,33 @@ impl AudioEncoder for OpusEncoder {
 
     fn flush(&mut self) -> Result<Vec<EncodedAudioPacket>> {
         // Opus doesn't buffer — each call to encode is self-contained.
+        Ok(vec![])
+    }
+}
+
+#[cfg(not(feature = "opus"))]
+/// Stub used when the opus codec is not compiled in (e.g. Windows builds
+/// without libopus). Construction always fails at runtime.
+pub struct OpusEncoder;
+
+#[cfg(not(feature = "opus"))]
+impl OpusEncoder {
+    pub fn new(_config: OpusEncoderConfig) -> Result<Self> {
+        Err(FluxError::AudioEncode("opus support not compiled in".into()))
+    }
+
+    pub fn samples_per_frame(&self) -> usize {
+        0
+    }
+}
+
+#[cfg(not(feature = "opus"))]
+impl AudioEncoder for OpusEncoder {
+    fn encode(&mut self, _samples: &AudioSamples) -> Result<EncodedAudioPacket> {
+        Err(FluxError::AudioEncode("opus support not compiled in".into()))
+    }
+
+    fn flush(&mut self) -> Result<Vec<EncodedAudioPacket>> {
         Ok(vec![])
     }
 }

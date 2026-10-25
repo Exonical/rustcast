@@ -351,11 +351,11 @@ func (s *store) getAuditContent(id int64) (auditRow, []byte, error) {
 	err := s.db.QueryRow(
 		`SELECT id, ts, machine_id, COALESCE(machine_name,''), COALESCE(session_id,''),
 		        COALESCE(user_sub,''), COALESCE(user_name,''), COALESCE(client_ip,''),
-		        direction, COALESCE(mime,''), size, sha256, result, content
+		        direction, COALESCE(mime,''), size, sha256, result, COALESCE(os_user,''), content
 		 FROM clipboard_events WHERE id = ?`, id).
 		Scan(&r.ID, &r.Timestamp, &r.MachineID, &r.MachineName, &r.SessionID,
 			&r.UserSub, &r.UserName, &r.ClientIP, &r.Direction, &r.Mime,
-			&r.Size, &r.SHA256, &r.Result, &content)
+			&r.Size, &r.SHA256, &r.Result, &r.OSUser, &content)
 	if err != nil {
 		return auditRow{}, nil, err
 	}
@@ -365,12 +365,16 @@ func (s *store) getAuditContent(id int64) (auditRow, []byte, error) {
 
 // purge deletes audit rows older than the retention window.
 func (s *store) purge(olderThan time.Time) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM clipboard_events WHERE ts < ?`,
-		olderThan.UTC().Format(time.RFC3339Nano))
+	ts := olderThan.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(`DELETE FROM clipboard_events WHERE ts < ?`, ts)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if _, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // auditRetentionDays reads FLUX_AUDIT_RETENTION_DAYS (default 30; 0 = keep).

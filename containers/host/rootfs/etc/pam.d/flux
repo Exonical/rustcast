@@ -1,5 +1,5 @@
 # flux-hostd login: authentik device-domain users first, local passwd fallback.
-auth      [success=1 default=ignore]  pam_authentik.so
+auth      [success=1 auth_err=die perm_denied=die default=ignore]  pam_authentik.so
 auth      required                    pam_unix.so
 account   required                    pam_unix.so broken_shadow
 account   [success=ok default=ignore] pam_authentik.so

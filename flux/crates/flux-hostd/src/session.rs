@@ -3,6 +3,7 @@
 
 use crate::osuser::OsUser;
 use crate::pam_session::PamSessionGuard;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,8 @@ impl<'a> Drop for Claim<'a> {
 pub struct SessionManager {
     inner: Mutex<Option<ActiveSession>>,
     claim: Mutex<Option<String>>,
+    /// Bumped on every lock/attach/take so stale idle timers can be told apart.
+    generation: AtomicU64,
     pub idle_logout: Duration,
 }
 
@@ -51,8 +54,14 @@ impl SessionManager {
         Self {
             inner: Mutex::new(None),
             claim: Mutex::new(None),
+            generation: AtomicU64::new(0),
             idle_logout,
         }
+    }
+
+    /// Monotonic counter of lock/attach/logout events.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Current occupancy for the login check.
@@ -102,6 +111,7 @@ impl SessionManager {
         if let Some(s) = self.inner.lock().unwrap().as_mut() {
             if s.locked_since.is_some() && s.user.name == user {
                 s.locked_since = None;
+                self.generation.fetch_add(1, Ordering::SeqCst);
                 return true;
             }
         }
@@ -113,6 +123,7 @@ impl SessionManager {
     pub fn lock(&self) -> Option<String> {
         if let Some(s) = self.inner.lock().unwrap().as_mut() {
             s.locked_since = Some(Instant::now());
+            self.generation.fetch_add(1, Ordering::SeqCst);
             return Some(s.user.name.clone());
         }
         None
@@ -120,6 +131,7 @@ impl SessionManager {
 
     /// Take the session out (for logout). Caller runs cleanup.
     pub fn take(&self) -> Option<ActiveSession> {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.inner.lock().unwrap().take()
     }
 }

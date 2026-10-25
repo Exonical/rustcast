@@ -70,7 +70,7 @@ func (u *machineUpstream) gateViewer(sess *Session) (role, reason string) {
 	if sess.user != nil {
 		sub = sess.user.Sub
 	}
-	if !u.loginSpoken {
+	if !u.supportsLogin && !u.loginSpoken {
 		// Upstream is an old-style agent without the login protocol; no gate.
 		return "viewer", ""
 	}

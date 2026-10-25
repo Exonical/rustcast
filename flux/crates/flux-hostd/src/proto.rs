@@ -20,6 +20,8 @@ pub const MSG_LOGIN: u8 = 0x06;
 pub const CMD_LOGIN_RESPONSE: u8 = 0x08;
 /// Client→host lock command type (empty payload).
 pub const CMD_LOCK: u8 = 0x09;
+/// Client→host hello/auth command type (token payload).
+pub const CMD_HELLO: u8 = 0x0A;
 
 const MAX_LOGIN_PAYLOAD: usize = 16 * 1024;
 
@@ -274,7 +276,7 @@ pub async fn read_raw_command(
             r.read_exact(&mut b).await?;
             bytes.extend_from_slice(&b);
         }
-        0x02 | 0x07 | 0x08 | CMD_LOCK => {
+        0x02 | 0x07 | 0x08 | CMD_LOCK | CMD_HELLO => {
             let mut len_buf = [0u8; 4];
             r.read_exact(&mut len_buf).await?;
             let len = u32::from_be_bytes(len_buf) as usize;
