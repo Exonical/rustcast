@@ -7,11 +7,8 @@
 //! are defined in `frame_protocol`.
 //!
 //! Stream formats:
-//!   frame (server→client uni): one message, header from `frame_protocol::frame_header`
-//!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata,
-//!     type 0x03 = resolution transition status JSON,
-//!     type 0x04 = Opus audio packet ([seq u32 BE][opus payload]),
-//!     type 0x05 = clipboard JSON
+//!   frame (server→client uni): one message, header from `frame_protocol::frame_header`,
+//!     type one of the `frame_protocol::MSG_*` constants
 //!   control (client→server bi): `frame_protocol::read_commands`
 
 use std::sync::Arc;
@@ -20,7 +17,10 @@ use std::time::{Duration, Instant};
 use flux_crypto::CertificateManager;
 
 use crate::PrivacyController;
-use crate::frame_protocol::{CommandChannels, frame_header, read_commands};
+use crate::frame_protocol::{
+    CommandChannels, MSG_AUDIO, MSG_CLIPBOARD, MSG_CURSOR, MSG_RESOLUTION_STATUS, MSG_VIDEO, frame_header,
+    read_commands,
+};
 
 pub const ALPN: &[u8] = b"flux-frames";
 
@@ -237,7 +237,7 @@ async fn handle_connection(
 
     let initial = cursor_rx.borrow_and_update().clone();
     if let Ok(payload) = serde_json::to_vec(&initial.1) {
-        if !send_message(&connection, 0x02, initial.0, payload).await {
+        if !send_message(&connection, MSG_CURSOR, initial.0, payload).await {
             control.abort();
             return;
         }
@@ -337,7 +337,7 @@ async fn handle_connection(
                 let Ok(payload) = serde_json::to_vec(&cursor.1) else {
                     continue;
                 };
-                if !send_message(&connection, 0x02, cursor.0, payload).await {
+                if !send_message(&connection, MSG_CURSOR, cursor.0, payload).await {
                     break;
                 }
             }
@@ -347,7 +347,7 @@ async fn handle_connection(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
-                if !send_message(&connection, 0x04, packet.0, packet.1.clone()).await {
+                if !send_message(&connection, MSG_AUDIO, packet.0, packet.1.clone()).await {
                     break;
                 }
             }
@@ -357,7 +357,7 @@ async fn handle_connection(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
-                if !send_message(&connection, 0x05, event.0, event.1.clone()).await {
+                if !send_message(&connection, MSG_CLIPBOARD, event.0, event.1.clone()).await {
                     break;
                 }
             }
@@ -367,7 +367,7 @@ async fn handle_connection(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
                 };
-                if !send_message(&connection, 0x03, status.0, status.1.clone()).await {
+                if !send_message(&connection, MSG_RESOLUTION_STATUS, status.0, status.1.clone()).await {
                     break;
                 }
             }
@@ -425,7 +425,7 @@ async fn send_frame_message(
             return FrameSendResult::Disconnected;
         }
     };
-    let header = frame_header(0x01, ts, payload.len());
+    let header = frame_header(MSG_VIDEO, ts, payload.len());
     if stream.write_all(&header).await.is_err() {
         tracing::info!("QUIC frame write failed; client disconnected");
         return FrameSendResult::Disconnected;
