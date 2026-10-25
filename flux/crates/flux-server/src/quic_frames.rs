@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use flux_crypto::CertificateManager;
 
-use crate::PrivacyController;
+use crate::display_platform::PrivacyController;
 use crate::frame_protocol::{CommandChannels, frame_header, read_commands};
 
 pub const ALPN: &[u8] = b"flux-frames";
@@ -214,14 +214,7 @@ async fn handle_connection(
     mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::resolution::ResolutionStatusMessage>,
     privacy_controller: Option<PrivacyController>,
 ) {
-    #[cfg(not(target_os = "windows"))]
-    let _ = &privacy_controller;
-    #[cfg(target_os = "windows")]
-    let privacy_connection = privacy_controller
-        .as_ref()
-        .map(|privacy| privacy.connection());
-    #[cfg(not(target_os = "windows"))]
-    let privacy_connection = None;
+    let privacy_connection = privacy_controller.as_ref().map(PrivacyController::connection);
     let frame_idr_tx = commands.idr_tx.clone();
     let control_conn = connection.clone();
     let peer = connection.remote_address();

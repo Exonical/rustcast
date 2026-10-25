@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 mod audio;
 mod capture_loop;
 mod clipboard;
+mod display_platform;
 mod encoder;
 mod frame_protocol;
 mod frame_server;
@@ -31,18 +32,11 @@ mod virtual_display;
 mod tray;
 
 use clipboard::ClipboardCtx;
+use display_platform::PrivacyController;
 use flux_core::config::FluxConfig;
 use flux_core::platform::PlatformInfo;
 use flux_crypto::CertificateManager;
 use resolution::{ModeRequest, ResolutionStatusMessage};
-#[cfg(target_os = "windows")]
-type PrivacyController = ccd_display::PrivacyController;
-#[cfg(not(target_os = "windows"))]
-type PrivacyController = ();
-#[cfg(target_os = "windows")]
-type VirtualDisplayHandle = virtual_display::VirtualDisplay;
-#[cfg(not(target_os = "windows"))]
-type VirtualDisplayHandle = ();
 #[cfg(feature = "tray")]
 use tray::{FluxTray, TrayAction, TrayState};
 
@@ -99,16 +93,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     metrics::init();
 
-    #[cfg(target_os = "windows")]
-    {
-        let privacy_snapshot_path = config
-            .security
-            .cert_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("privacy_topology.bin");
-        ccd_display::recover_snapshot(&privacy_snapshot_path);
-    }
+    let privacy_snapshot_path = config
+        .security
+        .cert_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("privacy_topology.bin");
+    display_platform::recover_snapshot(&privacy_snapshot_path);
     if config.video.privacy.enabled && config.video.virtual_display.is_none() {
         return Err(
             "privacy mode requires [video.virtual_display]; refusing to disable the only display"
@@ -301,20 +292,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None)
     };
     #[cfg(not(target_os = "windows"))]
-    let virtual_display: Option<VirtualDisplayHandle> = None;
-    #[cfg(not(target_os = "windows"))]
-    let virtual_display_target = None;
+    let (virtual_display, virtual_display_target): (Option<display_platform::VirtualDisplayHandle>, _) = (None, None);
 
-    #[cfg(target_os = "windows")]
     let privacy_controller = if config.video.privacy.enabled {
-        let privacy_snapshot_path = config
-            .security
-            .cert_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("privacy_topology.bin");
         Some(
-            ccd_display::PrivacyController::new(
+            PrivacyController::new(
                 virtual_display_target
                     .clone()
                     .ok_or("privacy mode requires a confirmed virtual display output")?,
@@ -326,8 +308,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    #[cfg(not(target_os = "windows"))]
-    let privacy_controller: Option<PrivacyController> = None;
 
     // ── Start capture → hardware H.264 encode ──────────────────────
     // Broadcast channel: capture thread sends, TCP frame server(s) receive.
@@ -590,11 +570,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(h) = quic_handle {
         h.abort();
     }
-    #[cfg(target_os = "windows")]
-    if let Some(privacy) = privacy_controller {
-        if let Err(error) = privacy.restore() {
-            tracing::error!("Failed to restore privacy display topology: {error}");
-        }
+    if let Some(privacy) = privacy_controller
+        && let Err(error) = privacy.restore()
+    {
+        tracing::error!("Failed to restore privacy display topology: {error}");
     }
     server.shutdown().await;
     if let Some(handle) = registration_stop {
