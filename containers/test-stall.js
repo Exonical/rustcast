@@ -1,8 +1,11 @@
 // Runs containers/test-stall.html in headless Chrome against the relay on
-// localhost:8080, prints one summary line per phase and writes the full JSON
-// report (plus the snapshot, if requested). Usage (Windows, Node 22+):
+// FLUX_RELAY (default http://localhost:8080), prints one summary line per
+// phase and writes the full JSON report (plus the snapshot, if requested).
+// Usage (Node 22+):
 //   node containers/test-stall.js [query-string] [report.json]
 // e.g. "machine=default&movePattern=burst&phases=idle:10,mouse:45,idle:10"
+// Optional env: FLUX_COOKIE=<logged-in session cookie>, FLUX_RELAY=<relay URL>,
+//   CHROME=<Chrome binary> (default google-chrome except on Windows).
 // with containers/test-stall-source.sh providing the video, and
 // containers/test-stall-relay.sh for the relay's drop/recovery counts.
 const { spawn } = require('child_process');
@@ -11,17 +14,24 @@ const path = require('path');
 
 const query = process.argv[2] || '';
 const reportPath = process.argv[3];
-const chromePath = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const relayBase = process.env.FLUX_RELAY || 'http://localhost:8080';
+const chromePath = process.env.CHROME || (process.platform !== 'win32' ? 'google-chrome' : 'C:/Program Files/Google/Chrome/Application/chrome.exe');
 const port = 9334;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let chrome;
 
 (async () => {
-  const discovery = await (await fetch('http://localhost:8080/api/webtransport')).json();
+  const headers = process.env.FLUX_COOKIE ? { Cookie: process.env.FLUX_COOKIE } : {};
+  const discoveryResponse = await fetch(new URL('/api/webtransport', relayBase), { headers });
+  if (!discoveryResponse.ok) {
+    throw new Error(`WebTransport discovery failed with HTTP ${discoveryResponse.status}; when auth is enabled, set FLUX_COOKIE to a logged-in relay session cookie.`);
+  }
+  const discovery = await discoveryResponse.json();
   const params = new URLSearchParams(query);
   params.set('wtHost', discovery.host || 'localhost');
   params.set('wtPort', String(discovery.port));
   params.set('certHashes', (discovery.certHashes || []).join(','));
+  if (discovery.ticket) params.set('ticket', discovery.ticket);
   const page = 'file:///' + path.resolve(__dirname, 'test-stall.html').replace(/\\/g, '/') + `?${params}`;
   chrome = spawn(chromePath, [
     '--headless=new', '--disable-gpu', '--autoplay-policy=no-user-gesture-required',
