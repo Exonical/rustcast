@@ -18,11 +18,9 @@ mod frame_protocol;
 mod frame_server;
 mod http;
 mod metrics;
-mod pipeline;
 mod quic_frames;
 mod resolution;
 
-mod session;
 #[cfg(target_os = "windows")]
 mod ccd_display;
 #[cfg(target_os = "windows")]
@@ -563,7 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Build the server.
-    let server = FluxServer::new(config, platform, cert_manager, authenticator).await?;
+    let _server = FluxServer::new(config, platform, cert_manager, authenticator).await?;
 
     tracing::info!("Flux Server is ready and waiting for connections.");
 
@@ -596,7 +594,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!("Failed to restore privacy display topology: {error}");
         }
     }
-    server.shutdown().await;
     if let Some(handle) = registration_stop {
         let _ = handle.stop.send(());
     }
@@ -609,7 +606,6 @@ struct FluxServer {
     _config: FluxConfig,
     _platform: PlatformInfo,
     _cert_manager: CertificateManager,
-    session_manager: session::SessionManager,
 }
 
 impl FluxServer {
@@ -619,11 +615,6 @@ impl FluxServer {
         cert_manager: CertificateManager,
         _authenticator: flux_crypto::PinAuthenticator,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let session_manager = session::SessionManager::new(
-            config.clone(),
-            platform.clone(),
-        );
-
         // main() already runs the relay frame servers (TCP, optional QUIC) and
         // the plain-HTTP `/api/status` + `/metrics` listener. Still missing:
         // - a client signaling/pairing listener on `server.signaling_port`
@@ -635,12 +626,6 @@ impl FluxServer {
             _config: config,
             _platform: platform,
             _cert_manager: cert_manager,
-            session_manager,
         })
-    }
-
-    async fn shutdown(self) {
-        tracing::info!("Shutting down all sessions...");
-        self.session_manager.shutdown_all().await;
     }
 }
