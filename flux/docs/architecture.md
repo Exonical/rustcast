@@ -48,8 +48,7 @@ flux-server ──┬── flux-capture ──── flux-core
               ├── flux-crypto  ──── flux-core
               └── flux-protocol ─── flux-core
 
-flux-client ──┬── flux-transport ── flux-core
-              ├── flux-crypto  ──── flux-core
+flux-client ──┬── flux-crypto  ──── flux-core
               ├── flux-protocol ─── flux-core
               └── flux-input   ──── flux-core
 ```

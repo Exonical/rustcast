@@ -1022,7 +1022,6 @@ dependencies = [
  "flux-crypto",
  "flux-input",
  "flux-protocol",
- "flux-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
