@@ -145,6 +145,9 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		LoggedInUser: input.LoggedInUser, QuicCertSHA256: input.QuicCertSHA256,
 	}
 	m.static = static
+	if m.upstream != nil {
+		m.upstream.setQuicCertSHA256(input.QuicCertSHA256)
+	}
 	if m.upstream != nil && input.TargetBitrate != 0 {
 		m.upstream.abr.setSenderTarget(input.TargetBitrate)
 	}

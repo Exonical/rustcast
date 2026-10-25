@@ -575,10 +575,20 @@ func (u *machineUpstream) connectFrameServer() {
 		}
 		log.Printf("[frame:%s] connected to %s", u.id, u.addr)
 		u.status("connected")
-		u.markConnected()
 		u.mu.Lock()
 		u.conn = conn
 		u.mu.Unlock()
+		// hostd demands the hello as the first command; write it
+		// directly and drop anything queued for the dead connection.
+		u.drainCommands()
+		if hello := helloCommand(); hello != nil {
+			if _, err := conn.Write(hello); err != nil {
+				log.Printf("[frame:%s] hello write failed: %v", u.id, err)
+				conn.Close()
+				continue
+			}
+		}
+		u.markConnected()
 		_ = u.sendViewerCount(int(u.viewerCount.Load()))
 
 		// Spawn writer for upstream commands.
@@ -692,19 +702,20 @@ func (u *machineUpstream) connectQUIC() error {
 	tlsConf := &tls.Config{
 		NextProtos: []string{"flux-frames"},
 	}
-	if u.quicCertSHA256 == "" {
+	expected := u.pinnedCertSHA256()
+	if expected == "" {
 		log.Printf("[frame:%s] WARN: no registered cert fingerprint; skipping TLS verification", u.id)
 		tlsConf.InsecureSkipVerify = true
 	} else {
-		expected := u.quicCertSHA256
 		tlsConf.InsecureSkipVerify = true // we verify manually below
 		tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("no peer certificate")
 			}
 			sum := sha256.Sum256(rawCerts[0])
-			if hex.EncodeToString(sum[:]) != expected {
-				return fmt.Errorf("quic certificate fingerprint mismatch")
+			actual := hex.EncodeToString(sum[:])
+			if actual != expected {
+				return fmt.Errorf("quic certificate fingerprint mismatch: want %s got %s", expected, actual)
 			}
 			return nil
 		}
@@ -718,8 +729,6 @@ func (u *machineUpstream) connectQUIC() error {
 	}
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
 	u.status("connected")
-	u.sendHello()
-	u.markConnected()
 	ctx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
 	defer conn.CloseWithError(0, "done")
@@ -727,7 +736,6 @@ func (u *machineUpstream) connectQUIC() error {
 	u.mu.Lock()
 	u.cancel = connCancel
 	u.mu.Unlock()
-	_ = u.sendViewerCount(int(u.viewerCount.Load()))
 	defer func() {
 		u.mu.Lock()
 		u.cancel = nil
@@ -742,6 +750,16 @@ func (u *machineUpstream) connectQUIC() error {
 	if err != nil {
 		return fmt.Errorf("open control stream: %w", err)
 	}
+	// Same hello-first rule as TCP: write it directly on the command
+	// stream before the pump starts draining the shared channel.
+	u.drainCommands()
+	if hello := helloCommand(); hello != nil {
+		if _, err := control.Write(hello); err != nil {
+			return fmt.Errorf("hello write: %w", err)
+		}
+	}
+	u.markConnected()
+	_ = u.sendViewerCount(int(u.viewerCount.Load()))
 	go func() {
 		for {
 			select {
@@ -823,6 +841,7 @@ func (u *machineUpstream) markConnected() {
 
 func (u *machineUpstream) markDisconnected() {
 	u.metrics.upstreamConnected.Set(0)
+	u.onUpstreamDisconnected()
 }
 
 func (u *machineUpstream) framePusher() {
@@ -982,15 +1001,42 @@ func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool)
 	return time.Since(start), false, nil
 }
 
-// sendHello authenticates this relay to flux-hostd (command 0x0A + token).
-func (u *machineUpstream) sendHello() {
+// helloCommand builds the 0x0A hello carrying the relay auth token.
+// Returns nil when no token is configured.
+func helloCommand() []byte {
 	token := os.Getenv("FLUX_RELAY_TOKEN")
 	if token == "" {
-		return
+		return nil
 	}
 	cmd := make([]byte, 5+len(token))
 	cmd[0] = 0x0A
 	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(token)))
 	copy(cmd[5:], token)
-	u.send(cmd)
+	return cmd
+}
+
+// setQuicCertSHA256 refreshes the pinned fingerprint from the latest
+// registration/heartbeat so a rotated host cert doesn't strand the link.
+func (u *machineUpstream) setQuicCertSHA256(v string) {
+	u.mu.Lock()
+	u.quicCertSHA256 = v
+	u.mu.Unlock()
+}
+
+func (u *machineUpstream) pinnedCertSHA256() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.quicCertSHA256
+}
+
+// drainCommands discards commands queued for a previous connection so the
+// new link's first bytes are always the hello.
+func (u *machineUpstream) drainCommands() {
+	for {
+		select {
+		case <-u.commandChan:
+		default:
+			return
+		}
+	}
 }

@@ -144,6 +144,7 @@ func newWebHandler(
 			"sub":          user.Sub,
 			"email":        user.Email,
 			"name":         user.Name,
+			"username":     user.Username,
 			"admin":        user.Admin,
 			"auth_enabled": authService.enabled,
 		})

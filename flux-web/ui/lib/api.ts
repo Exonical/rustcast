@@ -95,6 +95,8 @@ export interface Me {
   sub: string;
   email?: string;
   name?: string;
+  /** OIDC preferred_username — must equal a locked/busy host's logged_in_user to attach. */
+  username?: string;
   admin: boolean;
   auth_enabled: boolean;
 }

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { machineState } from "@/lib/machines";
+import { canJoinMachine, machineState } from "@/lib/machines";
 import type { ClipboardPolicy, Machine } from "@/lib/api";
 import { fetchPolicy, updatePolicy } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -26,6 +26,7 @@ export function MachineCard({ machine, onConnect }: {
   const admin = !!me?.admin;
   const state = machineState(machine);
   const online = state !== "offline";
+  const joinable = canJoinMachine(machine, me ? { username: me.username, admin: me.admin } : null);
   const display = machine.width && machine.height ? `${machine.width} × ${machine.height}` : "Native mode";
 
   const [policy, setPolicy] = useState<ClipboardPolicy | null>(null);
@@ -91,7 +92,7 @@ export function MachineCard({ machine, onConnect }: {
           </Badge>
           {machine.logged_in_user && (
             <span title={`Host login: ${machine.logged_in_user}`}>
-              <Badge tone="amber">In use by {machine.logged_in_user}</Badge>
+              <Badge tone="amber">{machine.login_state === "locked" ? `Locked (${machine.logged_in_user})` : `In use by ${machine.logged_in_user}`}</Badge>
             </span>
           )}
           {machine.clipboard_policy && (

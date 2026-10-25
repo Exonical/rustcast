@@ -63,6 +63,7 @@ pub struct OpusEncoder {
     samples_per_frame: usize,
 }
 
+#[cfg(feature = "opus")]
 impl OpusEncoder {
     pub fn new(config: OpusEncoderConfig) -> Result<Self> {
         tracing::info!(
@@ -119,6 +120,7 @@ impl OpusEncoder {
     }
 }
 
+#[cfg(feature = "opus")]
 impl AudioEncoder for OpusEncoder {
     fn encode(&mut self, samples: &AudioSamples) -> Result<EncodedAudioPacket> {
         let expected = self.samples_per_frame * self.config.channels as usize;

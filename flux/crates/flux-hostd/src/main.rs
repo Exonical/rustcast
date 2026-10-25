@@ -793,3 +793,69 @@ async fn logout_current(shared: &Shared) {
         tracing::info!("logged out {name}");
     }
 }
+
+#[cfg(test)]
+mod drive_pam_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An info message must not block waiting for a client response: the
+    /// next prompt should be written immediately after it.
+    #[tokio::test]
+    async fn info_prompts_do_not_wait_for_responses() {
+        let (etx, erx) = std::sync::mpsc::channel::<PamEvent>();
+        let (rtx, _rrx) = std::sync::mpsc::channel::<String>();
+        let (mut server_rd, mut client_wr) = tokio::io::duplex(4096);
+        let (mut client_rd, mut server_wr) = tokio::io::duplex(4096);
+
+        etx.send(PamEvent::Prompt {
+            style: PromptStyle::Info,
+            message: "Creating directory '/home/devuser'.".into(),
+        })
+        .unwrap();
+        etx.send(PamEvent::Prompt {
+            style: PromptStyle::EchoOff,
+            message: "Password: ".into(),
+        })
+        .unwrap();
+        etx.send(PamEvent::Ok(Box::new(pam_session::PamOutcome {
+            user: "devuser".into(),
+            env: vec![],
+            session: None,
+        })))
+        .unwrap();
+        drop(etx);
+
+        let driver = tokio::spawn(async move {
+            drive_pam(erx, rtx, &mut server_rd, &mut server_wr, "devuser").await
+        });
+
+        let mut text = String::new();
+        let mut buf = vec![0u8; 4096];
+        // Read until both frames have arrived: the info frame must come
+        // through without a client answer, then the password prompt.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !text.contains("Password") {
+                let n = client_rd.read(&mut buf).await.unwrap();
+                text.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+        .await
+        .expect("timed out waiting for login frames");
+        assert!(text.contains("info"), "expected info frame, got {text:?}");
+
+        let resp = serde_json::json!({"response": "hunter2"});
+        let payload = resp.to_string();
+        let mut cmd = vec![0x08u8];
+        cmd.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        cmd.extend_from_slice(payload.as_bytes());
+        client_wr.write_all(&cmd).await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.unwrap().user, "devuser");
+    }
+}
