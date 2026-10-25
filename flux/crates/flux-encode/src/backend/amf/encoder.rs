@@ -21,6 +21,8 @@ use flux_core::types::{DynamicRange, RateControlMode, Resolution, VideoCodec};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice};
 use windows::core::Interface;
+use windows_sys::Win32::Foundation::HMODULE;
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
 use crate::traits::{EncodeConfig, EncodeSession, EncoderCapabilities, VideoEncoder};
 
@@ -30,172 +32,219 @@ use super::ffi::*;
 // ─── DLL handle wrapper ─────────────────────────────────────────────────────
 
 /// Holds the dynamically loaded AMF DLL and resolved function pointers.
+///
+/// The DLL is never unloaded (there is no `FreeLibrary`), so the export
+/// pointers and every object the runtime hands out stay backed by mapped code
+/// for the rest of the process.
 struct AmfLibrary {
-    _handle: *mut std::ffi::c_void,
+    _handle: HMODULE,
     init_fn: AMFInit_Fn,
     query_version_fn: AMFQueryVersion_Fn,
 }
 
-// AMF library handle is thread-safe (COM apartment model).
+// SAFETY: the fields are a module handle that is never freed and two export
+// addresses, none of which is tied to the loading thread. The exports are only
+// called from `AmfEncoder::new`, before the library is shared.
 unsafe impl Send for AmfLibrary {}
 unsafe impl Sync for AmfLibrary {}
 
+/// Untyped export address, as returned by `GetProcAddress`.
+type RawExport = unsafe extern "system" fn() -> isize;
+
+/// Resolve a named export of the loaded AMF DLL.
+fn amf_export(handle: HMODULE, name: &str) -> Result<RawExport> {
+    let c_name = std::ffi::CString::new(name).unwrap();
+    // SAFETY: `handle` was returned by `LoadLibraryA` and is never freed;
+    // `c_name` is NUL-terminated and outlives the call.
+    let export = unsafe { GetProcAddress(handle, c_name.as_ptr() as *const u8) };
+    export.ok_or_else(|| FluxError::EncoderInit(format!("amfrt64.dll missing {} export", name)))
+}
+
 impl AmfLibrary {
     fn load() -> Result<Self> {
-        unsafe {
-            // LoadLibraryA("amfrt64.dll")
-            let dll_name = std::ffi::CString::new(AMF_DLL_NAME).unwrap();
-            let handle = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(
-                dll_name.as_ptr() as *const u8,
-            );
-
-            if handle.is_null() {
-                return Err(FluxError::EncoderInit(
-                    "Failed to load amfrt64.dll — AMD driver may not be installed".into(),
-                ));
-            }
-
-            // Resolve AMFQueryVersion
-            let query_name = std::ffi::CString::new("AMFQueryVersion").unwrap();
-            let query_ptr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                handle,
-                query_name.as_ptr() as *const u8,
-            );
-            if query_ptr.is_none() {
-                return Err(FluxError::EncoderInit(
-                    "amfrt64.dll missing AMFQueryVersion export".into(),
-                ));
-            }
-            let query_version_fn: AMFQueryVersion_Fn = std::mem::transmute(query_ptr.unwrap());
-
-            // Resolve AMFInit
-            let init_name = std::ffi::CString::new("AMFInit").unwrap();
-            let init_ptr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                handle,
-                init_name.as_ptr() as *const u8,
-            );
-            if init_ptr.is_none() {
-                return Err(FluxError::EncoderInit(
-                    "amfrt64.dll missing AMFInit export".into(),
-                ));
-            }
-            let init_fn: AMFInit_Fn = std::mem::transmute(init_ptr.unwrap());
-
-            Ok(Self {
-                _handle: handle,
-                init_fn,
-                query_version_fn,
-            })
+        let dll_name = std::ffi::CString::new(AMF_DLL_NAME).unwrap();
+        // SAFETY: `dll_name` is NUL-terminated and outlives the call.
+        let handle = unsafe { LoadLibraryA(dll_name.as_ptr() as *const u8) };
+        if handle.is_null() {
+            return Err(FluxError::EncoderInit(
+                "Failed to load amfrt64.dll — AMD driver may not be installed".into(),
+            ));
         }
+
+        let query_version = amf_export(handle, "AMFQueryVersion")?;
+        let init = amf_export(handle, "AMFInit")?;
+        // SAFETY: `AMFQueryVersion_Fn`/`AMFInit_Fn` mirror the export typedefs in
+        // the SDK's core/Factory.h. They are declared `__cdecl` there, which on
+        // x86_64 Windows is the single calling convention `extern "system"` names.
+        let (query_version_fn, init_fn) = unsafe {
+            (
+                std::mem::transmute::<RawExport, AMFQueryVersion_Fn>(query_version),
+                std::mem::transmute::<RawExport, AMFInit_Fn>(init),
+            )
+        };
+
+        Ok(Self {
+            _handle: handle,
+            init_fn,
+            query_version_fn,
+        })
     }
 
     fn query_version(&self) -> Result<u64> {
-        unsafe {
-            let mut version: amf_uint64 = 0;
-            let result = (self.query_version_fn)(&mut version);
-            check_amf(result, "AMFQueryVersion")?;
-            Ok(version)
-        }
+        let mut version: amf_uint64 = 0;
+        // SAFETY: `query_version_fn` is the resolved `AMFQueryVersion` export and
+        // `version` is a valid out-param.
+        let result = unsafe { (self.query_version_fn)(&mut version) };
+        check_amf(result, "AMFQueryVersion")?;
+        Ok(version)
     }
 
-    fn init_factory(&self, version: u64) -> Result<*mut AMFFactoryObj> {
-        unsafe {
-            let mut factory: *mut AMFFactoryObj = ptr::null_mut();
-            let result = (self.init_fn)(version, &mut factory);
-            check_amf(result, "AMFInit")?;
-            if factory.is_null() {
-                return Err(FluxError::EncoderInit("AMFInit returned null factory".into()));
-            }
-            Ok(factory)
+    fn init_factory(&self, version: u64) -> Result<AmfFactory> {
+        let mut factory: *mut AMFFactoryObj = ptr::null_mut();
+        // SAFETY: `init_fn` is the resolved `AMFInit` export and `factory` is a
+        // valid out-param.
+        let result = unsafe { (self.init_fn)(version, &mut factory) };
+        check_amf(result, "AMFInit")?;
+        if factory.is_null() {
+            return Err(FluxError::EncoderInit("AMFInit returned null factory".into()));
         }
+        Ok(AmfFactory { ptr: factory })
     }
 }
 
 // ─── Safe wrappers around AMF COM objects ───────────────────────────────────
+//
+// Each wrapper upholds one invariant: `ptr` is a non-null, live AMF object
+// whose vtable matches the `ffi` struct it is read through. The runtime never
+// changes an object's vtable pointer, so `vtbl()` is the only place that
+// dereferences it; the remaining unsafe blocks only vouch for call arguments.
+// AMF is COM-like but not COM (no apartments or CoInitialize), so objects are
+// not bound to the thread that created them.
 
-/// RAII wrapper for AMFContext.
+/// The runtime's `AMFFactory` singleton.
+///
+/// Invariant: `ptr` is the non-null factory returned by `AMFInit`. The factory
+/// is not reference-counted and must never be released; it stays valid while
+/// the DLL is loaded, which is the rest of the process.
+#[derive(Clone, Copy)]
+struct AmfFactory {
+    ptr: *mut AMFFactoryObj,
+}
+
+// SAFETY: the factory is a process-wide singleton, not tied to the thread that
+// called `AMFInit`. `Sync` (which makes `AmfEncoder` `Sync`) additionally relies
+// on the runtime tolerating concurrent `CreateContext`/`CreateComponent` calls;
+// the AMF API reference does not state factory thread-safety explicitly.
+unsafe impl Send for AmfFactory {}
+unsafe impl Sync for AmfFactory {}
+
+impl AmfFactory {
+    fn vtbl(&self) -> &AMFFactoryVtbl {
+        // SAFETY: by the type invariant `ptr` is the live factory.
+        unsafe { &*(*self.ptr).vtbl }
+    }
+
+    fn create_context(&self) -> Result<AmfContext> {
+        let mut ctx: *mut AMFContextObj = ptr::null_mut();
+        // SAFETY: `ptr` is the live factory and `ctx` is a valid out-param.
+        let result = unsafe { (self.vtbl().CreateContext)(self.ptr, &mut ctx) };
+        check_amf(result, "CreateContext")?;
+        if ctx.is_null() {
+            return Err(FluxError::EncoderInit("CreateContext returned null".into()));
+        }
+        Ok(AmfContext { ptr: ctx })
+    }
+
+    fn create_component(&self, context: &AmfContext, codec_id: &str) -> Result<AmfComponent> {
+        let codec_id_wide = to_wide(codec_id);
+        let mut component: *mut AMFComponentObj = ptr::null_mut();
+        // SAFETY: the factory and `context` are live, `codec_id_wide` is a
+        // NUL-terminated UTF-16 string that outlives the call, and `component`
+        // is a valid out-param.
+        let result =
+            unsafe { (self.vtbl().CreateComponent)(self.ptr, context.ptr, codec_id_wide.as_ptr(), &mut component) };
+        check_amf(result, "CreateComponent")?;
+        if component.is_null() {
+            return Err(FluxError::EncoderInit("CreateComponent returned null".into()));
+        }
+        Ok(AmfComponent { ptr: component })
+    }
+}
+
+/// Owned reference to an `AMFContext`.
+///
+/// Invariant: `ptr` is non-null and this wrapper owns the reference returned
+/// by `CreateContext`; `Drop` terminates and releases it.
 struct AmfContext {
     ptr: *mut AMFContextObj,
 }
 
+// SAFETY: the context is not bound to its creating thread (see above) and is
+// only reached through its single owner, `AmfSession`.
 unsafe impl Send for AmfContext {}
 
 impl AmfContext {
-    fn new(factory: *mut AMFFactoryObj) -> Result<Self> {
-        unsafe {
-            let mut ctx: *mut AMFContextObj = ptr::null_mut();
-            let result = ((*(*factory).vtbl).CreateContext)(factory, &mut ctx);
-            check_amf(result, "CreateContext")?;
-            if ctx.is_null() {
-                return Err(FluxError::EncoderInit("CreateContext returned null".into()));
-            }
-            Ok(Self { ptr: ctx })
-        }
+    fn vtbl(&self) -> &AMFContextVtbl {
+        // SAFETY: by the type invariant `ptr` is a live context.
+        unsafe { &*(*self.ptr).vtbl }
     }
 
+    /// Initialize for DX11 on `device`, or on an AMF-selected adapter if null.
     fn init_dx11(&self, device: *mut std::ffi::c_void) -> Result<()> {
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).InitDX11)(self.ptr, device, AMF_DX11_0);
-            check_amf(result, "InitDX11")
-        }
+        // SAFETY: `device` is null or a live ID3D11Device; `AmfSession` keeps the
+        // capture device alive for as long as it owns this context.
+        let result = unsafe { (self.vtbl().InitDX11)(self.ptr, device, AMF_DX11_0) };
+        check_amf(result, "InitDX11")
     }
 
     fn get_dx11_device(&self) -> Result<ID3D11Device> {
-        unsafe {
-            let ptr = ((*(*self.ptr).vtbl).GetDX11Device)(self.ptr, AMF_DX11_0);
-            if ptr.is_null() {
-                return Err(FluxError::EncoderInit("GetDX11Device returned null".into()));
-            }
-            // AMF returns a borrowed pointer (no AddRef).
-            // We use from_raw (which assumes ownership) then clone (AddRef) then forget (avoid Release on original).
-            let device: ID3D11Device = windows::core::Interface::from_raw(ptr);
-            let owned = device.clone();
-            std::mem::forget(device);
-            Ok(owned)
-        }
+        // SAFETY: `ptr` is a live context; the call takes no pointer arguments.
+        let raw = unsafe { (self.vtbl().GetDX11Device)(self.ptr, AMF_DX11_0) };
+        // SAFETY: a non-null result is the context's ID3D11Device. AMF does not
+        // AddRef it, so it is borrowed and cloned (AddRef) rather than adopted.
+        let device = unsafe { ID3D11Device::from_raw_borrowed(&raw) };
+        device
+            .cloned()
+            .ok_or_else(|| FluxError::EncoderInit("GetDX11Device returned null".into()))
     }
 
     #[allow(dead_code)]
-    fn alloc_surface(
-        &self,
-        format: AMF_SURFACE_FORMAT,
-        width: i32,
-        height: i32,
-    ) -> Result<*mut AMFSurfaceObj> {
-        unsafe {
-            let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
-            let result = ((*(*self.ptr).vtbl).AllocSurface)(
-                self.ptr,
-                AMF_MEMORY_HOST,
-                format,
-                width,
-                height,
-                &mut surface,
-            );
-            check_amf(result, "AllocSurface")?;
-            Ok(surface)
-        }
+    fn alloc_surface(&self, format: AMF_SURFACE_FORMAT, width: i32, height: i32) -> Result<AmfData> {
+        let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
+        // SAFETY: `ptr` is a live context and `surface` is a valid out-param.
+        let result =
+            unsafe { (self.vtbl().AllocSurface)(self.ptr, AMF_MEMORY_HOST, format, width, height, &mut surface) };
+        check_amf(result, "AllocSurface")?;
+        // SAFETY: on success `surface` is null or a new reference we now own.
+        unsafe { AmfData::from_created(surface, "AllocSurface") }
     }
 
-    fn create_surface_from_dx11(
-        &self,
-        dx11_texture: *mut std::ffi::c_void,
-    ) -> Result<*mut AMFSurfaceObj> {
-        unsafe {
-            let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
-            let result = ((*(*self.ptr).vtbl).CreateSurfaceFromDX11Native)(
-                self.ptr,
-                dx11_texture,
-                &mut surface,
-                ptr::null_mut(),
-            );
-            check_amf(result, "CreateSurfaceFromDX11Native")?;
-            Ok(surface)
-        }
+    /// Wrap a D3D11 texture as an AMF surface (zero-copy).
+    ///
+    /// # Safety
+    ///
+    /// `dx11_texture` must be a live `ID3D11Texture2D` on this context's device,
+    /// kept alive and unmodified until AMF has finished encoding the surface
+    /// (encoding continues after `SubmitInput` returns).
+    unsafe fn create_surface_from_dx11(&self, dx11_texture: *mut std::ffi::c_void) -> Result<AmfData> {
+        let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
+        // SAFETY: `ptr` is a live context, the caller vouches for `dx11_texture`,
+        // and `surface` is a valid out-param.
+        let result =
+            unsafe { (self.vtbl().CreateSurfaceFromDX11Native)(self.ptr, dx11_texture, &mut surface, ptr::null_mut()) };
+        check_amf(result, "CreateSurfaceFromDX11Native")?;
+        // SAFETY: on success `surface` is null or a new reference we now own.
+        unsafe { AmfData::from_created(surface, "CreateSurfaceFromDX11Native") }
     }
 
     /// Wrap existing host memory as an AMF surface (zero-copy from CPU buffer).
-    fn create_surface_from_host_native(
+    ///
+    /// # Safety
+    ///
+    /// `data` must point at `h_pitch * v_pitch` readable bytes laid out as
+    /// `format`, kept alive and unmodified until AMF has finished encoding the
+    /// surface (encoding continues after `SubmitInput` returns).
+    unsafe fn create_surface_from_host_native(
         &self,
         format: AMF_SURFACE_FORMAT,
         width: i32,
@@ -203,10 +252,12 @@ impl AmfContext {
         h_pitch: i32,
         v_pitch: i32,
         data: *mut std::ffi::c_void,
-    ) -> Result<*mut AMFSurfaceObj> {
-        unsafe {
-            let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
-            let result = ((*(*self.ptr).vtbl).CreateSurfaceFromHostNative)(
+    ) -> Result<AmfData> {
+        let mut surface: *mut AMFSurfaceObj = ptr::null_mut();
+        // SAFETY: `ptr` is a live context, the caller vouches for `data`, and
+        // `surface` is a valid out-param.
+        let result = unsafe {
+            (self.vtbl().CreateSurfaceFromHostNative)(
                 self.ptr,
                 format,
                 width,
@@ -216,31 +267,36 @@ impl AmfContext {
                 data,
                 &mut surface,
                 ptr::null_mut(),
-            );
-            check_amf(result, "CreateSurfaceFromHostNative")?;
-            Ok(surface)
-        }
-    }
-
-    fn as_ptr(&self) -> *mut AMFContextObj {
-        self.ptr
+            )
+        };
+        check_amf(result, "CreateSurfaceFromHostNative")?;
+        // SAFETY: on success `surface` is null or a new reference we now own.
+        unsafe { AmfData::from_created(surface, "CreateSurfaceFromHostNative") }
     }
 }
 
 impl Drop for AmfContext {
     fn drop(&mut self) {
+        let vtbl = self.vtbl();
+        // SAFETY: `ptr` is live and we own one reference; nothing uses the
+        // context after this.
         unsafe {
-            ((*(*self.ptr).vtbl).Terminate)(self.ptr);
-            ((*(*self.ptr).vtbl).Release)(self.ptr);
+            (vtbl.Terminate)(self.ptr);
+            (vtbl.Release)(self.ptr);
         }
     }
 }
 
-/// RAII wrapper for AMFComponent (encoder).
+/// Owned reference to an `AMFComponent` (encoder).
+///
+/// Invariant: `ptr` is non-null and this wrapper owns the reference returned
+/// by `CreateComponent`; `Drop` terminates and releases it.
 struct AmfComponent {
     ptr: *mut AMFComponentObj,
 }
 
+// SAFETY: the component is not bound to its creating thread (AMF documents all
+// components as thread-safe) and is only reached through `AmfSession`.
 unsafe impl Send for AmfComponent {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,9 +322,16 @@ impl fmt::Display for PropertyStatus {
 }
 
 impl AmfComponent {
+    fn vtbl(&self) -> &AMFComponentVtbl {
+        // SAFETY: by the type invariant `ptr` is a live component.
+        unsafe { &*(*self.ptr).vtbl }
+    }
+
     fn has_property(&self, name: &str) -> bool {
         let wide_name = to_wide(name);
-        unsafe { ((*(*self.ptr).vtbl).HasProperty)(self.ptr, wide_name.as_ptr()) }
+        // SAFETY: `ptr` is a live component and `wide_name` is a NUL-terminated
+        // UTF-16 string that outlives the call.
+        unsafe { (self.vtbl().HasProperty)(self.ptr, wide_name.as_ptr()) }
     }
 
     fn property_support_status(&self, name: &str) -> PropertyStatus {
@@ -281,15 +344,17 @@ impl AmfComponent {
         }
     }
 
-    fn set_property_int64(&self, name: &str, value: i64) -> Result<()> {
+    fn set_property(&self, name: &str, variant: AMFVariantStruct) -> Result<()> {
         let wide_name = to_wide(name);
-        let variant = AMFVariantStruct::from_int64(value);
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).SetProperty)(self.ptr, wide_name.as_ptr(), variant);
-            check_amf(result, &format!("SetProperty({})", name))
-        }
+        // SAFETY: `ptr` is a live component, `wide_name` is a NUL-terminated
+        // UTF-16 string that outlives the call, and `variant` is passed by value.
+        let result = unsafe { (self.vtbl().SetProperty)(self.ptr, wide_name.as_ptr(), variant) };
+        check_amf(result, &format!("SetProperty({})", name))
     }
 
+    fn set_property_int64(&self, name: &str, value: i64) -> Result<()> {
+        self.set_property(name, AMFVariantStruct::from_int64(value))
+    }
     fn set_optional_int64(&self, name: &str, value: i64) -> PropertyStatus {
         if !self.has_property(name) {
             tracing::info!("AMF: SetProperty({}) unsupported", name);
@@ -331,12 +396,7 @@ impl AmfComponent {
     }
 
     fn set_property_bool(&self, name: &str, value: bool) -> Result<()> {
-        let wide_name = to_wide(name);
-        let variant = AMFVariantStruct::from_bool(value);
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).SetProperty)(self.ptr, wide_name.as_ptr(), variant);
-            check_amf(result, &format!("SetProperty({})", name))
-        }
+        self.set_property(name, AMFVariantStruct::from_bool(value))
     }
 
     fn set_optional_bool(&self, name: &str, value: bool) -> PropertyStatus {
@@ -357,131 +417,175 @@ impl AmfComponent {
     }
 
     fn set_property_size(&self, name: &str, width: i32, height: i32) -> Result<()> {
-        let wide_name = to_wide(name);
-        let variant = AMFVariantStruct::from_size(AMFSize::new(width, height));
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).SetProperty)(self.ptr, wide_name.as_ptr(), variant);
-            check_amf(result, &format!("SetProperty({})", name))
-        }
+        self.set_property(name, AMFVariantStruct::from_size(AMFSize::new(width, height)))
     }
 
     fn set_property_rate(&self, name: &str, num: u32, den: u32) -> Result<()> {
-        let wide_name = to_wide(name);
-        let variant = AMFVariantStruct::from_rate(AMFRate::new(num, den));
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).SetProperty)(self.ptr, wide_name.as_ptr(), variant);
-            check_amf(result, &format!("SetProperty({})", name))
-        }
+        self.set_property(name, AMFVariantStruct::from_rate(AMFRate::new(num, den)))
     }
 
     fn init(&self, format: AMF_SURFACE_FORMAT, width: i32, height: i32) -> Result<()> {
-        unsafe {
-            let result = ((*(*self.ptr).vtbl).Init)(self.ptr, format, width, height);
-            check_amf(result, "Component::Init")
-        }
+        // SAFETY: `ptr` is a live component; the arguments are plain values.
+        let result = unsafe { (self.vtbl().Init)(self.ptr, format, width, height) };
+        check_amf(result, "Component::Init")
     }
 
-    fn submit_input(&self, data: *mut AMFDataObj) -> AMF_RESULT {
-        unsafe { ((*(*self.ptr).vtbl).SubmitInput)(self.ptr, data) }
+    fn submit_input(&self, data: &AmfData) -> AMF_RESULT {
+        // SAFETY: `ptr` is a live component and `data` a live surface; AMF takes
+        // its own reference to keep it past this call.
+        unsafe { (self.vtbl().SubmitInput)(self.ptr, data.ptr) }
     }
 
-    fn query_output(&self) -> (AMF_RESULT, *mut AMFDataObj) {
-        unsafe {
-            let mut data: *mut AMFDataObj = ptr::null_mut();
-            let result = ((*(*self.ptr).vtbl).QueryOutput)(self.ptr, &mut data);
-            (result, data)
-        }
+    /// Poll one encoded output. Video encoder components output `AMFBuffer`s
+    /// holding the bitstream.
+    fn query_output(&self) -> (AMF_RESULT, Option<AmfBuffer>) {
+        let mut data: *mut AMFDataObj = ptr::null_mut();
+        // SAFETY: `ptr` is a live component and `data` is a valid out-param.
+        let result = unsafe { (self.vtbl().QueryOutput)(self.ptr, &mut data) };
+        // SAFETY: a non-null output is an `AMFBuffer` whose reference is
+        // transferred to us.
+        (result, unsafe { AmfBuffer::from_raw(data) })
     }
 
     fn drain(&self) -> AMF_RESULT {
-        unsafe { ((*(*self.ptr).vtbl).Drain)(self.ptr) }
+        // SAFETY: `ptr` is a live component; the call takes no arguments.
+        unsafe { (self.vtbl().Drain)(self.ptr) }
     }
 
     #[allow(dead_code)]
     fn flush(&self) -> AMF_RESULT {
-        unsafe { ((*(*self.ptr).vtbl).Flush)(self.ptr) }
+        // SAFETY: `ptr` is a live component; the call takes no arguments.
+        unsafe { (self.vtbl().Flush)(self.ptr) }
     }
 }
 
 impl Drop for AmfComponent {
     fn drop(&mut self) {
+        let vtbl = self.vtbl();
+        // SAFETY: `ptr` is live and we own one reference; nothing uses the
+        // component after this.
         unsafe {
-            ((*(*self.ptr).vtbl).Terminate)(self.ptr);
-            ((*(*self.ptr).vtbl).Release)(self.ptr);
+            (vtbl.Terminate)(self.ptr);
+            (vtbl.Release)(self.ptr);
         }
     }
 }
 
-// ─── AMFData helper ─────────────────────────────────────────────────────────
+// ─── AMFData / AMFBuffer wrappers ───────────────────────────────────────────
 
-fn amf_data_set_pts(data: *mut AMFDataObj, pts: i64) {
-    unsafe {
-        ((*(*data).vtbl).SetPts)(data, pts);
-    }
+/// Owned reference to an `AMFData` (an input surface or output buffer).
+///
+/// Invariant: `ptr` is non-null and this wrapper owns one reference, which
+/// `Drop` releases.
+struct AmfData {
+    ptr: *mut AMFDataObj,
 }
 
-fn amf_data_set_duration(data: *mut AMFDataObj, duration: i64) {
-    unsafe {
-        ((*(*data).vtbl).SetDuration)(data, duration);
+impl AmfData {
+    /// Adopt the object a successful `call` wrote to its out-param.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be null or a live `AMFData` whose reference is transferred to
+    /// the returned wrapper.
+    unsafe fn from_created(ptr: *mut AMFDataObj, call: &str) -> Result<Self> {
+        if ptr.is_null() {
+            return Err(FluxError::EncoderInit(format!("{} returned null", call)));
+        }
+        Ok(Self { ptr })
     }
-}
 
-fn amf_data_set_property_int64(data: *mut AMFDataObj, name: &str, value: i64) -> Result<()> {
-    let wide_name = to_wide(name);
-    let variant = AMFVariantStruct::from_int64(value);
-    unsafe {
-        let result = ((*(*data).vtbl).SetProperty)(data, wide_name.as_ptr(), variant);
+    fn vtbl(&self) -> &AMFDataVtbl {
+        // SAFETY: by the type invariant `ptr` is a live data object.
+        unsafe { &*(*self.ptr).vtbl }
+    }
+
+    fn set_pts(&self, pts: i64) {
+        // SAFETY: `ptr` is live; the argument is a plain value.
+        unsafe { (self.vtbl().SetPts)(self.ptr, pts) }
+    }
+
+    fn set_duration(&self, duration: i64) {
+        // SAFETY: `ptr` is live; the argument is a plain value.
+        unsafe { (self.vtbl().SetDuration)(self.ptr, duration) }
+    }
+
+    fn set_property(&self, name: &str, variant: AMFVariantStruct) -> Result<()> {
+        let wide_name = to_wide(name);
+        // SAFETY: `ptr` is live, `wide_name` is a NUL-terminated UTF-16 string
+        // that outlives the call, and `variant` is passed by value.
+        let result = unsafe { (self.vtbl().SetProperty)(self.ptr, wide_name.as_ptr(), variant) };
         check_amf(result, &format!("Data::SetProperty({})", name))
     }
-}
 
-#[allow(dead_code)]
-fn amf_data_set_property_bool(data: *mut AMFDataObj, name: &str, value: bool) -> Result<()> {
-    let wide_name = to_wide(name);
-    let variant = AMFVariantStruct::from_bool(value);
-    unsafe {
-        let result = ((*(*data).vtbl).SetProperty)(data, wide_name.as_ptr(), variant);
-        check_amf(result, &format!("Data::SetProperty({})", name))
+    fn set_property_int64(&self, name: &str, value: i64) -> Result<()> {
+        self.set_property(name, AMFVariantStruct::from_int64(value))
     }
-}
 
-fn amf_data_get_property_int64(data: *mut AMFDataObj, name: &str) -> Result<i64> {
-    let wide_name = to_wide(name);
-    let mut variant = AMFVariantStruct::from_int64(0);
-    unsafe {
-        let result = ((*(*data).vtbl).GetProperty)(data, wide_name.as_ptr(), &mut variant);
+    #[allow(dead_code)]
+    fn set_property_bool(&self, name: &str, value: bool) -> Result<()> {
+        self.set_property(name, AMFVariantStruct::from_bool(value))
+    }
+
+    fn get_property_int64(&self, name: &str) -> Result<i64> {
+        let wide_name = to_wide(name);
+        let mut variant = AMFVariantStruct::from_int64(0);
+        // SAFETY: `ptr` is live, `wide_name` is a NUL-terminated UTF-16 string
+        // that outlives the call, and `variant` is a valid out-param.
+        let result = unsafe { (self.vtbl().GetProperty)(self.ptr, wide_name.as_ptr(), &mut variant) };
         check_amf(result, &format!("Data::GetProperty({})", name))?;
         Ok(variant.data[0] as i64)
     }
 }
 
-/// Get the size of an AMFBuffer output via raw vtable slot access.
-/// GetSize is an AMFBuffer method (not AMFData), at vtable slot 26.
-fn amf_buffer_get_size(buf: *mut AMFDataObj) -> usize {
-    unsafe {
-        let vtable = (*buf).vtbl as *const *const std::ffi::c_void;
-        let get_size_fn: unsafe extern "system" fn(*mut AMFDataObj) -> usize =
-            std::mem::transmute(*vtable.add(AMFBUFFER_VTABLE_SLOT_GET_SIZE));
-        get_size_fn(buf)
-    }
-}
-
-/// Get the native pointer of an AMFBuffer output via raw vtable slot access.
-/// GetNative is an AMFBuffer method (not AMFData), at vtable slot 27.
-fn amf_buffer_get_native(buf: *mut AMFDataObj) -> *mut std::ffi::c_void {
-    unsafe {
-        let vtable = (*buf).vtbl as *const *const std::ffi::c_void;
-        let get_native_fn: unsafe extern "system" fn(*mut AMFDataObj) -> *mut std::ffi::c_void =
-            std::mem::transmute(*vtable.add(AMFBUFFER_VTABLE_SLOT_GET_NATIVE));
-        get_native_fn(buf)
-    }
-}
-
-fn amf_data_release(data: *mut AMFDataObj) {
-    if !data.is_null() {
+impl Drop for AmfData {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` is live and we own one reference; nothing uses it after.
         unsafe {
-            ((*(*data).vtbl).Release)(data);
+            (self.vtbl().Release)(self.ptr);
         }
+    }
+}
+
+/// Owned reference to an `AMFBuffer`, the `AMFData` subtype encoders output.
+struct AmfBuffer(AmfData);
+
+impl AmfBuffer {
+    /// # Safety
+    ///
+    /// `ptr` must be null or a live `AMFBuffer` whose reference is transferred
+    /// to the returned wrapper.
+    unsafe fn from_raw(ptr: *mut AMFDataObj) -> Option<Self> {
+        (!ptr.is_null()).then_some(Self(AmfData { ptr }))
+    }
+
+    fn vtbl(&self) -> &AMFBufferVtbl {
+        // SAFETY: the object is a live `AMFBuffer`, whose vtable is the
+        // `AMFData` vtable followed by the buffer methods (`AMFBufferVtbl`).
+        unsafe { &*((*self.0.ptr).vtbl as *const AMFBufferVtbl) }
+    }
+
+    /// Copy the buffer's bytes out.
+    fn to_vec(&self) -> Vec<u8> {
+        let this = self.0.ptr as *mut AMFBufferObj;
+        // SAFETY: `this` is a live buffer; the calls take no other arguments.
+        let size = unsafe { (self.vtbl().GetSize)(this) };
+        // SAFETY: as above.
+        let native = unsafe { (self.vtbl().GetNative)(this) };
+        if native.is_null() || size == 0 {
+            return Vec::new();
+        }
+        // SAFETY: `GetNative` points at `GetSize` bytes of host memory owned by
+        // the buffer, which stays alive while `self` holds its reference.
+        unsafe { std::slice::from_raw_parts(native as *const u8, size).to_vec() }
+    }
+}
+
+impl std::ops::Deref for AmfBuffer {
+    type Target = AmfData;
+
+    fn deref(&self) -> &AmfData {
+        &self.0
     }
 }
 
@@ -576,13 +680,9 @@ impl fmt::Display for IdrTrigger {
 /// AMD VCE/VCN encoding hardware.
 pub struct AmfEncoder {
     _library: Arc<AmfLibrary>,
-    factory: *mut AMFFactoryObj,
+    factory: AmfFactory,
     runtime_version: u64,
 }
-
-// Factory pointer is thread-safe per AMF spec.
-unsafe impl Send for AmfEncoder {}
-unsafe impl Sync for AmfEncoder {}
 
 impl AmfEncoder {
     pub fn new() -> Result<Self> {
@@ -768,6 +868,7 @@ fn log_amf_encode_adapter(device: &ID3D11Device) {
             return;
         }
     };
+    // SAFETY: `dxgi_device` is a live COM interface; the call has no arguments.
     let adapter = match unsafe { dxgi_device.GetAdapter() } {
         Ok(adapter) => adapter,
         Err(error) => {
@@ -782,6 +883,7 @@ fn log_amf_encode_adapter(device: &ID3D11Device) {
             return;
         }
     };
+    // SAFETY: `adapter` is a live COM interface; the call has no arguments.
     let desc = match unsafe { adapter.GetDesc1() } {
         Ok(desc) => desc,
         Err(error) => {
@@ -806,7 +908,7 @@ fn log_amf_encode_adapter(device: &ID3D11Device) {
 
 impl AmfSession {
     fn new(
-        factory: *mut AMFFactoryObj,
+        factory: AmfFactory,
         runtime_version: u64,
         config: EncodeConfig,
         capture_device: Option<GpuDeviceHandle>,
@@ -820,7 +922,7 @@ impl AmfSession {
         );
 
         // 1. Create context and init DX11
-        let context = AmfContext::new(factory)?;
+        let context = factory.create_context()?;
 
         let init_device = capture_device.as_ref().map(GpuDeviceHandle::d3d11_device);
         // Use the capture device when available so shared textures and AMF
@@ -847,22 +949,7 @@ impl AmfSession {
             VideoCodec::H265 => AMF_VIDEO_ENCODER_HEVC,
             VideoCodec::Av1 => AMF_VIDEO_ENCODER_AV1,
         };
-        let codec_id_wide = to_wide(codec_id);
-
-        let encoder = unsafe {
-            let mut component: *mut AMFComponentObj = ptr::null_mut();
-            let result = ((*(*factory).vtbl).CreateComponent)(
-                factory,
-                context.as_ptr(),
-                codec_id_wide.as_ptr(),
-                &mut component,
-            );
-            check_amf(result, "CreateComponent")?;
-            if component.is_null() {
-                return Err(FluxError::EncoderInit("CreateComponent returned null".into()));
-            }
-            AmfComponent { ptr: component }
-        };
+        let encoder = factory.create_component(&context, codec_id)?;
 
         // 3. Determine surface format.
         // Use BGRA for SDR — matches DXGI capture output directly.
@@ -1072,21 +1159,19 @@ impl AmfSession {
             return Ok(&self.cached_shared_textures[index].1);
         }
 
-        unsafe {
-            let handle = windows::Win32::Foundation::HANDLE(handle_val as *mut std::ffi::c_void);
-            let mut texture: Option<ID3D11Texture2D> = None;
-            self.d3d11_device
-                .OpenSharedResource(handle, &mut texture)
-                .map_err(|e| FluxError::Encode {
-                    frame: self.frame_index,
-                    reason: format!("OpenSharedResource failed: {}", e),
-                })?;
-            let texture = texture.ok_or_else(|| FluxError::Encode {
-                frame: self.frame_index,
-                reason: "OpenSharedResource returned null texture".into(),
-            })?;
-            self.cached_shared_textures.push((handle_val, texture));
-        }
+        let handle = windows::Win32::Foundation::HANDLE(handle_val as *mut std::ffi::c_void);
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: `handle` is a DXGI shared handle from the capture side's
+        // texture ring and `texture` is a valid out-param.
+        unsafe { self.d3d11_device.OpenSharedResource(handle, &mut texture) }.map_err(|e| FluxError::Encode {
+            frame: self.frame_index,
+            reason: format!("OpenSharedResource failed: {}", e),
+        })?;
+        let texture = texture.ok_or_else(|| FluxError::Encode {
+            frame: self.frame_index,
+            reason: "OpenSharedResource returned null texture".into(),
+        })?;
+        self.cached_shared_textures.push((handle_val, texture));
         if self.cached_shared_textures.len() > MAX_CACHED_SHARED_TEXTURES {
             self.cached_shared_textures.remove(0);
         }
@@ -1100,15 +1185,8 @@ impl AmfSession {
     }
 
     /// Extract bitstream from an AMFBuffer output.
-    fn extract_output(&mut self, data: *mut AMFDataObj) -> EncodedPacket {
-        let size = amf_buffer_get_size(data);
-        let native = amf_buffer_get_native(data);
-
-        let bitstream = if !native.is_null() && size > 0 {
-            unsafe { std::slice::from_raw_parts(native as *const u8, size).to_vec() }
-        } else {
-            Vec::new()
-        };
+    fn extract_output(&mut self, data: &AmfBuffer) -> EncodedPacket {
+        let bitstream = data.to_vec();
 
         // Primary: read OutputDataType from the output buffer (authoritative, like OBS).
         // Fallback: scan for IDR NALU types in the bitstream.
@@ -1117,7 +1195,7 @@ impl AmfSession {
             VideoCodec::H265 => HEVC_OUTPUT_DATA_TYPE,
             VideoCodec::Av1 => H264_OUTPUT_DATA_TYPE, // fallback, AV1 uses different prop
         };
-        let is_keyframe = match amf_data_get_property_int64(data, output_type_prop) {
+        let is_keyframe = match data.get_property_int64(output_type_prop) {
             Ok(t) => t == OUTPUT_DATA_TYPE_IDR,
             Err(_) => contains_idr_nalu(&bitstream, self.config.codec),
         };
@@ -1145,14 +1223,8 @@ impl AmfSession {
     /// Poll encoder output, collecting all available packets.
     fn drain_output(&mut self) -> Vec<EncodedPacket> {
         let mut packets = Vec::new();
-        loop {
-            let (result, data) = self.encoder.query_output();
-            if result == AMF_OK && !data.is_null() {
-                packets.push(self.extract_output(data));
-                amf_data_release(data);
-            } else {
-                break;
-            }
+        while let (AMF_OK, Some(data)) = self.encoder.query_output() {
+            packets.push(self.extract_output(&data));
         }
         packets
     }
@@ -1178,7 +1250,11 @@ impl EncodeSession for AmfSession {
             // Zero-copy path: use cached shared texture reference
             let texture = self.open_shared_texture(dxgi.handle)?;
             let tex_ptr = Interface::as_raw(texture);
-            self.context.create_surface_from_dx11(tex_ptr as *mut std::ffi::c_void)?
+            // SAFETY: `texture` is a live ID3D11Texture2D opened on the context's
+            // device and stays open in `cached_shared_textures`. That the capture
+            // side does not rewrite it before AMF finishes reading relies on the
+            // `DXGI_SHARED_TEXTURE_RING_SIZE` ring, not on anything checked here.
+            unsafe { self.context.create_surface_from_dx11(tex_ptr) }?
         } else if !frame.data.is_empty() {
             // CPU path: wrap host memory as an AMF surface (no extra copy).
             // For BGRA: stride = width * 4, vPitch = height.
@@ -1187,14 +1263,20 @@ impl EncodeSession for AmfSession {
             let h_pitch = frame.stride as i32; // bytes per row
             let v_pitch = h;                   // number of rows
 
-            self.context.create_surface_from_host_native(
-                self.surface_format,
-                w,
-                h,
-                h_pitch,
-                v_pitch,
-                frame.data.as_ptr() as *mut std::ffi::c_void,
-            )?
+            // SAFETY: `frame.data` holds `stride * height` bytes of the session's
+            // surface format and AMF only reads it. AMF wraps rather than copies
+            // the memory, so this relies on the encoder having consumed the
+            // surface before the caller recycles `frame` after `encode` returns.
+            unsafe {
+                self.context.create_surface_from_host_native(
+                    self.surface_format,
+                    w,
+                    h,
+                    h_pitch,
+                    v_pitch,
+                    frame.data.as_ptr() as *mut std::ffi::c_void,
+                )
+            }?
         } else {
             return Err(FluxError::Encode {
                 frame: self.frame_index,
@@ -1212,8 +1294,8 @@ impl EncodeSession for AmfSession {
         self.first_capture_timestamp = Some(first_timestamp);
         let pts_amf = clamp_monotonic_pts(raw_pts_amf, self.last_pts_amf);
         self.last_pts_amf = pts_amf;
-        amf_data_set_pts(surface, pts_amf);
-        amf_data_set_duration(surface, self.frame_duration_100ns);
+        surface.set_pts(pts_amf);
+        surface.set_duration(self.frame_duration_100ns);
 
         // Force IDR if requested (IDR_PERIOD=0 is set in init for LOW_LATENCY mode)
         if is_idr {
@@ -1224,27 +1306,26 @@ impl EncodeSession for AmfSession {
             };
             // Set INSERT_SPS + INSERT_PPS so decoders can start from any IDR
             if self.config.codec == VideoCodec::H264 {
-                let _ = amf_data_set_property_int64(surface, H264_INSERT_SPS, 1);
-                let _ = amf_data_set_property_int64(surface, H264_INSERT_PPS, 1);
+                let _ = surface.set_property_int64(H264_INSERT_SPS, 1);
+                let _ = surface.set_property_int64(H264_INSERT_PPS, 1);
             }
-            match amf_data_set_property_int64(surface, force_type_prop, PICTURE_TYPE_IDR) {
+            match surface.set_property_int64(force_type_prop, PICTURE_TYPE_IDR) {
                 Ok(()) => tracing::debug!("AMF: SetProperty({}) = IDR({}) on surface OK", force_type_prop, PICTURE_TYPE_IDR),
                 Err(e) => tracing::warn!("AMF: SetProperty({}) failed: {}", force_type_prop, e),
             }
         }
 
         // Submit input — may return AMF_INPUT_FULL, in which case we poll output first
-        let mut submit_result = self.encoder.submit_input(surface);
+        let mut submit_result = self.encoder.submit_input(&surface);
         let mut packets = Vec::new();
 
         if submit_result == AMF_INPUT_FULL {
             // Drain output before retrying
             packets.extend(self.drain_output());
-            submit_result = self.encoder.submit_input(surface);
+            submit_result = self.encoder.submit_input(&surface);
         }
 
         if submit_result != AMF_OK {
-            amf_data_release(surface);
             return Err(FluxError::Encode {
                 frame: self.frame_index,
                 reason: format!("AMF SubmitInput failed: {}", submit_result),
@@ -1253,7 +1334,7 @@ impl EncodeSession for AmfSession {
 
         // Release the input surface — AMF has its own internal reference now.
         // Without this, every frame leaks an AMF surface object.
-        amf_data_release(surface);
+        drop(surface);
 
         // Poll output
         packets.extend(self.drain_output());
@@ -1301,14 +1382,8 @@ impl EncodeSession for AmfSession {
 
         // Collect remaining output
         let mut packets = Vec::new();
-        loop {
-            let (result, data) = self.encoder.query_output();
-            if result == AMF_OK && !data.is_null() {
-                packets.push(self.extract_output(data));
-                amf_data_release(data);
-            } else {
-                break;
-            }
+        while let (AMF_OK, Some(data)) = self.encoder.query_output() {
+            packets.push(self.extract_output(&data));
         }
 
         tracing::debug!("AMF flush: {} remaining packets", packets.len());
