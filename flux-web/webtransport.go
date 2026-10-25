@@ -209,9 +209,8 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		session.needsIDR.Store(true)
 		upstream.requestInitialIDR(session)
 		if width != 0 && height != 0 {
-			upstream.sendResolutionStatus(transitioningStatus(width, height))
-			if !upstream.send(resolutionCommand(width, height)) {
-				session.fail("resolution change could not be queued")
+			if !upstream.sendResolutionChange(width, height) {
+				session.fail(errResolutionNotQueued.Error())
 				return
 			}
 		}
@@ -286,6 +285,11 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	session.releaseNow()
 }
 
+var (
+	errInvalidResolution   = errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+	errResolutionNotQueued = errors.New("resolution change could not be queued")
+)
+
 func requestedResolution(r *http.Request) (uint32, uint32, error) {
 	widthValue, heightValue := r.URL.Query().Get("width"), r.URL.Query().Get("height")
 	if widthValue == "" && heightValue == "" {
@@ -293,11 +297,11 @@ func requestedResolution(r *http.Request) (uint32, uint32, error) {
 	}
 	width, err := strconv.ParseUint(widthValue, 10, 32)
 	if err != nil {
-		return 0, 0, errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+		return 0, 0, errInvalidResolution
 	}
 	height, err := strconv.ParseUint(heightValue, 10, 32)
 	if err != nil {
-		return 0, 0, errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+		return 0, 0, errInvalidResolution
 	}
 	if err := validateResolution(uint32(width), uint32(height)); err != nil {
 		return 0, 0, err
@@ -307,7 +311,7 @@ func requestedResolution(r *http.Request) (uint32, uint32, error) {
 
 func validateResolution(width, height uint32) error {
 	if width < 640 || width > 2560 || height < 480 || height > 1440 || width%2 != 0 || height%2 != 0 {
-		return errors.New("invalid resolution; use even dimensions from 640x480 through 2560x1440")
+		return errInvalidResolution
 	}
 	return nil
 }
@@ -329,6 +333,17 @@ func transitioningStatus(width, height uint32) []byte {
 	return status
 }
 
+// sendResolutionChange queues command 0x06 for the host and, once queued,
+// tells the viewer the host is transitioning to width×height. It reports
+// false (and sends no status) when the command channel is full.
+func (u *machineUpstream) sendResolutionChange(width, height uint32) bool {
+	if !u.send(resolutionCommand(width, height)) {
+		return false
+	}
+	u.sendResolutionStatus(transitioningStatus(width, height))
+	return true
+}
+
 // deferredStart begins the frame flow for an authenticating viewer whose
 // host login just succeeded (resolution change + initial IDR).
 func (s *Session) deferredStart(u *machineUpstream) {
@@ -336,9 +351,8 @@ func (s *Session) deferredStart(u *machineUpstream) {
 	if s.pendingWidth != 0 && s.pendingHeight != 0 {
 		width, height := s.pendingWidth, s.pendingHeight
 		s.pendingWidth, s.pendingHeight = 0, 0
-		u.sendResolutionStatus(transitioningStatus(width, height))
-		if !u.send(resolutionCommand(width, height)) {
-			s.fail("resolution change could not be queued")
+		if !u.sendResolutionChange(width, height) {
+			s.fail(errResolutionNotQueued.Error())
 			return
 		}
 	}
@@ -516,7 +530,7 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 		if err := json.Unmarshal(message.Data, &resolution); err != nil {
 			return s.writeControl(controlMessage{
 				Type: "error",
-				Data: mustJSON(map[string]string{"error": "invalid resolution; use even dimensions from 640x480 through 2560x1440"}),
+				Data: mustJSON(map[string]string{"error": errInvalidResolution.Error()}),
 			})
 		}
 		if err := validateResolution(resolution.Width, resolution.Height); err != nil {
@@ -531,13 +545,12 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 				Data: mustJSON(map[string]string{"error": "no active machine session"}),
 			})
 		}
-		if !machine.send(resolutionCommand(resolution.Width, resolution.Height)) {
+		if !machine.sendResolutionChange(resolution.Width, resolution.Height) {
 			return s.writeControl(controlMessage{
 				Type: "error",
-				Data: mustJSON(map[string]string{"error": "resolution change could not be queued"}),
+				Data: mustJSON(map[string]string{"error": errResolutionNotQueued.Error()}),
 			})
 		}
-		machine.sendResolutionStatus(transitioningStatus(resolution.Width, resolution.Height))
 	case "audio":
 		var audio struct {
 			Enabled bool `json:"enabled"`
