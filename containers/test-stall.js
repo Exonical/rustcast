@@ -15,20 +15,25 @@ const path = require('path');
 const query = process.argv[2] || '';
 const reportPath = process.argv[3];
 const relayBase = process.env.FLUX_RELAY || 'http://localhost:8080';
+const relayUrl = new URL(relayBase);
 const chromePath = process.env.CHROME || (process.platform !== 'win32' ? 'google-chrome' : 'C:/Program Files/Google/Chrome/Application/chrome.exe');
 const port = 9334;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let chrome;
 
 (async () => {
+  if (process.env.FLUX_COOKIE && relayUrl.protocol === 'http:' &&
+      !['localhost', '127.0.0.1', '::1', '[::1]'].includes(relayUrl.hostname.toLowerCase())) {
+    console.warn('FLUX_COOKIE is sent unencrypted over HTTP to a non-loopback relay; use an https:// FLUX_RELAY for remote relays.');
+  }
   const headers = process.env.FLUX_COOKIE ? { Cookie: process.env.FLUX_COOKIE } : {};
-  const discoveryResponse = await fetch(new URL('/api/webtransport', relayBase), { headers });
+  const discoveryResponse = await fetch(new URL('/api/webtransport', relayUrl), { headers });
   if (!discoveryResponse.ok) {
     throw new Error(`WebTransport discovery failed with HTTP ${discoveryResponse.status}; when auth is enabled, set FLUX_COOKIE to a logged-in relay session cookie.`);
   }
   const discovery = await discoveryResponse.json();
   const params = new URLSearchParams(query);
-  params.set('wtHost', discovery.host || 'localhost');
+  params.set('wtHost', discovery.host || relayUrl.hostname);
   params.set('wtPort', String(discovery.port));
   params.set('certHashes', (discovery.certHashes || []).join(','));
   if (discovery.ticket) params.set('ticket', discovery.ticket);
