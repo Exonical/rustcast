@@ -54,14 +54,14 @@ pub fn login_env(user: &OsUser, pam_env: &[(OsString, OsString)]) -> Vec<(OsStri
     env
 }
 
-/// Run a program fully de-privileged as `user`: fork, initgroups, setgid,
-/// setuid, chdir home, controlled environment.
-pub fn run_as_user(
+/// Build a command that runs fully de-privileged as `user` once spawned:
+/// fork, initgroups, setgid, setuid, chdir home, controlled environment.
+pub fn command_as_user(
     user: &OsUser,
     pam_env: &[(OsString, OsString)],
     program: &str,
     args: &[&str],
-) -> io::Result<Child> {
+) -> io::Result<Command> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -81,5 +81,10 @@ pub fn run_as_user(
             Ok(())
         });
     }
-    cmd.spawn()
+    Ok(cmd)
+}
+
+/// Spawn `program` de-privileged as `user` (see [`command_as_user`]).
+pub fn run_as_user(user: &OsUser, pam_env: &[(OsString, OsString)], program: &str, args: &[&str]) -> io::Result<Child> {
+    command_as_user(user, pam_env, program, args)?.spawn()
 }
