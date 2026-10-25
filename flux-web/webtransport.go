@@ -112,9 +112,6 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 			return
 		}
 	}
-	if machineID == "" {
-		machineID = "default"
-	}
 	transport, err := server.Upgrade(w, r)
 	if err != nil {
 		log.Printf("[webtransport] upgrade failed: %v", err)
