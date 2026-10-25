@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use crate::PrivacyController;
-use crate::frame_protocol::{CommandChannels, frame_header, read_commands};
+use crate::frame_protocol::{
+    CommandChannels, MSG_AUDIO, MSG_CLIPBOARD, MSG_CURSOR, MSG_RESOLUTION_STATUS, MSG_VIDEO, frame_header,
+    read_commands,
+};
 use crate::resolution::ResolutionStatusMessage;
 
 /// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
-/// Wire format (messages out, commands in) is documented in `frame_protocol`.
-/// Outbound types: 0x01 H.264 access unit, 0x02 cursor JSON metadata,
-/// 0x03 resolution status, 0x04 Opus audio, 0x05 clipboard JSON.
+/// Wire format (`MSG_*` messages out, commands in) is documented in `frame_protocol`.
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
@@ -70,7 +71,7 @@ pub(crate) async fn serve(
                 }
             };
             if !initial_payload.is_empty()
-                && write_frame_message(&mut writer, 0x02, initial_cursor.0, &initial_payload)
+                && write_frame_message(&mut writer, MSG_CURSOR, initial_cursor.0, &initial_payload)
                     .await
                     .is_err()
             {
@@ -92,7 +93,7 @@ pub(crate) async fn serve(
                         let Ok(payload) = serde_json::to_vec(&cursor.1) else {
                             continue;
                         };
-                        if write_frame_message(&mut writer, 0x02, cursor.0, &payload)
+                        if write_frame_message(&mut writer, MSG_CURSOR, cursor.0, &payload)
                             .await
                             .is_err()
                         {
@@ -101,7 +102,7 @@ pub(crate) async fn serve(
                         continue;
                     }
                     result = rx.recv() => match result {
-                        Ok(d) => (0x01, d),
+                        Ok(d) => (MSG_VIDEO, d),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Frame client {} lagged by {} frames", addr, n);
                             continue;
@@ -109,17 +110,17 @@ pub(crate) async fn serve(
                         Err(_) => break,
                     },
                     result = audio_rx.recv() => match result {
-                        Ok(d) => (0x04, d),
+                        Ok(d) => (MSG_AUDIO, d),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
                     result = clipboard_rx.recv() => match result {
-                        Ok(d) => (0x05, d),
+                        Ok(d) => (MSG_CLIPBOARD, d),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
                     result = resolution_status_rx.recv() => match result {
-                        Ok(status) => (0x03, status),
+                        Ok(status) => (MSG_RESOLUTION_STATUS, status),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     },
