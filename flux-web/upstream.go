@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -644,56 +645,103 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			return nil
 		default:
 		}
-		// Protocol: [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload].
-		// Type 0x01 is H.264; type 0x02 is cursor JSON metadata.
-		var hdr [13]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			return fmt.Errorf("read header: %w", err)
-		}
-		messageType := hdr[0]
-		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
-		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
-		if payloadLen == 0 || payloadLen > maxFramePayloadSize {
-			return fmt.Errorf("invalid frame length: %d", payloadLen)
-		}
-		frame, err := u.readPayload(conn, messageType, int(payloadLen))
+		header, frame, err := u.readFrame(conn)
 		if err != nil {
-			return fmt.Errorf("read frame data: %w", err)
+			return err
 		}
-		data := frame.data
-		switch messageType {
-		case 0x01:
-			frameCount++
-			u.metrics.upstreamFrames.Inc()
-			u.metrics.upstreamBytes.Add(float64(len(data)))
-			u.abr.countFrameBytes(len(data))
-			if frameCount%300 == 0 {
-				log.Printf("[frame:%s] received %d frames (last=%d bytes)", u.id, frameCount, payloadLen)
-			}
-			frame.tsMicros, frame.receivedAt = tsMicros, time.Now()
-			if u.queueFrame(frame) {
-				u.requestIDR(idrReasonUpstreamDrop)
-			}
-		case 0x02:
-			if !json.Valid(data) {
-				log.Printf("[frame:%s] invalid cursor JSON", u.id)
-				continue
-			}
-			u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
-		case 0x03:
-			u.sendResolutionStatus(data)
-		case 0x04:
-			u.metrics.upstreamAudioPackets.Inc()
-			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
-			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
-		case 0x05:
-			u.handleClipboardFrame(data)
-		case 0x06:
-			u.handleLoginFrame(data)
-		default:
-			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
+		if err := u.dispatchFrame(header, frame, "tcp", &frameCount); err != nil {
+			return err
 		}
 	}
+}
+
+// frameHeader is the prefix of every host→relay message:
+// [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload].
+type frameHeader struct {
+	messageType byte
+	tsMicros    uint64
+	payloadLen  uint32
+}
+
+// readFrame reads one complete host message (header and payload). Errors are
+// fatal for the connection, except that callers on QUIC may skip streams the
+// host reset (see isStreamReset).
+func (u *machineUpstream) readFrame(reader io.Reader) (frameHeader, frameMsg, error) {
+	var hdr [13]byte
+	if _, err := io.ReadFull(reader, hdr[:]); err != nil {
+		return frameHeader{}, frameMsg{}, fmt.Errorf("read header: %w", err)
+	}
+	header := frameHeader{
+		messageType: hdr[0],
+		tsMicros:    binary.BigEndian.Uint64(hdr[1:9]),
+		payloadLen:  binary.BigEndian.Uint32(hdr[9:13]),
+	}
+	if header.payloadLen == 0 || header.payloadLen > maxFramePayloadSize {
+		return frameHeader{}, frameMsg{}, fmt.Errorf("invalid frame length: %d", header.payloadLen)
+	}
+	frame, err := u.readPayload(reader, header.messageType, int(header.payloadLen))
+	if err != nil {
+		return frameHeader{}, frameMsg{}, fmt.Errorf("read frame data: %w", err)
+	}
+	return header, frame, nil
+}
+
+// dispatchFrame routes one host message by type. frameCount counts video
+// frames on the current connection for the periodic log line.
+func (u *machineUpstream) dispatchFrame(header frameHeader, frame frameMsg, transport string, frameCount *uint64) error {
+	data := frame.data
+	switch header.messageType {
+	case 0x01:
+		*frameCount++
+		u.metrics.upstreamFrames.Inc()
+		u.metrics.upstreamBytes.Add(float64(len(data)))
+		u.abr.countFrameBytes(len(data))
+		if *frameCount%300 == 0 {
+			log.Printf("[frame:%s] received %d frames via %s (last=%d bytes)", u.id, *frameCount, transport, header.payloadLen)
+		}
+		frame.tsMicros, frame.receivedAt = header.tsMicros, time.Now()
+		if u.queueFrame(frame) {
+			u.requestIDR(idrReasonUpstreamDrop)
+		}
+	case 0x02:
+		if !json.Valid(data) {
+			log.Printf("[frame:%s] invalid cursor JSON", u.id)
+			return nil
+		}
+		u.sendCursor(cursorMsg{tsMicros: header.tsMicros, data: data})
+	case 0x03:
+		u.sendResolutionStatus(data)
+	case 0x04:
+		u.metrics.upstreamAudioPackets.Inc()
+		u.metrics.upstreamAudioBytes.Add(float64(len(data)))
+		u.sendAudio(audioMsg{tsMicros: header.tsMicros, data: data})
+	case 0x05:
+		u.handleClipboardFrame(data)
+	case 0x06:
+		u.handleLoginFrame(data)
+	default:
+		return fmt.Errorf("unknown frame message type: 0x%02x", header.messageType)
+	}
+	return nil
+}
+
+// readQUICStream reads and dispatches the single message carried by a QUIC
+// uni-stream. A stream the host reset (it abandons superseded P-frames under
+// backlog) is dropped; any other error is fatal for the connection.
+func (u *machineUpstream) readQUICStream(stream io.Reader, frameCount *uint64) error {
+	header, frame, err := u.readFrame(stream)
+	if err != nil {
+		if isStreamReset(err) {
+			return nil
+		}
+		return err
+	}
+	return u.dispatchFrame(header, frame, "quic", frameCount)
+}
+
+func isStreamReset(err error) bool {
+	var streamErr *quic.StreamError
+	return errors.As(err, &streamErr) && streamErr.Remote
 }
 
 func (u *machineUpstream) connectQUIC() error {
@@ -783,51 +831,8 @@ func (u *machineUpstream) connectQUIC() error {
 		if err != nil {
 			return fmt.Errorf("accept stream: %w", err)
 		}
-		// Frame stream: [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload].
-		var hdr [13]byte
-		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
-			continue
-		}
-		messageType := hdr[0]
-		tsMicros := binary.BigEndian.Uint64(hdr[1:9])
-		payloadLen := binary.BigEndian.Uint32(hdr[9:13])
-		if payloadLen == 0 || payloadLen > maxFramePayloadSize {
-			continue
-		}
-		frame, err := u.readPayload(stream, messageType, int(payloadLen))
-		if err != nil {
-			continue
-		}
-		data := frame.data
-		switch messageType {
-		case 0x01:
-			frameCount++
-			u.metrics.upstreamFrames.Inc()
-			u.metrics.upstreamBytes.Add(float64(len(data)))
-			u.abr.countFrameBytes(len(data))
-			if frameCount%300 == 0 {
-				log.Printf("[frame:%s] received %d frames via quic (last=%d bytes)", u.id, frameCount, payloadLen)
-			}
-			frame.tsMicros, frame.receivedAt = tsMicros, time.Now()
-			if u.queueFrame(frame) {
-				u.requestIDR(idrReasonUpstreamDrop)
-			}
-		case 0x02:
-			if json.Valid(data) {
-				u.sendCursor(cursorMsg{tsMicros: tsMicros, data: data})
-			}
-		case 0x03:
-			u.sendResolutionStatus(data)
-		case 0x04:
-			u.metrics.upstreamAudioPackets.Inc()
-			u.metrics.upstreamAudioBytes.Add(float64(len(data)))
-			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
-		case 0x05:
-			u.handleClipboardFrame(data)
-		case 0x06:
-			u.handleLoginFrame(data)
-		default:
-			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
+		if err := u.readQUICStream(stream, &frameCount); err != nil {
+			return err
 		}
 	}
 }

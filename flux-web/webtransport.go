@@ -212,13 +212,8 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		session.needsIDR.Store(true)
 		upstream.requestInitialIDR(session)
 		if width != 0 && height != 0 {
-			status, _ := json.Marshal(map[string]any{
-				"state":  "transitioning",
-				"width":  width,
-				"height": height,
-			})
-			upstream.sendResolutionStatus(status)
-			if !upstream.send([]byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}) {
+			upstream.sendResolutionStatus(transitioningStatus(width, height))
+			if !upstream.send(resolutionCommand(width, height)) {
 				session.fail("resolution change could not be queued")
 				return
 			}
@@ -320,6 +315,23 @@ func validateResolution(width, height uint32) error {
 	return nil
 }
 
+// resolutionCommand encodes relay→host command 0x06: set the capture
+// resolution to width×height (each a 16-bit BE value).
+func resolutionCommand(width, height uint32) []byte {
+	return []byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}
+}
+
+// transitioningStatus is the resolution status broadcast to viewers while the
+// host switches to width×height.
+func transitioningStatus(width, height uint32) []byte {
+	status, _ := json.Marshal(map[string]any{
+		"state":  "transitioning",
+		"width":  width,
+		"height": height,
+	})
+	return status
+}
+
 // deferredStart begins the frame flow for an authenticating viewer whose
 // host login just succeeded (resolution change + initial IDR).
 func (s *Session) deferredStart(u *machineUpstream) {
@@ -327,13 +339,8 @@ func (s *Session) deferredStart(u *machineUpstream) {
 	if s.pendingWidth != 0 && s.pendingHeight != 0 {
 		width, height := s.pendingWidth, s.pendingHeight
 		s.pendingWidth, s.pendingHeight = 0, 0
-		status, _ := json.Marshal(map[string]any{
-			"state":  "transitioning",
-			"width":  width,
-			"height": height,
-		})
-		u.sendResolutionStatus(status)
-		if !u.send([]byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}) {
+		u.sendResolutionStatus(transitioningStatus(width, height))
+		if !u.send(resolutionCommand(width, height)) {
 			s.fail("resolution change could not be queued")
 			return
 		}
@@ -527,23 +534,13 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 				Data: mustJSON(map[string]string{"error": "no active machine session"}),
 			})
 		}
-		command := []byte{
-			0x06,
-			byte(resolution.Width >> 8), byte(resolution.Width),
-			byte(resolution.Height >> 8), byte(resolution.Height),
-		}
-		if !machine.send(command) {
+		if !machine.send(resolutionCommand(resolution.Width, resolution.Height)) {
 			return s.writeControl(controlMessage{
 				Type: "error",
 				Data: mustJSON(map[string]string{"error": "resolution change could not be queued"}),
 			})
 		}
-		status, _ := json.Marshal(map[string]any{
-			"state":  "transitioning",
-			"width":  resolution.Width,
-			"height": resolution.Height,
-		})
-		machine.sendResolutionStatus(status)
+		machine.sendResolutionStatus(transitioningStatus(resolution.Width, resolution.Height))
 	case "audio":
 		var audio struct {
 			Enabled bool `json:"enabled"`
