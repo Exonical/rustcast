@@ -5,9 +5,8 @@
 //! zero-copy GPU encode.
 
 use flux_core::error::{FluxError, Result};
+#[cfg(feature = "capture-pipewire")]
 use flux_core::frame::CapturedFrame;
-#[cfg(not(feature = "capture-pipewire"))]
-use flux_core::types::PixelFormat;
 use flux_core::types::Resolution;
 
 use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
@@ -21,6 +20,9 @@ const STUB_DISPLAY_ID: u32 = 0;
 /// Name of the display reported when capture owns a Mutter virtual monitor.
 pub const VIRTUAL_MONITOR_NAME: &str = "Rustcast virtual monitor";
 
+#[cfg(not(feature = "capture-pipewire"))]
+const NOT_BUILT: &str = "PipeWire capture not available: built without feature 'capture-pipewire'";
+
 /// PipeWire screen-cast capture backend.
 pub struct PipeWireCapture {
     // Will hold PipeWire main-loop, core proxy, etc.
@@ -28,18 +30,19 @@ pub struct PipeWireCapture {
 }
 
 impl PipeWireCapture {
+    /// Fails without the `capture-pipewire` feature: there is no stream to
+    /// read frames from, so a "working" backend would only stream black.
     pub fn new() -> Result<Self> {
-        tracing::info!("Initializing PipeWire screen-cast capture");
+        #[cfg(not(feature = "capture-pipewire"))]
+        {
+            Err(FluxError::Capture(NOT_BUILT.into()))
+        }
 
-        // TODO: Initialization sequence:
-        //
-        //   1. Connect to D-Bus session bus
-        //   2. Call org.freedesktop.portal.ScreenCast.CreateSession
-        //   3. SelectSources (monitor / window / virtual)
-        //   4. Start → receive PipeWire node_id
-        //   5. Initialize PipeWire context and connect to the node
-
-        Ok(Self { _private: () })
+        #[cfg(feature = "capture-pipewire")]
+        {
+            tracing::info!("Initializing PipeWire screen-cast capture");
+            Ok(Self { _private: () })
+        }
     }
 }
 
@@ -136,11 +139,7 @@ impl ScreenCapture for PipeWireCapture {
 
         #[cfg(not(feature = "capture-pipewire"))]
         {
-            Ok(Box::new(PipeWireCaptureSession::new(
-                display_id.unwrap_or(0),
-                resolution,
-                framerate,
-            )?))
+            Err(FluxError::Capture(NOT_BUILT.into()))
         }
     }
 }
@@ -389,86 +388,21 @@ mod real {
     }
 }
 
-/// An active PipeWire capture session.
-#[cfg(not(feature = "capture-pipewire"))]
-struct PipeWireCaptureSession {
-    display_id: u32,
-    resolution: Resolution,
-    framerate: u32,
-    frame_sequence: u64,
-    running: bool,
-    // TODO: Store pw_stream, spa buffers, etc.
-}
+#[cfg(all(test, not(feature = "capture-pipewire")))]
+mod stub_tests {
+    use super::*;
 
-#[cfg(not(feature = "capture-pipewire"))]
-impl PipeWireCaptureSession {
-    fn new(display_id: u32, resolution: Resolution, framerate: u32) -> Result<Self> {
-        // TODO: Full initialization:
-        //
-        //   1. pw_stream_new(core, "flux-capture", props)
-        //   2. Set stream params requesting DMA-BUF + SPA_VIDEO_FORMAT_BGRx
-        //   3. pw_stream_connect(PW_DIRECTION_INPUT, node_id, PW_STREAM_FLAG_AUTOCONNECT)
-        //   4. Register on_process callback to receive buffers
-        //   5. Start the PipeWire main loop on a dedicated thread
-
-        Ok(Self {
-            display_id,
-            resolution,
-            framerate,
-            frame_sequence: 0,
-            running: true,
-        })
-    }
-
-    fn acquire_frame(&mut self) -> Result<CapturedFrame> {
-        // TODO: Real implementation:
-        //
-        //   1. Dequeue buffer from pw_stream
-        //   2. If buffer has SPA_DATA_DmaBuf:
-        //      - Extract fd, offset, stride, modifier from spa_data
-        //      - Return CapturedFrame with GpuFrameHandle::DmaBuf
-        //   3. If buffer has SPA_DATA_MemPtr (fallback):
-        //      - memcpy the pixel data
-        //      - Return CapturedFrame with data vec
-        //   4. pw_stream_queue_buffer to return the buffer
-
-        self.frame_sequence += 1;
-
-        // Until the real PipeWire stream is wired up (see `bridge` module and
-        // the `PipewireFrameSource` trait), return an empty CPU frame rather
-        // than fabricating an invalid DMA-BUF fd.
-        Ok(CapturedFrame {
-            sequence: self.frame_sequence,
-            timestamp: std::time::Instant::now(),
-            format: PixelFormat::Bgra8,
-            resolution: self.resolution,
-            stride: self.resolution.width * 4,
-            data: Vec::new(),
-            gpu_handle: None,
-        })
-    }
-}
-
-#[cfg(not(feature = "capture-pipewire"))]
-impl CaptureSession for PipeWireCaptureSession {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        if !self.running {
-            return Err(FluxError::Capture("session stopped".into()));
+    #[test]
+    fn construction_fails_instead_of_faking_success() {
+        match PipeWireCapture::new() {
+            Err(FluxError::Capture(msg)) => assert!(msg.contains("capture-pipewire"), "{msg}"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("stub PipeWire capture must not construct"),
         }
-        self.acquire_frame()
     }
 
-    fn try_next_frame(&mut self) -> Result<Option<CapturedFrame>> {
-        if !self.running {
-            return Ok(None);
-        }
-        Ok(Some(self.acquire_frame()?))
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        tracing::info!("Stopping PipeWire capture session");
-        self.running = false;
-        // TODO: pw_stream_disconnect, destroy main loop, close DMA-BUF fds.
-        Ok(())
+    #[test]
+    fn default_create_capture_fails_without_feature() {
+        assert!(matches!(crate::create_capture(None), Err(FluxError::Capture(_))));
     }
 }
