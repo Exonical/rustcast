@@ -178,13 +178,13 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
-    clipboard: crate::ClipboardCtx,
+    clipboard: crate::clipboard::ClipboardCtx,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
-    resolution_status_tx: tokio::sync::broadcast::Sender<crate::ResolutionStatusMessage>,
+    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
+    resolution_status_tx: tokio::sync::broadcast::Sender<crate::resolution::ResolutionStatusMessage>,
     input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -226,13 +226,13 @@ async fn handle_connection(
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut audio_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut clipboard_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
-    clipboard: crate::ClipboardCtx,
+    clipboard: crate::clipboard::ClipboardCtx,
     mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
-    mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::ResolutionStatusMessage>,
+    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
+    mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::resolution::ResolutionStatusMessage>,
     input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
@@ -587,9 +587,9 @@ async fn read_commands(
     idr_tx: std::sync::mpsc::Sender<()>,
     bitrate_tx: std::sync::mpsc::Sender<u32>,
     quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::ModeRequest>,
+    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
     input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
-    clipboard: crate::ClipboardCtx,
+    clipboard: crate::clipboard::ClipboardCtx,
     privacy_connection: Option<PrivacyConnection>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -672,7 +672,7 @@ async fn read_commands(
                     return;
                 }
                 if clipboard.enabled {
-                    match crate::parse_clipboard_set(&payload, clipboard.max_bytes) {
+                    match crate::clipboard::parse_clipboard_set(&payload, clipboard.max_bytes) {
                         Ok(msg) => {
                             if let Err(e) = clipboard.sink.set_text(msg.data) {
                                 tracing::warn!("QUIC clipboard set failed: {}", e);
@@ -689,7 +689,7 @@ async fn read_commands(
                 if recv.read_exact(&mut dimensions).await.is_err() {
                     return;
                 }
-                let _ = resolution_tx.send(crate::ModeRequest {
+                let _ = resolution_tx.send(crate::resolution::ModeRequest {
                     width: u16::from_be_bytes([dimensions[0], dimensions[1]]) as u32,
                     height: u16::from_be_bytes([dimensions[2], dimensions[3]]) as u32,
                 });

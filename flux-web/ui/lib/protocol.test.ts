@@ -33,10 +33,10 @@ function rustNumber(literal: string): number {
   return Number(literal.replace(/_/g, ""));
 }
 
-const serverMain = rustSource("flux/crates/flux-server/src/main.rs");
+const serverEncoder = rustSource("flux/crates/flux-server/src/encoder.rs");
 
 test("QUALITY_BPP matches quality_bpp() in flux-server", () => {
-  const body = rustItem(serverMain, "fn quality_bpp(");
+  const body = rustItem(serverEncoder, "fn quality_bpp(");
   const levelClamp = body.match(/level\.clamp\((\d+),\s*(\d+)\)/);
   assert.ok(levelClamp, "quality_bpp level clamp not found");
   assert.equal(Number(levelClamp[1]), MIN_QUALITY_LEVEL);
@@ -51,7 +51,7 @@ test("QUALITY_BPP matches quality_bpp() in flux-server", () => {
 });
 
 test("target bitrate clamp matches bitrate_kbps_for() in flux-server", () => {
-  const body = rustItem(serverMain, "fn bitrate_kbps_for(");
+  const body = rustItem(serverEncoder, "fn bitrate_kbps_for(");
   const clamp = body.match(/\.clamp\(([\d_.]+),\s*([\d_.]+)\)/);
   assert.ok(clamp, "bitrate_kbps_for clamp not found");
   assert.equal(rustNumber(clamp[1]), MIN_TARGET_BITRATE_KBPS);
