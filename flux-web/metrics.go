@@ -37,6 +37,13 @@ var (
 		"edge":    {},
 		"other":   {},
 	}
+	clientDropReasonValues = map[string]struct{}{
+		"not_painted":       {},
+		"awaiting_keyframe": {},
+		"decode_backlog":    {},
+		"lost":              {},
+		"decoder_error":     {},
+	}
 )
 
 type relayMetrics struct {
@@ -116,13 +123,14 @@ type machineMetrics struct {
 }
 
 type clientStats struct {
-	FPS              float64 `json:"fps"`
-	DecodeMs         float64 `json:"decodeMs"`
-	ReceiveToPaintMs float64 `json:"receiveToPaintMs"`
-	BitrateKbps      float64 `json:"bitrateKbps"`
-	FramesDropped    float64 `json:"framesDropped"`
-	Decoder          string  `json:"decoder"`
-	Browser          string  `json:"browser"`
+	FPS              float64            `json:"fps"`
+	DecodeMs         float64            `json:"decodeMs"`
+	ReceiveToPaintMs float64            `json:"receiveToPaintMs"`
+	BitrateKbps      float64            `json:"bitrateKbps"`
+	FramesDropped    float64            `json:"framesDropped"`
+	DroppedByReason  map[string]float64 `json:"droppedByReason"`
+	Decoder          string             `json:"decoder"`
+	Browser          string             `json:"browser"`
 }
 
 func newRelayMetrics() *relayMetrics {
@@ -155,7 +163,7 @@ func newRelayMetrics() *relayMetrics {
 		clientDecode:         prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_client_decode_seconds", Help: "Recent browser video decode time."}, []string{"machine"}),
 		clientReceivePaint:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_client_receive_to_paint_seconds", Help: "Recent browser receive-to-paint latency."}, []string{"machine"}),
 		clientBitrate:        prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_client_bitrate_kbps", Help: "Recent browser-received video bitrate."}, []string{"machine"}),
-		clientFramesDropped:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_client_frames_dropped_total", Help: "Frames dropped by the browser since the relay started counting."}, []string{"machine"}),
+		clientFramesDropped:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_client_frames_dropped_total", Help: "Frames dropped by the browser, by reason."}, []string{"machine", "reason"}),
 		clientInfo:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_client_info", Help: "Current browser and decoder information."}, []string{"machine", "browser", "decoder"}),
 	}
 	m.registry.MustRegister(
@@ -292,6 +300,14 @@ func validateClientStats(stats clientStats) (clientStats, bool) {
 		math.Trunc(stats.FramesDropped) != stats.FramesDropped {
 		return clientStats{}, false
 	}
+	for reason, value := range stats.DroppedByReason {
+		if _, known := clientDropReasonValues[reason]; !known {
+			continue
+		}
+		if !validMetricValue(value, maxClientDrops) || math.Trunc(value) != value {
+			return clientStats{}, false
+		}
+	}
 	if _, ok := clientDecoderValues[stats.Decoder]; !ok {
 		stats.Decoder = "unknown"
 	}
@@ -314,7 +330,15 @@ func (m *machineMetrics) recordClientStats(stats clientStats) bool {
 	m.clientDecode.Set(stats.DecodeMs / 1000)
 	m.clientReceivePaint.Set(stats.ReceiveToPaintMs / 1000)
 	m.clientBitrate.Set(stats.BitrateKbps)
-	m.owner.clientFramesDropped.WithLabelValues(m.id).Add(stats.FramesDropped)
+	var reasonTotal float64
+	for reason := range clientDropReasonValues {
+		count := stats.DroppedByReason[reason]
+		m.owner.clientFramesDropped.WithLabelValues(m.id, reason).Add(count)
+		reasonTotal += count
+	}
+	if residual := stats.FramesDropped - reasonTotal; residual > 0 {
+		m.owner.clientFramesDropped.WithLabelValues(m.id, "unknown").Add(residual)
+	}
 
 	m.clientMu.Lock()
 	defer m.clientMu.Unlock()

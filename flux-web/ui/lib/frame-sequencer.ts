@@ -10,6 +10,7 @@ export interface EncodedFrame {
 export interface SequenceResult {
   ready: EncodedFrame[];
   dropped: number;
+  awaitingKeyframe: number;
   requestKeyframe: boolean;
 }
 
@@ -22,11 +23,12 @@ export class FrameSequencer {
   constructor(private readonly gapTimeoutMs = 100, private readonly maxBufferedFrames = 256) {}
 
   push(frame: EncodedFrame, now: number): SequenceResult {
-    const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
+    const result: SequenceResult = { ready: [], dropped: 0, awaitingKeyframe: 0, requestKeyframe: false };
     if (this.expected === null) {
       if (!frame.keyframe) {
         if (this.buffered.size >= this.maxBufferedFrames) {
           result.dropped++;
+          result.awaitingKeyframe++;
           result.requestKeyframe = true;
         } else {
           this.buffered.set(frame.seq, frame);
@@ -37,6 +39,7 @@ export class FrameSequencer {
         if (seq === frame.seq || sequenceDistance(seq, frame.seq) >= 0x80000000) {
           this.buffered.delete(seq);
           result.dropped++;
+          result.awaitingKeyframe++;
         }
       }
       this.expected = frame.seq;
@@ -78,7 +81,7 @@ export class FrameSequencer {
   }
 
   markLost(seq: number, now: number): SequenceResult {
-    const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
+    const result: SequenceResult = { ready: [], dropped: 0, awaitingKeyframe: 0, requestKeyframe: false };
     if (this.expected === null) {
       result.requestKeyframe = true;
       return result;
@@ -98,12 +101,13 @@ export class FrameSequencer {
   }
 
   expire(now: number): SequenceResult {
-    const result: SequenceResult = { ready: [], dropped: 0, requestKeyframe: false };
+    const result: SequenceResult = { ready: [], dropped: 0, awaitingKeyframe: 0, requestKeyframe: false };
     if (this.expected === null) {
       for (const [seq, frame] of this.buffered) {
         if (now - frame.receivedAt > this.gapTimeoutMs) {
           this.buffered.delete(seq);
           result.dropped++;
+          result.awaitingKeyframe++;
           result.requestKeyframe = true;
         }
       }
@@ -123,6 +127,7 @@ export class FrameSequencer {
       this.buffered.delete(next.seq);
       if (this.waitingForKeyframe && !next.keyframe) {
         result.dropped++;
+        result.awaitingKeyframe++;
         this.expected = (next.seq + 1) >>> 0;
         result.requestKeyframe = true;
         continue;
@@ -138,6 +143,7 @@ export class FrameSequencer {
   private consume(frame: EncodedFrame, result: SequenceResult): void {
     if (this.waitingForKeyframe && !frame.keyframe) {
       result.dropped++;
+      result.awaitingKeyframe++;
       result.requestKeyframe = true;
     } else {
       if (frame.keyframe) this.waitingForKeyframe = false;

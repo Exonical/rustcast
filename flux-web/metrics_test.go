@@ -78,6 +78,12 @@ func TestRelayMetricsExposeSessionAndFrameMetrics(t *testing.T) {
 	if !strings.Contains(body, `machine="host-1"`) {
 		t.Fatal("scrape missing machine label")
 	}
+	if !strings.Contains(body, `flux_client_frames_dropped_total{machine="host-1",reason="unknown"} 2`) {
+		t.Fatalf("scrape missing unknown client drop reason: %s", body)
+	}
+	if !strings.Contains(body, "# HELP flux_client_frames_dropped_total Frames dropped by the browser, by reason.") {
+		t.Fatalf("scrape missing client drop reason help: %s", body)
+	}
 }
 
 func TestClientStatsValidationAndEnumNormalization(t *testing.T) {
@@ -105,12 +111,82 @@ func TestClientStatsValidationAndEnumNormalization(t *testing.T) {
 	}
 }
 
+func TestClientStatsRecordDropReasonsAndResidual(t *testing.T) {
+	metrics := newRelayMetrics()
+	machine := metrics.machine("host-3")
+	if !machine.recordClientStats(clientStats{
+		FramesDropped: 10,
+		DroppedByReason: map[string]float64{
+			"lost":              3,
+			"not_painted":       2,
+			"awaiting_keyframe": 1,
+		},
+	}) {
+		t.Fatal("valid client drop reasons were rejected")
+	}
+
+	body := scrapeMetrics(metrics)
+	for _, sample := range []string{
+		`flux_client_frames_dropped_total{machine="host-3",reason="lost"} 3`,
+		`flux_client_frames_dropped_total{machine="host-3",reason="not_painted"} 2`,
+		`flux_client_frames_dropped_total{machine="host-3",reason="awaiting_keyframe"} 1`,
+		`flux_client_frames_dropped_total{machine="host-3",reason="unknown"} 4`,
+	} {
+		if !strings.Contains(body, sample) {
+			t.Errorf("scrape missing %s", sample)
+		}
+	}
+}
+
+func TestLegacyClientStatsDropsAreUnknown(t *testing.T) {
+	stats, ok := decodeClientStats([]byte(`{"framesDropped":7}`))
+	if !ok || stats.DroppedByReason != nil {
+		t.Fatalf("legacy stats were not accepted: %+v, %t", stats, ok)
+	}
+	metrics := newRelayMetrics()
+	if !metrics.machine("host-4").recordClientStats(stats) {
+		t.Fatal("valid legacy stats were rejected")
+	}
+	if body := scrapeMetrics(metrics); !strings.Contains(body, `flux_client_frames_dropped_total{machine="host-4",reason="unknown"} 7`) {
+		t.Fatalf("legacy drops were not recorded as unknown: %s", body)
+	}
+}
+
+func TestClientStatsRejectInvalidKnownDropReasonAndIgnoreUnknown(t *testing.T) {
+	if _, ok := validateClientStats(clientStats{
+		FramesDropped:   2,
+		DroppedByReason: map[string]float64{"lost": 1.5},
+	}); ok {
+		t.Fatal("accepted a fractional known drop reason")
+	}
+
+	metrics := newRelayMetrics()
+	if !metrics.machine("host-5").recordClientStats(clientStats{
+		FramesDropped: 2,
+		DroppedByReason: map[string]float64{
+			"lost":          1,
+			"future_reason": math.Inf(1),
+		},
+	}) {
+		t.Fatal("unknown reason key invalidated client stats")
+	}
+	body := scrapeMetrics(metrics)
+	if !strings.Contains(body, `flux_client_frames_dropped_total{machine="host-5",reason="lost"} 1`) ||
+		!strings.Contains(body, `flux_client_frames_dropped_total{machine="host-5",reason="unknown"} 1`) {
+		t.Fatalf("known and residual drops were not recorded: %s", body)
+	}
+	if strings.Contains(body, `reason="future_reason"`) {
+		t.Fatalf("unknown reason was recorded: %s", body)
+	}
+}
+
 func TestRelayMetricsCleanupRemovesClientInfoAndMachineSeries(t *testing.T) {
 	metrics := newRelayMetrics()
 	machine := metrics.machine("host-2")
 	machine.recordClientStats(clientStats{
-		FPS: 30, DecodeMs: 8, ReceiveToPaintMs: 15, BitrateKbps: 1000,
-		Browser: "firefox", Decoder: "software",
+		FPS: 30, DecodeMs: 8, ReceiveToPaintMs: 15, BitrateKbps: 1000, FramesDropped: 2,
+		DroppedByReason: map[string]float64{"lost": 2},
+		Browser:         "firefox", Decoder: "software",
 	})
 	session := &Session{metrics: machine, sessionDone: make(chan struct{})}
 	session.releaseNow()

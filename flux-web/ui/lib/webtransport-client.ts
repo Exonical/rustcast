@@ -2,6 +2,7 @@ import { h264CodecFromSps, isH264Keyframe } from "./h264";
 import { browserFamily } from "./browser-family";
 import { FrameSequencer, type EncodedFrame, type SequenceResult } from "./frame-sequencer";
 import { ResolutionPaintTracker } from "./resolution-paint";
+import { DropCounter, DropVisibilityPolicy, type DropReason } from "./frame-drops";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
 import { parseAudioHeader } from "./audio-framing";
 import { CLIPBOARD_MIME, type ClipboardPayload, type ClipboardStatus } from "./clipboard";
@@ -124,8 +125,12 @@ export class WebTransportClient {
   private canvasContext: CanvasRenderingContext2D | null = null;
   private pendingPaint: { frame: VideoFrame; metadata?: FrameMetadata } | null = null;
   private paintScheduled = false;
+  private visibilityChangeHandler: (() => void) | null = null;
+  private resumeKeyframeRequestPending = false;
   private readonly frameMetadata = new Map<number, FrameMetadata>();
   private sequencer = new FrameSequencer();
+  private readonly drops = new DropCounter();
+  private readonly dropVisibility = new DropVisibilityPolicy();
   private readonly resolutionPaintTracker = new ResolutionPaintTracker();
   private decodeChain: Promise<void> = Promise.resolve();
   private generation = 0;
@@ -146,7 +151,6 @@ export class WebTransportClient {
   private audioBytesWindow = 0;
   private audioBytesReceived = 0;
   private framesWindow = 0;
-  private framesDropped = 0;
   private packetsLost = 0;
   private receiveToPaintTotal = 0;
   private receiveToPaintCount = 0;
@@ -157,8 +161,6 @@ export class WebTransportClient {
   private clientWindowFrames = 0;
   private clientWindowBytes = 0;
   private clientWindowElapsed = 0;
-  private clientWindowDropped = 0;
-  private clientWindowLastDropped = 0;
   private clientWindowDecodeTotal = 0;
   private clientWindowDecodeCount = 0;
   private clientWindowReceivePaintTotal = 0;
@@ -200,6 +202,7 @@ export class WebTransportClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.closeCurrent();
+    this.attachVisibilityListener();
     this.generation++;
     const generation = this.generation;
     this.sessionId = null;
@@ -238,6 +241,10 @@ export class WebTransportClient {
       }
       const control = await transport.createBidirectionalStream();
       this.controlWriter = control.writable.getWriter();
+      if (this.resumeKeyframeRequestPending) {
+        this.resumeKeyframeRequestPending = false;
+        this.requestKeyframeIfAllowed();
+      }
       void this.readControl(control.readable, generation);
       this.sendControl("latency-ping", { t: performance.now() });
       void this.readIncomingStreams(transport, generation);
@@ -317,6 +324,9 @@ export class WebTransportClient {
     this.generation++;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.detachVisibilityListener();
+    this.dropVisibility.reset();
+    this.resumeKeyframeRequestPending = false;
     this.closeCurrent();
     this.setState("disconnected");
   }
@@ -455,7 +465,7 @@ export class WebTransportClient {
       if (seq !== null && generation === this.generation) {
         this.acceptSequence(this.sequencer.markLost(seq, performance.now()));
       } else {
-        this.framesDropped++;
+        this.countDrop("lost");
       }
       if (generation === this.generation && !this.intentionalClose) {
         console.debug("WebTransport stream was incomplete", error);
@@ -466,24 +476,32 @@ export class WebTransportClient {
   }
 
   private acceptSequence(result: SequenceResult): void {
-    this.framesDropped += result.dropped;
+    if (this.dropVisibility.isHidden) {
+      this.waitingForKeyframe = true;
+      return;
+    }
+    this.countDrop("lost", result.dropped - result.awaitingKeyframe);
+    this.countDrop("awaiting_keyframe", result.awaitingKeyframe);
     if (result.requestKeyframe) {
       this.waitingForKeyframe = true;
       this.requestKeyframeIfAllowed();
     }
     for (const frame of result.ready) {
       if (this.waitingForKeyframe && !frame.keyframe) {
-        this.framesDropped++;
+        this.countDrop("awaiting_keyframe");
         this.requestKeyframeIfAllowed();
         continue;
       }
       if (this.decoder && this.decoder.decodeQueueSize > 2 && !frame.keyframe) {
-        this.framesDropped++;
+        this.countDrop("decode_backlog");
         this.waitingForKeyframe = true;
         this.requestKeyframeIfAllowed();
         continue;
       }
-      if (frame.keyframe) this.waitingForKeyframe = false;
+      if (frame.keyframe) {
+        this.waitingForKeyframe = false;
+        this.dropVisibility.acceptKeyframe();
+      }
       const generation = this.generation;
       this.decodeChain = this.decodeChain.then(async () => {
         if (generation === this.generation) await this.decodeFrame(frame, generation);
@@ -570,9 +588,13 @@ export class WebTransportClient {
     const metadata = this.frameMetadata.get(frame.timestamp);
     this.frameMetadata.delete(frame.timestamp);
     if (metadata) metadata.decodeMs = performance.now() - metadata.decodeStarted;
+    if (this.dropVisibility.isHidden) {
+      frame.close();
+      return;
+    }
     if (this.pendingPaint) {
       this.pendingPaint.frame.close();
-      this.framesDropped++;
+      this.countDrop("not_painted");
     }
     this.pendingPaint = { frame, metadata };
     if (!this.paintScheduled) {
@@ -587,6 +609,10 @@ export class WebTransportClient {
     this.pendingPaint = null;
     if (!pending) return;
     const { frame, metadata } = pending;
+    if (this.dropVisibility.isHidden) {
+      frame.close();
+      return;
+    }
     const canvas = this.canvas;
     const context = this.canvasContext;
     if (canvas && context) {
@@ -619,7 +645,7 @@ export class WebTransportClient {
     this.decoderType = "unknown";
     this.frameMetadata.clear();
     this.waitingForKeyframe = true;
-    this.framesDropped++;
+    this.countDrop("decoder_error");
     this.requestKeyframeIfAllowed();
   }
 
@@ -663,14 +689,12 @@ export class WebTransportClient {
       controlRttMs: this.controlRttMs,
       receiveToPaintMs: this.receiveToPaintCount ? this.receiveToPaintTotal / this.receiveToPaintCount : null,
       decodeMs: this.decodeCount ? this.decodeTotal / this.decodeCount : null,
-      framesDropped: this.framesDropped,
+      framesDropped: this.drops.total,
     };
     this.onStats?.(result);
     this.clientWindowFrames += this.framesWindow;
     this.clientWindowBytes += this.bytesWindow;
     this.clientWindowElapsed += elapsed;
-    this.clientWindowDropped += Math.max(0, this.framesDropped - this.clientWindowLastDropped);
-    this.clientWindowLastDropped = this.framesDropped;
     this.clientWindowDecodeTotal += this.decodeTotal;
     this.clientWindowDecodeCount += this.decodeCount;
     this.clientWindowReceivePaintTotal += this.receiveToPaintTotal;
@@ -686,6 +710,8 @@ export class WebTransportClient {
 
   private publishClientStats(): void {
     const elapsed = Math.max(1, this.clientWindowElapsed);
+    const droppedByReason = this.drops.takeWindow();
+    const framesDropped = Object.values(droppedByReason).reduce((total, count) => total + count, 0);
     this.sendControl("client-stats", {
       fps: this.clientWindowFrames * 1000 / elapsed,
       decodeMs: this.clientWindowDecodeCount ? this.clientWindowDecodeTotal / this.clientWindowDecodeCount : 0,
@@ -693,14 +719,14 @@ export class WebTransportClient {
         ? this.clientWindowReceivePaintTotal / this.clientWindowReceivePaintCount
         : 0,
       bitrateKbps: this.clientWindowBytes * 8 / elapsed,
-      framesDropped: this.clientWindowDropped,
+      framesDropped,
+      droppedByReason,
       decoder: this.decoderType,
       browser: browserFamily(navigator.userAgent),
     });
     this.clientWindowFrames = 0;
     this.clientWindowBytes = 0;
     this.clientWindowElapsed = 0;
-    this.clientWindowDropped = 0;
     this.clientWindowDecodeTotal = 0;
     this.clientWindowDecodeCount = 0;
     this.clientWindowReceivePaintTotal = 0;
@@ -717,6 +743,7 @@ export class WebTransportClient {
   }
 
   private requestKeyframeIfAllowed(): void {
+    if (this.dropVisibility.isHidden || !this.controlWriter) return;
     const now = performance.now();
     if (now - this.lastKeyframeRequest < 500) return;
     this.lastKeyframeRequest = now;
@@ -766,13 +793,11 @@ export class WebTransportClient {
     this.bytesReceived = 0;
     this.bytesWindow = 0;
     this.framesWindow = 0;
-    this.framesDropped = 0;
+    this.drops.reset();
     this.decoderType = "unknown";
     this.clientWindowFrames = 0;
     this.clientWindowBytes = 0;
     this.clientWindowElapsed = 0;
-    this.clientWindowDropped = 0;
-    this.clientWindowLastDropped = 0;
     this.clientWindowDecodeTotal = 0;
     this.clientWindowDecodeCount = 0;
     this.clientWindowReceivePaintTotal = 0;
@@ -782,6 +807,48 @@ export class WebTransportClient {
     this.receiveToPaintCount = 0;
     this.decodeTotal = 0;
     this.decodeCount = 0;
+  }
+
+  private countDrop(reason: DropReason, count = 1): void {
+    if (!this.dropVisibility.suppresses(reason)) this.drops.add(reason, count);
+  }
+
+  private attachVisibilityListener(): void {
+    if (typeof document === "undefined") return;
+    if (!this.visibilityChangeHandler) {
+      this.visibilityChangeHandler = () => this.handleVisibilityChange();
+      document.addEventListener("visibilitychange", this.visibilityChangeHandler);
+    }
+    this.updateVisibility(document.visibilityState === "hidden");
+  }
+
+  private detachVisibilityListener(): void {
+    if (typeof document !== "undefined" && this.visibilityChangeHandler) {
+      document.removeEventListener("visibilitychange", this.visibilityChangeHandler);
+    }
+    this.visibilityChangeHandler = null;
+  }
+
+  private handleVisibilityChange(): void {
+    if (typeof document === "undefined") return;
+    this.updateVisibility(document.visibilityState === "hidden");
+  }
+
+  private updateVisibility(hidden: boolean): void {
+    const becameVisible = this.dropVisibility.setHidden(hidden);
+    if (hidden) {
+      this.waitingForKeyframe = true;
+      if (this.pendingPaint) this.pendingPaint.frame.close();
+      this.pendingPaint = null;
+      this.paintScheduled = false;
+      return;
+    }
+    if (becameVisible) {
+      this.waitingForKeyframe = true;
+      this.lastKeyframeRequest = Number.NEGATIVE_INFINITY;
+      if (this.controlWriter) this.requestKeyframeIfAllowed();
+      else this.resumeKeyframeRequestPending = true;
+    }
   }
 
   private setState(state: ConnectionState): void {
