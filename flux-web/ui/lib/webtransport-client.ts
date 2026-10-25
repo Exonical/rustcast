@@ -844,6 +844,7 @@ export class WebTransportClient {
       return;
     }
     if (becameVisible) {
+      this.sequencer = new FrameSequencer();
       this.waitingForKeyframe = true;
       this.lastKeyframeRequest = Number.NEGATIVE_INFINITY;
       if (this.controlWriter) this.requestKeyframeIfAllowed();

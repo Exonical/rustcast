@@ -180,6 +180,35 @@ func TestClientStatsRejectInvalidKnownDropReasonAndIgnoreUnknown(t *testing.T) {
 	}
 }
 
+func TestClientStatsRejectsDropReasonsAboveTotalWithoutRecording(t *testing.T) {
+	metrics := newRelayMetrics()
+	machine := metrics.machine("host-6")
+	clientMetricsForHost := func(body string) string {
+		var lines []string
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, "flux_client_") && strings.Contains(line, `machine="host-6"`) {
+				lines = append(lines, line)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	before := clientMetricsForHost(scrapeMetrics(metrics))
+	if machine.recordClientStats(clientStats{
+		FPS:              30,
+		DecodeMs:         8,
+		ReceiveToPaintMs: 15,
+		BitrateKbps:      1000,
+		FramesDropped:    2,
+		DroppedByReason:  map[string]float64{"lost": 3},
+	}) {
+		t.Fatal("accepted reason counts above framesDropped")
+	}
+	after := clientMetricsForHost(scrapeMetrics(metrics))
+	if after != before {
+		t.Fatalf("recorded client metrics for rejected stats:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
 func TestRelayMetricsCleanupRemovesClientInfoAndMachineSeries(t *testing.T) {
 	metrics := newRelayMetrics()
 	machine := metrics.machine("host-2")
