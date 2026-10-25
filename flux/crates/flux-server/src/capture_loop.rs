@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use flux_core::error::FluxError;
 
-use crate::VirtualDisplayHandle;
+use crate::display_platform::VirtualDisplayHandle;
 #[cfg(target_os = "windows")]
 use crate::ccd_display;
 use crate::clipboard::{ClipboardCtx, attach_clipboard};

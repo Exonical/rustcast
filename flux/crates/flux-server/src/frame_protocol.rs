@@ -23,12 +23,8 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::clipboard::{ClipboardCtx, parse_clipboard_set};
+use crate::display_platform::PrivacyConnection;
 use crate::resolution::{ModeRequest, validate_mode_request};
-
-#[cfg(target_os = "windows")]
-pub(crate) type PrivacyConnection = crate::ccd_display::PrivacyConnection;
-#[cfg(not(target_os = "windows"))]
-pub(crate) type PrivacyConnection = ();
 
 pub(crate) const FRAME_HEADER_LEN: usize = 13;
 
@@ -93,8 +89,6 @@ async fn read_command<R>(
 where
     R: AsyncRead + Unpin,
 {
-    #[cfg(not(target_os = "windows"))]
-    let _ = privacy_connection;
     let [cmd] = read_array(reader).await?;
     match cmd {
         CMD_IDR => {
@@ -125,11 +119,10 @@ where
             let count = u32::from_be_bytes(read_array(reader).await?);
             crate::metrics::viewers(count);
             tracing::info!("Client {} reported {} viewer(s)", peer, count);
-            #[cfg(target_os = "windows")]
-            if let Some(privacy) = privacy_connection {
-                if let Err(error) = privacy.update(count) {
-                    tracing::error!("Privacy mode viewer-count update failed: {error}");
-                }
+            if let Some(privacy) = privacy_connection
+                && let Err(error) = privacy.update(count)
+            {
+                tracing::error!("Privacy mode viewer-count update failed: {error}");
             }
         }
         CMD_QUALITY => {

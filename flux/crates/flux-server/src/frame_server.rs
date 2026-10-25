@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::PrivacyController;
+use crate::display_platform::PrivacyController;
 use crate::frame_protocol::{
     CommandChannels, MSG_AUDIO, MSG_CLIPBOARD, MSG_CURSOR, MSG_RESOLUTION_STATUS, MSG_VIDEO, frame_header,
     read_commands,
@@ -20,8 +20,6 @@ pub(crate) async fn serve(
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
     privacy_controller: Option<PrivacyController>,
 ) {
-    #[cfg(not(target_os = "windows"))]
-    let _ = &privacy_controller;
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
@@ -49,12 +47,7 @@ pub(crate) async fn serve(
         let mut cursor_rx = cursor_rx.clone();
         let commands = commands.clone();
         let mut resolution_status_rx = resolution_status_tx.subscribe();
-        #[cfg(target_os = "windows")]
-        let privacy_connection = privacy_controller
-            .as_ref()
-            .map(|privacy| privacy.connection());
-        #[cfg(not(target_os = "windows"))]
-        let privacy_connection = None;
+        let privacy_connection = privacy_controller.as_ref().map(PrivacyController::connection);
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
