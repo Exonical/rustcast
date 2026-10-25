@@ -109,6 +109,7 @@ RUN dnf -y --setopt=install_weak_deps=False install \
       google-noto-sans-fonts google-noto-sans-mono-fonts dejavu-sans-fonts \
       redhat-text-vf-fonts redhat-mono-vf-fonts \
       ffmpeg-libs x264-libs \
+      sssd sssd-ldap openldap-clients \
  && dnf clean all
 COPY --from=mesa /out/usr/ /usr/
 COPY containers/host/rootfs/ /
@@ -124,7 +125,7 @@ RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-gen-config /usr/local
  && dconf update \
  && systemctl --global enable pipewire.socket pipewire.service wireplumber.service \
       pipewire-pulse.socket pipewire-pulse.service \
- && systemctl enable flux-env.service flux-hostd.service flux-ak-join.service ak-sysd.service \
+ && systemctl enable flux-env.service flux-hostd.service flux-ak-join.service ak-sysd.service sssd.service \
  && systemctl mask systemd-resolved.service polkit.service rtkit-daemon.service geoclue.service \
       systemd-networkd.service systemd-firstboot.service getty@tty1.service
 COPY --from=builder /out/flux-server /usr/local/bin/flux-server

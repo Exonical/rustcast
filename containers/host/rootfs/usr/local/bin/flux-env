@@ -22,3 +22,49 @@ get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
 # Local test user password, injected at container start (never baked in).
 devpw=$(get FLUX_DEVUSER_PASSWORD || true)
 if [ -n "$devpw" ]; then echo "devuser:$devpw" | chpasswd; fi
+
+# pam_authentik interactive auth needs an Authentik Enterprise license; unlicensed
+# it answers with a hard auth error that blocks pam_unix/pam_sss. Off by default.
+if [ "$(get FLUX_PAM_AUTHENTIK || true)" != "true" ]; then
+  sed -i '/pam_authentik\.so/d' /etc/pam.d/flux
+fi
+
+# SSSD talks to the pod-local Authentik LDAP outpost. The bind password is
+# rendered at boot so it never lands in the image. FLUX_LDAP_URI can point at
+# an ldaps:// endpoint in production.
+ldap_pw=$(get FLUX_LDAP_BIND_PASSWORD || true)
+ldap_uri=$(get FLUX_LDAP_URI || true)
+ldap_uri=${ldap_uri:-ldap://127.0.0.1:3389}
+if [ -n "$ldap_pw" ]; then
+  umask 077
+  cat > /etc/sssd/sssd.conf <<SSSDEOF
+[sssd]
+services = nss, pam
+domains = authentik
+
+[domain/authentik]
+id_provider = ldap
+auth_provider = ldap
+ldap_uri = $ldap_uri
+ldap_search_base = dc=ldap,dc=goauthentik,dc=io
+ldap_schema = rfc2307bis
+ldap_user_object_class = user
+ldap_user_name = cn
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_user_home_directory = homeDirectory
+ldap_group_object_class = group
+ldap_group_name = cn
+ldap_group_member = member
+ldap_default_bind_dn = cn=ldapservice,ou=users,dc=ldap,dc=goauthentik,dc=io
+ldap_default_authtok = $ldap_pw
+ldap_id_use_start_tls = false
+ldap_auth_disable_tls_never_use_in_production = true
+cache_credentials = false
+enumerate = false
+use_fully_qualified_names = false
+default_shell = /bin/bash
+override_homedir = /home/%u
+SSSDEOF
+  chmod 600 /etc/sssd/sssd.conf
+fi

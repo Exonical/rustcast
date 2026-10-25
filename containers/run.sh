@@ -36,7 +36,7 @@ if [ ! -f "$env_file" ]; then
 else
   # Backfill keys added after the file was first generated.
   gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
-  for key in FLUX_DEVUSER_PASSWORD FLUX_AK_ENROLLMENT_TOKEN; do
+  for key in FLUX_DEVUSER_PASSWORD FLUX_AK_ENROLLMENT_TOKEN FLUX_LDAP_OUTPOST_TOKEN FLUX_LDAP_BIND_PASSWORD; do
     if ! grep -q "^$key=" "$env_file"; then
       echo "$key=$(gen_secret)" >> "$env_file"
     fi
@@ -124,12 +124,20 @@ sed \
   -e "s|%%FLUX_RELAY_TOKEN%%|$FLUX_RELAY_TOKEN|g" \
   -e "s|%%FLUX_DEVUSER_PASSWORD%%|$FLUX_DEVUSER_PASSWORD|g" \
   -e "s|%%FLUX_AK_ENROLLMENT_TOKEN%%|$FLUX_AK_ENROLLMENT_TOKEN|g" \
+  -e "s|%%FLUX_LDAP_OUTPOST_TOKEN%%|$FLUX_LDAP_OUTPOST_TOKEN|g" \
+  -e "s|%%FLUX_LDAP_BIND_PASSWORD%%|$FLUX_LDAP_BIND_PASSWORD|g" \
   -e "s|%%BLUEPRINT_DIR%%|$here/authentik/blueprints|g" \
   "$pod_yaml" > "$templated"
 pod_yaml="$templated"
 
 podman kube down "$here/flux-pod.yaml" >/dev/null 2>&1 || true
+# SELinux hosts: the blueprint dir must be readable by the authentik containers.
+command -v chcon >/dev/null 2>&1 && chcon -Rt container_file_t -l s0 "$here/authentik/blueprints" 2>/dev/null || true
 podman kube play "$pod_yaml"
+
+# Pin the LDAP outpost's API token once Authentik is up (best-effort; the
+# script waits for readiness and the blueprint-applied outpost itself).
+nohup bash "$here/ak-ldap-bootstrap.sh" >/tmp/flux-ak-ldap-bootstrap.log 2>&1 &
 
 echo "Relay UI: http://localhost:8080"
 if [ -n "$cert_dir" ]; then
