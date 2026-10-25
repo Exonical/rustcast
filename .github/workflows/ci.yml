@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y clang libclang-dev libgtk-3-dev libxdo-dev libva-dev \
             libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev \
             libpostproc-dev libswscale-dev libswresample-dev \
-            libdrm-dev libpipewire-0.3-dev libspa-0.2-dev
+            libdrm-dev libpipewire-0.3-dev libspa-0.2-dev libpam0g-dev
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
