@@ -21,7 +21,9 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
-use ashpd::desktop::screencast::{CursorMode as XdpCursorMode, Screencast, SelectSourcesOptions, SourceType, Stream};
+use ashpd::desktop::screencast::{
+    CursorMode as XdpCursorMode, IsScreencastSession, Screencast, SelectSourcesOptions, SourceType, Stream,
+};
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 use async_trait::async_trait;
@@ -93,28 +95,19 @@ impl XdgPortalSession {
             .response()
             .map_err(portal_err)?;
 
-        let streams = map_streams(response.streams(), &opts.source_kinds);
-        if streams.is_empty() {
-            return Err(FluxError::Capture("portal granted an empty stream set".into()));
-        }
-
-        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session, Default::default()).await.map_err(portal_err)?;
-        let raw_fd = fd.as_raw_fd();
-        let restore_token = response.restore_token().map(str::to_owned);
-
-        self.screencast = Some(screencast);
+        let grant = self
+            .finish_negotiation(
+                screencast,
+                &session,
+                response.streams(),
+                response.restore_token(),
+                &opts.source_kinds,
+                true,
+            )
+            .await?;
         self.remote_desktop = Some(remote_desktop);
         self.rd_session = Some(session);
-        self.pipewire_fd = Some(fd);
-        self.streams = streams.clone();
-        self.restore_token = restore_token.clone();
-
-        Ok(PortalGrant {
-            streams,
-            pipewire_fd: raw_fd,
-            restore_token,
-            remote_desktop: true,
-        })
+        Ok(grant)
     }
 
     /// Negotiate a ScreenCast-only session (capture, no input).
@@ -130,7 +123,7 @@ impl XdgPortalSession {
                     .set_sources(to_source_types(&opts.source_kinds))
                     .set_multiple(opts.multiple)
                     .set_restore_token(opts.restore_token.as_deref())
-                    .set_persist_mode(persist_mode(opts)),
+                    .set_persist_mode(capture_only_persist_mode()),
             )
             .await
             .map_err(portal_err)?;
@@ -142,17 +135,46 @@ impl XdgPortalSession {
             .response()
             .map_err(portal_err)?;
 
-        let streams = map_streams(response.streams(), &opts.source_kinds);
+        let grant = self
+            .finish_negotiation(
+                screencast,
+                &session,
+                response.streams(),
+                response.restore_token(),
+                &opts.source_kinds,
+                false,
+            )
+            .await?;
+        self.sc_session = Some(session);
+        Ok(grant)
+    }
+
+    /// Shared tail of both negotiate paths once `Start` has been answered:
+    /// map the granted streams, open the PipeWire remote, and keep the
+    /// ScreenCast proxy, fd, streams and restore token on `self`. The caller
+    /// stores its own (path-specific) session handle on success.
+    async fn finish_negotiation(
+        &mut self,
+        screencast: Screencast,
+        session: &Session<impl IsScreencastSession>,
+        granted: &[Stream],
+        restore_token: Option<&str>,
+        requested: &[SourceKind],
+        remote_desktop: bool,
+    ) -> Result<PortalGrant> {
+        let streams = map_streams(granted, requested);
         if streams.is_empty() {
             return Err(FluxError::Capture("portal granted an empty stream set".into()));
         }
 
-        let fd: OwnedFd = screencast.open_pipe_wire_remote(&session, Default::default()).await.map_err(portal_err)?;
+        let fd: OwnedFd = screencast
+            .open_pipe_wire_remote(session, Default::default())
+            .await
+            .map_err(portal_err)?;
         let raw_fd = fd.as_raw_fd();
-        let restore_token = response.restore_token().map(str::to_owned);
+        let restore_token = restore_token.map(str::to_owned);
 
         self.screencast = Some(screencast);
-        self.sc_session = Some(session);
         self.pipewire_fd = Some(fd);
         self.streams = streams.clone();
         self.restore_token = restore_token.clone();
@@ -161,7 +183,7 @@ impl XdgPortalSession {
             streams,
             pipewire_fd: raw_fd,
             restore_token,
-            remote_desktop: false,
+            remote_desktop,
         })
     }
 
@@ -213,7 +235,7 @@ fn portal_err(e: ashpd::Error) -> FluxError {
 /// lets a later reconnection skip the consent prompt; the grant stays valid
 /// until the user explicitly revokes it. (RemoteDesktop sessions can't persist,
 /// so the combined input path passes `PersistMode::DoNot` directly instead.)
-fn persist_mode(_opts: &PortalOptions) -> PersistMode {
+fn capture_only_persist_mode() -> PersistMode {
     PersistMode::ExplicitlyRevoked
 }
 
