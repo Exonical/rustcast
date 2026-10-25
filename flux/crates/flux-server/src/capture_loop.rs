@@ -119,6 +119,33 @@ impl StageTimings {
     }
 }
 
+/// Poll `enumerate_displays` every 100 ms until `select` accepts the display
+/// list or `timeout` elapses (`None`). Enumeration errors are logged and
+/// retried, since outputs briefly vanish while the virtual monitor changes.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn wait_for_displays<T>(
+    capture: &dyn flux_capture::traits::ScreenCapture,
+    timeout: std::time::Duration,
+    waiting_for: &str,
+    mut select: impl FnMut(Vec<flux_capture::traits::DisplayInfo>) -> Option<T>,
+) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match capture.enumerate_displays() {
+            Ok(displays) => {
+                if let Some(selected) = select(displays) {
+                    return Some(selected);
+                }
+            }
+            Err(e) => tracing::debug!("waiting for {waiting_for}: {e}"),
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn replug_capture(
     starter: &CaptureStarter<'_>,
@@ -1239,6 +1266,112 @@ impl CaptureLoop {
     }
 }
 
+#[cfg(test)]
+mod display_wait_tests {
+    use super::*;
+    use flux_capture::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
+    use flux_core::types::{DesktopRect, Resolution};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Replays one scripted `enumerate_displays` result per call, then repeats the last one.
+    struct ScriptedCapture {
+        results: Mutex<VecDeque<flux_core::Result<Vec<DisplayInfo>>>>,
+        calls: Mutex<usize>,
+    }
+
+    impl ScriptedCapture {
+        fn new(results: Vec<flux_core::Result<Vec<DisplayInfo>>>) -> Self {
+            Self {
+                results: Mutex::new(results.into()),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl ScreenCapture for ScriptedCapture {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn enumerate_displays(&self) -> flux_core::Result<Vec<DisplayInfo>> {
+            *self.calls.lock().unwrap() += 1;
+            let mut results = self.results.lock().unwrap();
+            if results.len() > 1 {
+                results.pop_front().unwrap()
+            } else {
+                match results.front().unwrap() {
+                    Ok(displays) => Ok(displays.clone()),
+                    Err(_) => Err(FluxError::Capture("scripted".into())),
+                }
+            }
+        }
+
+        fn start_capture(
+            &self,
+            _display_id: Option<u32>,
+            _resolution: Resolution,
+            _framerate: u32,
+            _cursor_sink: Option<CursorUpdateSink>,
+        ) -> flux_core::Result<Box<dyn CaptureSession>> {
+            Err(FluxError::Capture("scripted".into()))
+        }
+    }
+
+    fn display(name: &str) -> DisplayInfo {
+        DisplayInfo {
+            id: 0,
+            adapter_luid: None,
+            name: name.into(),
+            native_resolution: Resolution::new(1920, 1080),
+            desktop_rect: DesktopRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            primary: false,
+            capture_supported: true,
+        }
+    }
+
+    fn find_named(name: &'static str) -> impl FnMut(Vec<DisplayInfo>) -> Option<DisplayInfo> {
+        move |displays| displays.into_iter().find(|display| display.name == name)
+    }
+
+    #[test]
+    fn returns_first_accepted_display_list_without_waiting() {
+        let capture = ScriptedCapture::new(vec![Ok(vec![display("A"), display("B")])]);
+        let found = wait_for_displays(&capture, Duration::from_secs(5), "test", find_named("B"));
+        assert_eq!(found.map(|display| display.name).as_deref(), Some("B"));
+        assert_eq!(capture.calls(), 1);
+    }
+
+    #[test]
+    fn retries_through_enumeration_errors_until_selected() {
+        let capture = ScriptedCapture::new(vec![
+            Err(FluxError::Capture("output gone".into())),
+            Ok(vec![display("A")]),
+            Ok(vec![display("A"), display("B")]),
+        ]);
+        let found = wait_for_displays(&capture, Duration::from_secs(5), "test", find_named("B"));
+        assert_eq!(found.map(|display| display.name).as_deref(), Some("B"));
+        assert_eq!(capture.calls(), 3);
+    }
+
+    #[test]
+    fn gives_up_after_timeout() {
+        let capture = ScriptedCapture::new(vec![Ok(vec![display("A")])]);
+        let found = wait_for_displays(&capture, Duration::ZERO, "test", find_named("B"));
+        assert!(found.is_none());
+        assert_eq!(capture.calls(), 1);
+    }
+}
 
 #[cfg(test)]
 mod pacing_tests {
