@@ -304,6 +304,7 @@ type oidcClaims struct {
 	Name              string   `json:"name"`
 	PreferredUsername string   `json:"preferred_username"`
 	Groups            []string `json:"groups"`
+	Nonce             string   `json:"nonce"`
 }
 
 func (a *authService) callback(c *gin.Context) {
@@ -354,11 +355,7 @@ func (a *authService) callback(c *gin.Context) {
 		c.String(http.StatusBadGateway, "claims parse failed")
 		return
 	}
-	var nonce struct {
-		Nonce string `json:"nonce"`
-	}
-	_ = idToken.Claims(&nonce)
-	if nonce.Nonce != pending.Nonce {
+	if claims.Nonce != pending.Nonce {
 		c.String(http.StatusUnauthorized, "nonce mismatch")
 		return
 	}
