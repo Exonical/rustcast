@@ -26,7 +26,7 @@ flux/
 │   ├── flux-encode/      # GPU video encoding (NVENC, AMF, VA-API, Vulkan Video, software)
 │   ├── flux-audio/       # Audio capture (WASAPI, PipeWire) + Opus encoding
 │   ├── flux-input/       # Input forwarding (keyboard, mouse, gamepad)
-│   ├── flux-transport/   # Networking (RTP, FEC, QUIC, packetizer)
+│   ├── flux-transport/   # Networking (RTP, FEC, packetizer)
 │   ├── flux-crypto/      # TLS certificates, AES-GCM, PIN authentication
 │   ├── flux-protocol/    # Wire protocol messages, session negotiation
 │   ├── flux-server/      # Server binary (host)

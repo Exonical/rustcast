@@ -1164,8 +1164,6 @@ dependencies = [
  "bytes",
  "flux-core",
  "parking_lot",
- "quinn",
- "rustls",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
