@@ -23,6 +23,11 @@ type sentFrame struct {
 	bytes int
 }
 
+type sentOrderEntry struct {
+	seq uint32
+	at  time.Time
+}
+
 type delaySample struct {
 	at      time.Time
 	delayMs float64
@@ -38,11 +43,8 @@ type deliveryEstimator struct {
 	lastChange       time.Time
 	suppressIncrease time.Time
 
-	outstanding map[uint32]sentFrame
-	sendOrder   []struct {
-		seq uint32
-		at  time.Time
-	}
+	outstanding  map[uint32]sentFrame
+	sendOrder    []sentOrderEntry
 	delaySamples []delaySample
 	queueEWMA    time.Duration
 	haveQueue    bool
@@ -90,10 +92,7 @@ func (e *deliveryEstimator) onFrameSent(seq uint32, bytes int, at time.Time) {
 		at:    at,
 		bytes: bytes,
 	}
-	e.sendOrder = append(e.sendOrder, struct {
-		seq uint32
-		at  time.Time
-	}{seq: seq, at: at})
+	e.sendOrder = append(e.sendOrder, sentOrderEntry{seq: seq, at: at})
 	for len(e.outstanding) > bweMaxOutstanding && len(e.sendOrder) > 0 {
 		oldest := e.sendOrder[0]
 		e.sendOrder = e.sendOrder[1:]
