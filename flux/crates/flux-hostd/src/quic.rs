@@ -24,8 +24,11 @@ pub fn make_endpoint(
         std::path::Path::new("/var/lib/flux/quic-key.pem"),
     )?;
     let chain = certs.rustls_cert_chain()?;
-    let fingerprint =
-        flux_crypto::auth::cert_fingerprint(chain[0].as_ref()).to_lowercase();
+    // cert_fingerprint returns colon-separated uppercase hex; the relay
+    // compares against plain lowercase hex of the leaf DER.
+    let fingerprint = flux_crypto::auth::cert_fingerprint(chain[0].as_ref())
+        .to_lowercase()
+        .replace(':', "");
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(chain, certs.rustls_private_key()?)?;
