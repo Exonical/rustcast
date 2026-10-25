@@ -228,12 +228,11 @@ fn run_stream(
     let prefs = Rc::new(RefCell::new(prefs));
 
     // Per-frame sequence counter, owned by the process callback.
-    let seq = Arc::new(Mutex::new(0u64));
+    let mut sequence = 0u64;
 
     let format_cb = Arc::clone(&format);
     let format_proc = Arc::clone(&format);
     let sink_proc = sink.clone();
-    let seq_proc = Arc::clone(&seq);
 
     let mut last_cursor: Option<CursorMetadata> = None;
 
@@ -281,11 +280,10 @@ fn run_stream(
             let Some(negotiated) = negotiated else {
                 return;
             };
-            let mut seq = seq_proc.lock().unwrap();
             // A buffer that carries no new frame (cursor-only update) must not
             // be pushed as a stale frame; the sequence only advances for frames.
-            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, *seq + 1, &sink_proc) {
-                *seq += 1;
+            if let Some(frame) = build_frame(buffer.datas_mut(), &negotiated, sequence + 1, &sink_proc) {
+                sequence += 1;
                 sink_proc.push(frame);
             }
         })

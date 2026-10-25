@@ -45,8 +45,6 @@ mod imp {
 
 #[cfg(feature = "audio-pipewire")]
 mod imp {
-    use std::sync::Arc;
-    use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::Instant;
 
@@ -194,8 +192,7 @@ mod imp {
         )
         .map_err(|e| pw_err("create audio stream", e))?;
 
-        let sequence = Arc::new(Mutex::new(0u64));
-        let seq_proc = Arc::clone(&sequence);
+        let mut sequence = 0u64;
 
         let _listener = stream
             .add_local_listener::<()>()
@@ -212,9 +209,8 @@ mod imp {
                 }
             })
             .process(move |stream, _ud| {
-                let mut seq = seq_proc.lock().unwrap();
-                if let Some(samples) = read_buffer(stream, *seq + 1) {
-                    *seq += 1;
+                if let Some(samples) = read_buffer(stream, sequence + 1) {
+                    sequence += 1;
                     // Drop-oldest when the consumer is behind.
                     let mut pending = samples;
                     loop {
