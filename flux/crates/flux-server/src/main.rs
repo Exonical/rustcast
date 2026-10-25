@@ -14,6 +14,7 @@ mod audio;
 mod capture_loop;
 mod clipboard;
 mod encoder;
+mod frame_protocol;
 mod frame_server;
 mod http;
 mod metrics;
@@ -528,6 +529,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let commands = frame_protocol::CommandChannels {
+        idr_tx,
+        bitrate_tx,
+        quality_tx,
+        resolution_tx,
+        input_tx,
+        clipboard: clipboard.clone(),
+    };
+
     // QUIC frame server on the same port number over UDP. Preferred by the
     // relay on lossy links (no head-of-line blocking); TCP remains as fallback.
     let quic_handle = if !config.server.frame_quic {
@@ -539,28 +549,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
                 let h264_tx = h264_tx.clone();
                 let audio_tx = audio_tx.clone();
-                let clipboard = clipboard.clone();
                 let cursor_rx = cursor_tx.subscribe();
-                let idr_tx = idr_tx.clone();
-                let bitrate_tx = bitrate_tx.clone();
-                let quality_tx = quality_tx.clone();
-                let resolution_tx = resolution_tx.clone();
+                let commands = commands.clone();
                 let resolution_status_tx = resolution_status_tx.clone();
-                let input_tx = input_tx.clone();
                 let privacy_controller = privacy_controller.clone();
                 Some(tokio::spawn(async move {
                     quic_frames::serve(
                         endpoint,
                         h264_tx,
                         audio_tx,
-                        clipboard,
                         cursor_rx,
-                        idr_tx,
-                        bitrate_tx,
-                        quality_tx,
-                        resolution_tx,
+                        commands,
                         resolution_status_tx,
-                        input_tx,
                         privacy_controller,
                     )
                     .await;
@@ -585,14 +585,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame_listener,
             h264_tx,
             audio_tx.clone(),
-            clipboard.clone(),
             cursor_rx,
-            idr_tx,
-            bitrate_tx,
-            quality_tx,
-            resolution_tx,
+            commands,
             resolution_status_tx,
-            input_tx,
             frame_privacy_controller,
         )
         .await;

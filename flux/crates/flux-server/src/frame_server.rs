@@ -3,29 +3,20 @@
 use std::sync::Arc;
 
 use crate::PrivacyController;
-use crate::clipboard::{ClipboardCtx, parse_clipboard_set};
-use crate::resolution::{ModeRequest, ResolutionStatusMessage, validate_mode_request};
+use crate::frame_protocol::{CommandChannels, frame_header, read_commands};
+use crate::resolution::ResolutionStatusMessage;
 
 /// TCP frame server: accepts connections and streams timestamped H.264 NALUs.
-/// Protocol: [1-byte type][8-byte BE capture-timestamp µs][4-byte BE length][payload].
-/// Type 0x01 is an H.264 access unit; type 0x02 is cursor JSON metadata.
-/// Control commands: 0x01 IDR, 0x02 input, 0x03 bitrate, 0x04 viewer count,
-/// and 0x05 quality/FPS ([quality level, FPS cap], each 0 means automatic),
-/// and 0x06 resolution ([2-byte BE width, 2-byte BE height], refresh fixed at 60),
-/// and 0x07 clipboard ([4-byte BE len][JSON {"mime","data"}]).
-/// Outbound message type 0x05 is a clipboard payload with the same JSON shape.
+/// Wire format (messages out, commands in) is documented in `frame_protocol`.
+/// Outbound types: 0x01 H.264 access unit, 0x02 cursor JSON metadata,
+/// 0x03 resolution status, 0x04 Opus audio, 0x05 clipboard JSON.
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
-    clipboard: ClipboardCtx,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
-    idr_tx: std::sync::mpsc::Sender<()>,
-    bitrate_tx: std::sync::mpsc::Sender<u32>,
-    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<ModeRequest>,
+    commands: CommandChannels,
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -53,175 +44,22 @@ pub(crate) async fn serve(
         }
         let mut rx = h264_tx.subscribe();
         let mut audio_rx = audio_tx.subscribe();
-        let mut clipboard_rx = clipboard.events.subscribe();
-        let clipboard = clipboard.clone();
+        let mut clipboard_rx = commands.clipboard.events.subscribe();
         let mut cursor_rx = cursor_rx.clone();
-        let idr_tx = idr_tx.clone();
-        let bitrate_tx = bitrate_tx.clone();
-        let quality_tx = quality_tx.clone();
-        let resolution_tx = resolution_tx.clone();
+        let commands = commands.clone();
         let mut resolution_status_rx = resolution_status_tx.subscribe();
-        let input_tx = input_tx.clone();
         #[cfg(target_os = "windows")]
         let privacy_connection = privacy_controller
             .as_ref()
             .map(|privacy| privacy.connection());
         #[cfg(not(target_os = "windows"))]
-        let privacy_connection: Option<()> = None;
-        #[cfg(not(target_os = "windows"))]
-        let _ = &privacy_connection;
+        let privacy_connection = None;
 
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let (mut reader, mut writer) = stream.into_split();
+            let (reader, mut writer) = stream.into_split();
             let mut frames_sent: u64 = 0;
 
-            // Spawn reader task to handle upstream commands
-            let mut reader_handle = tokio::spawn(async move {
-                #[cfg(target_os = "windows")]
-                let privacy_connection = privacy_connection;
-                loop {
-                    // Read command byte
-                    let mut cmd = [0u8; 1];
-                    if reader.read_exact(&mut cmd).await.is_err() {
-                        break;
-                    }
-
-                    match cmd[0] {
-                        0x01 => {
-                            // IDR Request
-                            tracing::info!("Client {} requested IDR frame", addr);
-                            let _ = idr_tx.send(());
-                        }
-                        0x02 => {
-                            // Input Event
-                            // Read 4-byte length (Big Endian)
-                            let mut len_buf = [0u8; 4];
-                            if reader.read_exact(&mut len_buf).await.is_err() {
-                                break;
-                            }
-                            let len = u32::from_be_bytes(len_buf) as usize;
-
-                            // Limit max input packet size (e.g. 1MB) to prevent OOM
-                            if len > 1024 * 1024 {
-                                tracing::warn!("Input event too large: {} bytes", len);
-                                break;
-                            }
-
-                            let mut payload = vec![0u8; len];
-                            if reader.read_exact(&mut payload).await.is_err() {
-                                break;
-                            }
-
-                            // Deserialize and dispatch
-                            match serde_json::from_slice::<flux_input::InputEvent>(&payload) {
-                                Ok(event) => {
-                                    // Log non-movement events at INFO, movements at TRACE
-                                    match &event {
-                                        flux_input::InputEvent::Mouse(flux_input::mouse::MouseEvent::Move { .. }) |
-                                        flux_input::InputEvent::Mouse(flux_input::mouse::MouseEvent::MoveAbsolute { .. }) => {
-                                            tracing::trace!("Input: Move");
-                                        }
-                                        _ => {
-                                            tracing::info!("Input: {:?}", event);
-                                        }
-                                    }
-                                    let _ = input_tx.send((std::time::Instant::now(), event));
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Failed to deserialize input event: {}", e);
-                                }
-                            }
-                        }
-                        0x03 => {
-                            // Bitrate update (congestion feedback from relay)
-                            let mut kbps_buf = [0u8; 4];
-                            if reader.read_exact(&mut kbps_buf).await.is_err() {
-                                break;
-                            }
-                            let kbps = u32::from_be_bytes(kbps_buf);
-                            tracing::info!("Client {} requested bitrate {} kbps", addr, kbps);
-                            let _ = bitrate_tx.send(kbps);
-                        }
-                        0x04 => {
-                            let mut count_buf = [0u8; 4];
-                            if reader.read_exact(&mut count_buf).await.is_err() {
-                                break;
-                            }
-                            let count = u32::from_be_bytes(count_buf);
-                            crate::metrics::viewers(count);
-                            tracing::info!("Client {} reported {} viewer(s)", addr, count);
-                            #[cfg(target_os = "windows")]
-                            if let Some(privacy) = privacy_connection.as_ref() {
-                                if let Err(error) = privacy.update(count) {
-                                    tracing::error!(
-                                        "Privacy mode viewer-count update failed: {error}"
-                                    );
-                                }
-                            }
-                        }
-                        0x05 => {
-                            let mut level = [0u8; 2];
-                            if reader.read_exact(&mut level).await.is_err() {
-                                break;
-                            }
-                            let _ = quality_tx.send((level[0], level[1]));
-                        }
-                        0x07 => {
-                            // Clipboard set: [len u32][JSON {"mime","data"}]
-                            let mut len_buf = [0u8; 4];
-                            if reader.read_exact(&mut len_buf).await.is_err() {
-                                break;
-                            }
-                            let len = u32::from_be_bytes(len_buf) as usize;
-                            if len > clipboard.max_bytes.saturating_add(4096) {
-                                tracing::warn!("Clipboard command too large: {} bytes", len);
-                                break;
-                            }
-                            let mut payload = vec![0u8; len];
-                            if reader.read_exact(&mut payload).await.is_err() {
-                                break;
-                            }
-                            if clipboard.enabled {
-                                match parse_clipboard_set(&payload, clipboard.max_bytes) {
-                                    Ok(msg) => {
-                                        if let Err(e) = clipboard.sink.set_text(msg.data) {
-                                            tracing::warn!("Clipboard set failed: {}", e);
-                                        }
-                                    }
-                                    Err(reason) => {
-                                        tracing::warn!("Rejected client clipboard: {}", reason);
-                                    }
-                                }
-                            }
-                        }
-                        0x06 => {
-                            let mut dimensions = [0u8; 4];
-                            if reader.read_exact(&mut dimensions).await.is_err() {
-                                break;
-                            }
-                            let request = ModeRequest {
-                                width: u16::from_be_bytes([dimensions[0], dimensions[1]]) as u32,
-                                height: u16::from_be_bytes([dimensions[2], dimensions[3]]) as u32,
-                            };
-                            if validate_mode_request(request).is_err() {
-                                tracing::warn!(
-                                    "Ignoring invalid resolution request: {}x{}",
-                                    request.width,
-                                    request.height
-                                );
-                            } else {
-                                let _ = resolution_tx.send(request);
-                            }
-                        }
-                        _ => {
-                            tracing::warn!("Unknown command byte: 0x{:02x}", cmd[0]);
-                            // We could break or ignore. If we ignore, we might lose sync if protocol expects strict format.
-                            // For now, let's assume valid stream or disconnect.
-                        }
-                    }
-                }
-            });
+            let mut reader_handle = tokio::spawn(read_commands(reader, addr, commands, privacy_connection));
 
             let initial_cursor = cursor_rx.borrow_and_update().clone();
             let initial_payload = match serde_json::to_vec(&initial_cursor.1) {
@@ -310,10 +148,7 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
-    let mut header = [0u8; 13];
-    header[0] = message_type;
-    header[1..9].copy_from_slice(&timestamp.to_be_bytes());
-    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let header = frame_header(message_type, timestamp, payload.len());
 
     let total = header.len() + payload.len();
     let mut written = 0;
