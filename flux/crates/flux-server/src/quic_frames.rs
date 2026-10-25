@@ -3,30 +3,24 @@
 //! lossy links. Each frame is sent on its own unidirectional stream, so a lost
 //! packet only delays that frame, never the ones behind it. Commands from the
 //! relay (IDR requests, input events) arrive on a client-opened bidirectional
-//! stream using the same byte protocol as the TCP frame server.
+//! stream using the same byte protocol as the TCP frame server; both formats
+//! are defined in `frame_protocol`.
 //!
 //! Stream formats:
-//!   frame (server→client uni): [1-byte type][8-byte BE capture-ts µs][4-byte BE length][payload]
+//!   frame (server→client uni): one message, header from `frame_protocol::frame_header`
 //!     type 0x01 = H.264 access unit, type 0x02 = cursor JSON metadata,
 //!     type 0x03 = resolution transition status JSON,
-//!     type 0x04 = Opus audio packet ([seq u32 BE][opus payload])
-//!   control (client→server bi): [0x01] IDR request | [0x02][4-byte BE len][JSON input event]
-//!                                | [0x03][4-byte BE target bitrate kbps]
-//!                                | [0x04][4-byte BE viewer count]
-//!                                | [0x05][quality level][FPS cap] (each 0 means automatic)
-//!                                | [0x06][2-byte BE width][2-byte BE height]
+//!     type 0x04 = Opus audio packet ([seq u32 BE][opus payload]),
+//!     type 0x05 = clipboard JSON
+//!   control (client→server bi): `frame_protocol::read_commands`
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use flux_crypto::CertificateManager;
 
-#[cfg(target_os = "windows")]
-use crate::ccd_display::{PrivacyConnection, PrivacyController};
-#[cfg(not(target_os = "windows"))]
-type PrivacyController = ();
-#[cfg(not(target_os = "windows"))]
-type PrivacyConnection = ();
+use crate::PrivacyController;
+use crate::frame_protocol::{CommandChannels, frame_header, read_commands};
 
 pub const ALPN: &[u8] = b"flux-frames";
 
@@ -178,14 +172,9 @@ pub async fn serve(
     endpoint: quinn::Endpoint,
     h264_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
     audio_tx: tokio::sync::broadcast::Sender<Arc<(u64, Vec<u8>)>>,
-    clipboard: crate::clipboard::ClipboardCtx,
     cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
-    idr_tx: std::sync::mpsc::Sender<()>,
-    bitrate_tx: std::sync::mpsc::Sender<u32>,
-    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
+    commands: CommandChannels,
     resolution_status_tx: tokio::sync::broadcast::Sender<crate::resolution::ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     while let Some(incoming) = endpoint.accept().await {
@@ -200,22 +189,16 @@ pub async fn serve(
 
         let rx = h264_tx.subscribe();
         let audio_rx = audio_tx.subscribe();
-        let clipboard_rx = clipboard.events.subscribe();
-        let clipboard = clipboard.clone();
+        let clipboard_rx = commands.clipboard.events.subscribe();
         let cursor_rx = cursor_rx.clone();
         tokio::spawn(handle_connection(
             connection,
             rx,
             audio_rx,
             clipboard_rx,
-            clipboard,
             cursor_rx,
-            idr_tx.clone(),
-            bitrate_tx.clone(),
-            quality_tx.clone(),
-            resolution_tx.clone(),
+            commands.clone(),
             resolution_status_tx.subscribe(),
-            input_tx.clone(),
             privacy_controller.clone(),
         ));
     }
@@ -226,14 +209,9 @@ async fn handle_connection(
     mut rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut audio_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
     mut clipboard_rx: tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>,
-    clipboard: crate::clipboard::ClipboardCtx,
     mut cursor_rx: tokio::sync::watch::Receiver<Arc<(u64, flux_core::cursor::CursorMetadata)>>,
-    idr_tx: std::sync::mpsc::Sender<()>,
-    bitrate_tx: std::sync::mpsc::Sender<u32>,
-    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
+    commands: CommandChannels,
     mut resolution_status_rx: tokio::sync::broadcast::Receiver<crate::resolution::ResolutionStatusMessage>,
-    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
     privacy_controller: Option<PrivacyController>,
 ) {
     #[cfg(not(target_os = "windows"))]
@@ -244,31 +222,16 @@ async fn handle_connection(
         .map(|privacy| privacy.connection());
     #[cfg(not(target_os = "windows"))]
     let privacy_connection = None;
-    let frame_idr_tx = idr_tx.clone();
+    let frame_idr_tx = commands.idr_tx.clone();
     let control_conn = connection.clone();
+    let peer = connection.remote_address();
     let control = tokio::spawn(async move {
         loop {
             let (_, recv) = match control_conn.accept_bi().await {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let idr_tx = idr_tx.clone();
-            let bitrate_tx = bitrate_tx.clone();
-            let quality_tx = quality_tx.clone();
-            let resolution_tx = resolution_tx.clone();
-            let input_tx = input_tx.clone();
-            let clipboard = clipboard.clone();
-            let privacy_connection = privacy_connection.clone();
-            tokio::spawn(read_commands(
-                recv,
-                idr_tx,
-                bitrate_tx,
-                quality_tx,
-                resolution_tx,
-                input_tx,
-                clipboard,
-                privacy_connection,
-            ));
+            tokio::spawn(read_commands(recv, peer, commands.clone(), privacy_connection.clone()));
         }
     });
 
@@ -428,10 +391,7 @@ async fn send_message(
             return false;
         }
     };
-    let mut header = [0u8; 13];
-    header[0] = message_type;
-    header[1..9].copy_from_slice(&ts.to_be_bytes());
-    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let header = frame_header(message_type, ts, payload.len());
     if stream.write_all(&header).await.is_err() || stream.write_all(&payload).await.is_err() {
         tracing::info!("QUIC frame write failed; client disconnected");
         return false;
@@ -465,10 +425,7 @@ async fn send_frame_message(
             return FrameSendResult::Disconnected;
         }
     };
-    let mut header = [0u8; 13];
-    header[0] = 0x01;
-    header[1..9].copy_from_slice(&ts.to_be_bytes());
-    header[9..13].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let header = frame_header(0x01, ts, payload.len());
     if stream.write_all(&header).await.is_err() {
         tracing::info!("QUIC frame write failed; client disconnected");
         return FrameSendResult::Disconnected;
@@ -580,126 +537,6 @@ async fn send_frame_message(
         needs_recovery: dropped_frames,
         recovery_requested: false,
     })
-}
-
-async fn read_commands(
-    mut recv: quinn::RecvStream,
-    idr_tx: std::sync::mpsc::Sender<()>,
-    bitrate_tx: std::sync::mpsc::Sender<u32>,
-    quality_tx: std::sync::mpsc::Sender<(u8, u8)>,
-    resolution_tx: std::sync::mpsc::Sender<crate::resolution::ModeRequest>,
-    input_tx: std::sync::mpsc::Sender<(std::time::Instant, flux_input::InputEvent)>,
-    clipboard: crate::clipboard::ClipboardCtx,
-    privacy_connection: Option<PrivacyConnection>,
-) {
-    #[cfg(not(target_os = "windows"))]
-    let _ = &privacy_connection;
-    loop {
-        let mut cmd = [0u8; 1];
-        if recv.read_exact(&mut cmd).await.is_err() {
-            return;
-        }
-        match cmd[0] {
-            0x01 => {
-                tracing::info!("QUIC client requested IDR frame");
-                let _ = idr_tx.send(());
-            }
-            0x02 => {
-                let mut len_buf = [0u8; 4];
-                if recv.read_exact(&mut len_buf).await.is_err() {
-                    return;
-                }
-                let len = u32::from_be_bytes(len_buf) as usize;
-                if len > 1024 * 1024 {
-                    tracing::warn!("QUIC input event too large: {} bytes", len);
-                    return;
-                }
-                let mut payload = vec![0u8; len];
-                if recv.read_exact(&mut payload).await.is_err() {
-                    return;
-                }
-                match serde_json::from_slice::<flux_input::InputEvent>(&payload) {
-                    Ok(event) => {
-                        let _ = input_tx.send((std::time::Instant::now(), event));
-                    }
-                    Err(e) => tracing::warn!("QUIC input event parse error: {}", e),
-                }
-            }
-            0x03 => {
-                let mut kbps_buf = [0u8; 4];
-                if recv.read_exact(&mut kbps_buf).await.is_err() {
-                    return;
-                }
-                let kbps = u32::from_be_bytes(kbps_buf);
-                tracing::info!("QUIC client requested bitrate {} kbps", kbps);
-                let _ = bitrate_tx.send(kbps);
-            }
-            0x04 => {
-                let mut count_buf = [0u8; 4];
-                if recv.read_exact(&mut count_buf).await.is_err() {
-                    return;
-                }
-                let count = u32::from_be_bytes(count_buf);
-                crate::metrics::viewers(count);
-                tracing::info!("QUIC client reported {} viewer(s)", count);
-                #[cfg(target_os = "windows")]
-                if let Some(privacy) = privacy_connection.as_ref() {
-                    if let Err(error) = privacy.update(count) {
-                        tracing::error!("Privacy mode viewer-count update failed: {error}");
-                    }
-                }
-            }
-            0x05 => {
-                let mut levels = [0u8; 2];
-                if recv.read_exact(&mut levels).await.is_err() {
-                    return;
-                }
-                let _ = quality_tx.send((levels[0], levels[1]));
-            }
-            0x07 => {
-                // Clipboard set: [len u32][JSON {"mime","data"}]
-                let mut len_buf = [0u8; 4];
-                if recv.read_exact(&mut len_buf).await.is_err() {
-                    return;
-                }
-                let len = u32::from_be_bytes(len_buf) as usize;
-                if len > clipboard.max_bytes.saturating_add(4096) {
-                    tracing::warn!("QUIC clipboard command too large: {} bytes", len);
-                    return;
-                }
-                let mut payload = vec![0u8; len];
-                if recv.read_exact(&mut payload).await.is_err() {
-                    return;
-                }
-                if clipboard.enabled {
-                    match crate::clipboard::parse_clipboard_set(&payload, clipboard.max_bytes) {
-                        Ok(msg) => {
-                            if let Err(e) = clipboard.sink.set_text(msg.data) {
-                                tracing::warn!("QUIC clipboard set failed: {}", e);
-                            }
-                        }
-                        Err(reason) => {
-                            tracing::warn!("Rejected QUIC clipboard: {}", reason);
-                        }
-                    }
-                }
-            }
-            0x06 => {
-                let mut dimensions = [0u8; 4];
-                if recv.read_exact(&mut dimensions).await.is_err() {
-                    return;
-                }
-                let _ = resolution_tx.send(crate::resolution::ModeRequest {
-                    width: u16::from_be_bytes([dimensions[0], dimensions[1]]) as u32,
-                    height: u16::from_be_bytes([dimensions[2], dimensions[3]]) as u32,
-                });
-            }
-            other => {
-                tracing::warn!("QUIC unknown command byte: 0x{:02x}", other);
-                return;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
