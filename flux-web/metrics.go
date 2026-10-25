@@ -300,6 +300,7 @@ func validateClientStats(stats clientStats) (clientStats, bool) {
 		math.Trunc(stats.FramesDropped) != stats.FramesDropped {
 		return clientStats{}, false
 	}
+	var reasonTotal float64
 	for reason, value := range stats.DroppedByReason {
 		if _, known := clientDropReasonValues[reason]; !known {
 			continue
@@ -307,6 +308,10 @@ func validateClientStats(stats clientStats) (clientStats, bool) {
 		if !validMetricValue(value, maxClientDrops) || math.Trunc(value) != value {
 			return clientStats{}, false
 		}
+		reasonTotal += value
+	}
+	if reasonTotal > stats.FramesDropped {
+		return clientStats{}, false
 	}
 	if _, ok := clientDecoderValues[stats.Decoder]; !ok {
 		stats.Decoder = "unknown"

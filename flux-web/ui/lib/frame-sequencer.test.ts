@@ -38,6 +38,20 @@ test("counts startup buffer overflow as awaiting a keyframe", () => {
   assert.equal(result.awaitingKeyframe, 1);
 });
 
+test("a fresh sequencer classifies resume deltas as awaiting a keyframe", () => {
+  let sequencer = new FrameSequencer();
+  sequencer.push(frame(0, true), 0);
+  sequencer.push(frame(2), 1);
+  sequencer = new FrameSequencer();
+  sequencer.push(frame(10), 2);
+
+  const result = sequencer.push(frame(11, true), 3);
+  assert.deepEqual(result.ready.map((item) => item.seq), [11]);
+  assert.equal(result.dropped, 1);
+  assert.equal(result.awaitingKeyframe, 1);
+  assert.equal(result.dropped - result.awaitingKeyframe, 0);
+});
+
 test("pre-sync expiry drops stale deltas and requests a keyframe", () => {
   const sequencer = new FrameSequencer(100);
   sequencer.push(frame(1), 0);
