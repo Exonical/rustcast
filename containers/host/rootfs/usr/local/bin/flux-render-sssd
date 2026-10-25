@@ -1,0 +1,49 @@
+#!/bin/bash
+# Render sssd.conf to stdout: flux-render-sssd <bind-password>
+# FLUX_LDAP_URI (default ldap://127.0.0.1:3389), FLUX_LDAP_CA_CERT (ldaps CA bundle).
+set -eu
+ldap_pw=$1
+uri=${FLUX_LDAP_URI:-ldap://127.0.0.1:3389}
+ca=${FLUX_LDAP_CA_CERT:-/etc/pki/tls/certs/ca-bundle.crt}
+case "$uri" in
+  ldap://127.0.0.1|ldap://127.0.0.1:*|ldap://localhost|ldap://localhost:*|ldap://\[::1\]|ldap://\[::1\]:*)
+    tls='ldap_id_use_start_tls = false
+ldap_auth_disable_tls_never_use_in_production = true' ;;
+  ldaps://*)
+    tls="ldap_id_use_start_tls = false
+ldap_tls_reqcert = demand
+ldap_tls_cacert = $ca" ;;
+  ldap://*)
+    tls="ldap_id_use_start_tls = true
+ldap_tls_reqcert = demand
+ldap_tls_cacert = $ca" ;;
+  *) echo "unsupported FLUX_LDAP_URI: $uri" >&2; exit 1 ;;
+esac
+cat <<SSSDEOF
+[sssd]
+services = nss, pam
+domains = authentik
+
+[domain/authentik]
+id_provider = ldap
+auth_provider = ldap
+ldap_uri = $uri
+ldap_search_base = dc=ldap,dc=goauthentik,dc=io
+ldap_schema = rfc2307bis
+ldap_user_object_class = user
+ldap_user_name = cn
+ldap_user_uid_number = uidNumber
+ldap_user_gid_number = gidNumber
+ldap_user_home_directory = homeDirectory
+ldap_group_object_class = group
+ldap_group_name = cn
+ldap_group_member = member
+ldap_default_bind_dn = cn=ldapservice,ou=users,dc=ldap,dc=goauthentik,dc=io
+ldap_default_authtok = $ldap_pw
+$tls
+cache_credentials = false
+enumerate = false
+use_fully_qualified_names = false
+default_shell = /bin/bash
+override_homedir = /home/%u
+SSSDEOF

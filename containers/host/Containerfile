@@ -118,7 +118,7 @@ RUN dnf -y --setopt=install_weak_deps=False install \
       authentik-sysd-0.72.3 authentik-cli-0.72.3 authentik-agent-0.72.3 \
       libpam-authentik-0.72.3 libnss-authentik-0.72.3 \
  && dnf clean all
-RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
+RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-render-sssd /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
       /usr/local/bin/flux-ak-join \
  && groupadd -g 8001 devgroup \
  && useradd --no-create-home --uid 2101 --gid 8001 --groups systemd-journal devuser \

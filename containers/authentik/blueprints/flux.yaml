@@ -73,6 +73,24 @@ entries:
 
   # LDAP outpost so hosts can log users in through SSSD (community-friendly
   # alternative to the Enterprise-only pam_authentik interactive auth).
+  # Explicit POSIX ids exposed through the LDAP outpost (string attributes win
+  # over uid/gid_start_number + pk). Keep local accounts (devuser 2101/8001)
+  # out of these ranges.
+  - model: authentik_core.user
+    identifiers:
+      username: akadmin
+    attrs:
+      attributes:
+        uidNumber: "3001"
+        gidNumber: "9001"
+  - model: authentik_core.group
+    identifiers:
+      name: flux-users
+    attrs:
+      attributes:
+        gidNumber: "9001"
+      users:
+        - !Find [authentik_core.user, [username, akadmin]]
   - model: authentik_core.user
     id: flux-ldap-svc
     identifiers:

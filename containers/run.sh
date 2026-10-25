@@ -16,32 +16,25 @@ if [ -z "$public_host" ] && podman machine inspect >/dev/null 2>&1; then
   public_host="$(podman machine ssh "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null | tr -d '\r\n' || true)"
 fi
 
-# Authentik/OIDC secrets live outside git; generate them once per checkout.
+# Authentik/OIDC secrets live outside git; each key is generated once and
+# never regenerated, so new keys backfill into existing files.
 env_file="$here/.env.authentik"
+gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
+required_keys=(
+  AUTHENTIK_SECRET_KEY PG_PASS AUTHENTIK_BOOTSTRAP_PASSWORD AUTHENTIK_BOOTSTRAP_TOKEN
+  FLUX_OIDC_CLIENT_SECRET FLUX_SESSION_SECRET FLUX_RELAY_TOKEN FLUX_DEVUSER_PASSWORD
+  FLUX_AK_ENROLLMENT_TOKEN FLUX_LDAP_OUTPOST_TOKEN FLUX_LDAP_BIND_PASSWORD
+)
 if [ ! -f "$env_file" ]; then
-  gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
-  {
-    echo "AUTHENTIK_SECRET_KEY=$(gen_secret)"
-    echo "PG_PASS=$(gen_secret)"
-    echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$(gen_secret)"
-    echo "AUTHENTIK_BOOTSTRAP_TOKEN=$(gen_secret)"
-    echo "FLUX_OIDC_CLIENT_SECRET=$(gen_secret)"
-    echo "FLUX_SESSION_SECRET=$(gen_secret)"
-    echo "FLUX_RELAY_TOKEN=$(gen_secret)"
-    echo "FLUX_DEVUSER_PASSWORD=$(gen_secret)"
-    echo "FLUX_AK_ENROLLMENT_TOKEN=$(gen_secret)"
-  } > "$env_file"
-  chmod 600 "$env_file"
+  (umask 077; : > "$env_file")
   echo "Generated $env_file (akadmin password, OIDC secrets; gitignored)."
-else
-  # Backfill keys added after the file was first generated.
-  gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
-  for key in FLUX_DEVUSER_PASSWORD FLUX_AK_ENROLLMENT_TOKEN FLUX_LDAP_OUTPOST_TOKEN FLUX_LDAP_BIND_PASSWORD; do
-    if ! grep -q "^$key=" "$env_file"; then
-      echo "$key=$(gen_secret)" >> "$env_file"
-    fi
-  done
 fi
+for key in "${required_keys[@]}"; do
+  if ! grep -q "^$key=" "$env_file"; then
+    echo "$key=$(gen_secret)" >> "$env_file"
+  fi
+done
+chmod 600 "$env_file"
 set -a
 # shellcheck disable=SC1090
 . "$env_file"

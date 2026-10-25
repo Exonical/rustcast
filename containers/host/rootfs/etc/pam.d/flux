@@ -1,7 +1,7 @@
 # flux-hostd login: authentik device-domain first (inert without an
 # Enterprise license), then local/SSSD password auth.
 auth     [success=done auth_err=die perm_denied=die default=ignore]  pam_authentik.so
-auth     sufficient                                                  pam_unix.so nullok
+auth     sufficient                                                  pam_unix.so
 auth     [default=1 ignore=ignore success=ok]                        pam_usertype.so isregular
 auth     sufficient                                                  pam_sss.so forward_pass
 auth     required                                                    pam_deny.so
