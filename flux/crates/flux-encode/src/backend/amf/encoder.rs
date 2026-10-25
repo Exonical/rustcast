@@ -601,6 +601,21 @@ fn frame_duration_100ns(framerate: u32) -> i64 {
     (AMF_TIMEBASE_PER_SECOND / u64::from(framerate.max(1))).max(1) as i64
 }
 
+/// Decide whether a runtime framerate change may update the session's pacing
+/// state. A rejected property is an error so the caller knows the encoder kept
+/// its old rate. An unsupported property is accepted: the runtime keeps its
+/// init-time rate, but frames now arrive at `framerate`, so surface durations
+/// and timestamp fallbacks follow the input cadence.
+fn runtime_framerate_outcome(status: PropertyStatus, property: &str, framerate: u32, frame: u64) -> Result<()> {
+    match status {
+        PropertyStatus::Rejected => Err(FluxError::Encode {
+            frame,
+            reason: format!("AMF rejected runtime framerate {} = {}", property, framerate),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Keep the VBV formula identical between session setup and bitrate updates.
 fn vbv_buffer_size(bitrate_bps: i64, framerate: u32, frame_count: u64) -> i64 {
     let frames = frame_count.max(1);
@@ -1366,6 +1381,7 @@ impl EncodeSession for AmfSession {
             framerate,
             status
         );
+        runtime_framerate_outcome(status, property, framerate, self.frame_index)?;
         self.config.framerate = framerate;
         self.frame_duration_100ns = frame_duration_100ns(framerate);
         Ok(())
@@ -1380,11 +1396,7 @@ impl EncodeSession for AmfSession {
             tracing::warn!("AMF Drain returned {}", drain_result);
         }
 
-        // Collect remaining output
-        let mut packets = Vec::new();
-        while let (AMF_OK, Some(data)) = self.encoder.query_output() {
-            packets.push(self.extract_output(&data));
-        }
+        let packets = self.drain_output();
 
         tracing::debug!("AMF flush: {} remaining packets", packets.len());
         Ok(packets)
@@ -1504,6 +1516,15 @@ mod tests {
         assert_eq!(max_au_size_bits(10_000_000), 1_000_000);
         assert_eq!(max_au_size_bits(6_827_000), 682_700);
         assert_eq!(max_au_size_bits(0), 1);
+    }
+
+    #[test]
+    fn runtime_framerate_rejection_is_an_error() {
+        let err = runtime_framerate_outcome(PropertyStatus::Rejected, H264_FRAMERATE, 30, 7)
+            .expect_err("rejected framerate must not report success");
+        assert!(matches!(err, FluxError::Encode { frame: 7, .. }));
+        assert!(runtime_framerate_outcome(PropertyStatus::Accepted, H264_FRAMERATE, 30, 7).is_ok());
+        assert!(runtime_framerate_outcome(PropertyStatus::Unsupported, H264_FRAMERATE, 30, 7).is_ok());
     }
 
     #[test]

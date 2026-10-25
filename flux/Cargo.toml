@@ -6,7 +6,6 @@ members = [
     "crates/flux-encode",
     "crates/flux-audio",
     "crates/flux-input",
-    "crates/flux-transport",
     "crates/flux-crypto",
     "crates/flux-protocol",
     "crates/flux-server",
@@ -28,7 +27,6 @@ flux-capture = { path = "crates/flux-capture" }
 flux-encode = { path = "crates/flux-encode" }
 flux-audio = { path = "crates/flux-audio" }
 flux-input = { path = "crates/flux-input" }
-flux-transport = { path = "crates/flux-transport" }
 flux-crypto = { path = "crates/flux-crypto" }
 flux-protocol = { path = "crates/flux-protocol" }
 
@@ -56,7 +54,6 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 
 # Byte manipulation
-bytes = "1.12"
 byteorder = "1.5.0"
 
 # GPU / Vulkan

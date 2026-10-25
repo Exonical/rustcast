@@ -37,7 +37,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
-uuid = { workspace = true }
 parking_lot = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
@@ -53,3 +52,4 @@ muda = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
+thiserror = { workspace = true }

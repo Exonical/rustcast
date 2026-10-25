@@ -32,6 +32,74 @@ struct DisplayConfig {
     modes: Vec<DISPLAYCONFIG_MODE_INFO>,
 }
 
+/// Topology change a `SetDisplayConfig` validate/apply pair belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOp {
+    Privacy,
+    Restore,
+    Mode,
+}
+
+impl std::fmt::Display for ConfigOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Privacy => "privacy",
+            Self::Restore => "restore",
+            Self::Mode => "mode",
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CcdError {
+    /// `SDC_VALIDATE` refused the supplied topology; nothing was applied.
+    #[error("CCD {op} validate rejected (status {status}): SetDisplayConfig")]
+    ValidateRejected { op: ConfigOp, status: i32 },
+    /// `SDC_APPLY` failed after validation; the topology may be partially applied.
+    #[error("CCD {op} apply failed (status {status}): SetDisplayConfig")]
+    ApplyFailed { op: ConfigOp, status: i32 },
+    #[error("CCD {op} verification mismatch: {detail}")]
+    VerifyMismatch { op: ConfigOp, detail: String },
+    #[error("{0}")]
+    Topology(String),
+    #[error("{action}: {source}")]
+    SnapshotIo {
+        action: &'static str,
+        source: std::io::Error,
+    },
+    #[error("privacy topology snapshot {0}")]
+    SnapshotInvalid(String),
+    #[error("LockWorkStation failed: {0}")]
+    LockWorkstation(windows::core::Error),
+    #[error("CCD configuration did not settle within {timeout:?}: {last}")]
+    Timeout { timeout: Duration, last: Box<CcdError> },
+    #[error("privacy state lock poisoned")]
+    StatePoisoned,
+    #[error("privacy controller is shutting down")]
+    ShuttingDown,
+}
+
+impl CcdError {
+    fn topology(message: impl Into<String>) -> Self {
+        Self::Topology(message.into())
+    }
+
+    fn verify_mismatch(op: ConfigOp, detail: impl Into<String>) -> Self {
+        Self::VerifyMismatch {
+            op,
+            detail: detail.into(),
+        }
+    }
+
+    fn snapshot_io(action: &'static str) -> impl FnOnce(std::io::Error) -> Self {
+        move |source| Self::SnapshotIo { action, source }
+    }
+
+    fn snapshot_invalid(message: impl Into<String>) -> Self {
+        Self::SnapshotInvalid(message.into())
+    }
+}
+
 #[derive(Clone)]
 pub struct PrivacyController {
     inner: Arc<Mutex<PrivacyState>>,
@@ -67,7 +135,7 @@ impl Drop for PrivacyConnectionState {
 }
 
 impl PrivacyController {
-    pub fn new(target: DisplayInfo, snapshot_path: PathBuf, lock_on_disconnect: bool) -> Result<Self, String> {
+    pub fn new(target: DisplayInfo, snapshot_path: PathBuf, lock_on_disconnect: bool) -> Result<Self, CcdError> {
         Ok(Self {
             inner: Arc::new(Mutex::new(PrivacyState {
                 target,
@@ -93,27 +161,30 @@ impl PrivacyController {
         }
     }
 
-    fn update_connection(&self, token: u64, count: u32) -> Result<(), String> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| "privacy state lock poisoned".to_string())?;
+    fn update_connection(&self, token: u64, count: u32) -> Result<(), CcdError> {
+        let mut state = self.inner.lock().map_err(|_| CcdError::StatePoisoned)?;
         let was_viewed = state.connections.values().any(|viewers| *viewers > 0);
         state.connections.insert(token, count);
         let has_viewers = state.connections.values().any(|viewers| *viewers > 0);
         if !was_viewed && has_viewers && !state.privacy_applied {
             if let Err(error) = apply_privacy(&state.target, &state.snapshot_path) {
-                if error.contains("validate rejected") {
-                    let _ = std::fs::remove_file(&state.snapshot_path);
-                    state.privacy_applied = false;
-                    state.connections.insert(token, 0);
-                } else if state.snapshot_path.exists() {
+                match error {
+                    // Validation rejects before anything is applied, so the
+                    // snapshot is stale and the topology is untouched.
+                    CcdError::ValidateRejected {
+                        op: ConfigOp::Privacy, ..
+                    } => {
+                        let _ = std::fs::remove_file(&state.snapshot_path);
+                        state.privacy_applied = false;
+                        state.connections.insert(token, 0);
+                    }
                     // An apply or verification error may mean that the
                     // temporary topology took effect. Keep the snapshot and
                     // force the disconnect path to attempt restoration.
-                    state.privacy_applied = true;
-                } else {
-                    state.connections.insert(token, 0);
+                    _ if state.snapshot_path.exists() => state.privacy_applied = true,
+                    _ => {
+                        state.connections.insert(token, 0);
+                    }
                 }
                 return Err(error);
             }
@@ -125,11 +196,8 @@ impl PrivacyController {
         Ok(())
     }
 
-    fn disconnect(&self, token: u64) -> Result<(), String> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| "privacy state lock poisoned".to_string())?;
+    fn disconnect(&self, token: u64) -> Result<(), CcdError> {
+        let mut state = self.inner.lock().map_err(|_| CcdError::StatePoisoned)?;
         let was_viewed = state.connections.values().any(|viewers| *viewers > 0);
         state.connections.remove(&token);
         if was_viewed
@@ -141,11 +209,8 @@ impl PrivacyController {
         Ok(())
     }
 
-    pub fn restore(&self) -> Result<(), String> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| "privacy state lock poisoned".to_string())?;
+    pub fn restore(&self) -> Result<(), CcdError> {
+        let mut state = self.inner.lock().map_err(|_| CcdError::StatePoisoned)?;
         if !state.privacy_applied && !state.snapshot_path.exists() {
             return Ok(());
         }
@@ -158,17 +223,13 @@ impl PrivacyController {
 }
 
 impl PrivacyConnection {
-    pub fn update(&self, count: u32) -> Result<(), String> {
-        let inner = self
-            .inner
-            .controller
-            .upgrade()
-            .ok_or_else(|| "privacy controller is shutting down".to_string())?;
+    pub fn update(&self, count: u32) -> Result<(), CcdError> {
+        let inner = self.inner.controller.upgrade().ok_or(CcdError::ShuttingDown)?;
         PrivacyController { inner }.update_connection(self.inner.token, count)
     }
 }
 
-fn restore_and_lock(state: &mut PrivacyState) -> Result<(), String> {
+fn restore_and_lock(state: &mut PrivacyState) -> Result<(), CcdError> {
     restore_snapshot(&state.snapshot_path)?;
     state.privacy_applied = false;
     tracing::info!("Privacy mode disabled; physical display topology restored");
@@ -223,11 +284,11 @@ pub fn recover_snapshot(snapshot_path: &Path) {
     }
 }
 
-fn apply_privacy(target: &DisplayInfo, snapshot_path: &Path) -> Result<(), String> {
+fn apply_privacy(target: &DisplayInfo, snapshot_path: &Path) -> Result<(), CcdError> {
     let config = query_config(ACTIVE_QUERY_FLAGS)?;
     let adapter_luid = target
         .adapter_luid
-        .ok_or_else(|| format!("DXGI output {} has no adapter LUID", target.name))?;
+        .ok_or_else(|| CcdError::topology(format!("DXGI output {} has no adapter LUID", target.name)))?;
     let (virtual_index, _) = find_source_path(&config.paths, adapter_luid, &target.name)?;
     write_snapshot(snapshot_path, &config)?;
 
@@ -242,26 +303,13 @@ fn apply_privacy(target: &DisplayInfo, snapshot_path: &Path) -> Result<(), Strin
     apply_and_verify_privacy(&privacy_config, target, adapter_luid)
 }
 
-fn apply_and_verify_privacy(config: &DisplayConfig, target: &DisplayInfo, adapter_luid: u64) -> Result<(), String> {
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
-    if status != 0 {
-        return Err(format!(
-            "CCD privacy validate rejected (status {}): SetDisplayConfig",
-            status
-        ));
-    }
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
-    if status != 0 {
-        return Err(format!(
-            "CCD privacy apply failed (status {}): SetDisplayConfig",
-            status
-        ));
-    }
+fn apply_and_verify_privacy(config: &DisplayConfig, target: &DisplayInfo, adapter_luid: u64) -> Result<(), CcdError> {
+    set_display_config(config, ConfigOp::Privacy)?;
 
     let active = query_config(ACTIVE_QUERY_FLAGS)?;
     let (virtual_index, _) = find_source_path(&active.paths, adapter_luid, &target.name)?;
     if active.paths[virtual_index].flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
-        return Err("CCD privacy verification mismatch: virtual path is inactive".into());
+        return Err(CcdError::verify_mismatch(ConfigOp::Privacy, "virtual path is inactive"));
     }
     let all_paths = query_config(ALL_PATHS_QUERY_FLAGS)?;
     for path in all_paths.paths {
@@ -269,28 +317,18 @@ fn apply_and_verify_privacy(config: &DisplayConfig, target: &DisplayInfo, adapte
             continue;
         }
         if source_name(path.sourceInfo.adapterId, path.sourceInfo.id)? != target.name {
-            return Err("CCD privacy verification mismatch: a physical source remains active".into());
+            return Err(CcdError::verify_mismatch(
+                ConfigOp::Privacy,
+                "a physical source remains active",
+            ));
         }
     }
     Ok(())
 }
 
-fn restore_snapshot(snapshot_path: &Path) -> Result<(), String> {
+fn restore_snapshot(snapshot_path: &Path) -> Result<(), CcdError> {
     let config = read_snapshot(snapshot_path)?;
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
-    if status != 0 {
-        return Err(format!(
-            "CCD restore validate rejected (status {}): SetDisplayConfig",
-            status
-        ));
-    }
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
-    if status != 0 {
-        return Err(format!(
-            "CCD restore apply failed (status {}): SetDisplayConfig",
-            status
-        ));
-    }
+    set_display_config(&config, ConfigOp::Restore)?;
 
     let active = query_config(ACTIVE_QUERY_FLAGS)?;
     for expected in &config.paths {
@@ -304,14 +342,17 @@ fn restore_snapshot(snapshot_path: &Path) -> Result<(), String> {
                 && actual.targetInfo.adapterId == expected.targetInfo.adapterId
                 && actual.targetInfo.id == expected.targetInfo.id
         }) {
-            return Err("CCD restore verification mismatch: a saved active path is missing".into());
+            return Err(CcdError::verify_mismatch(
+                ConfigOp::Restore,
+                "a saved active path is missing",
+            ));
         }
     }
-    std::fs::remove_file(snapshot_path).map_err(|error| format!("remove privacy topology snapshot: {error}"))?;
+    std::fs::remove_file(snapshot_path).map_err(CcdError::snapshot_io("remove privacy topology snapshot"))?;
     Ok(())
 }
 
-fn write_snapshot(snapshot_path: &Path, config: &DisplayConfig) -> Result<(), String> {
+fn write_snapshot(snapshot_path: &Path, config: &DisplayConfig) -> Result<(), CcdError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(SNAPSHOT_MAGIC);
     bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
@@ -321,45 +362,45 @@ fn write_snapshot(snapshot_path: &Path, config: &DisplayConfig) -> Result<(), St
     append_snapshot_vec(&mut bytes, &config.paths);
     append_snapshot_vec(&mut bytes, &config.modes);
     if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("create privacy snapshot directory: {error}"))?;
+        std::fs::create_dir_all(parent).map_err(CcdError::snapshot_io("create privacy snapshot directory"))?;
     }
     let temporary = snapshot_path.with_extension("tmp");
-    std::fs::write(&temporary, bytes).map_err(|error| format!("write privacy topology snapshot: {error}"))?;
-    std::fs::rename(&temporary, snapshot_path).map_err(|error| format!("commit privacy topology snapshot: {error}"))?;
+    std::fs::write(&temporary, bytes).map_err(CcdError::snapshot_io("write privacy topology snapshot"))?;
+    std::fs::rename(&temporary, snapshot_path).map_err(CcdError::snapshot_io("commit privacy topology snapshot"))?;
     Ok(())
 }
 
-fn read_snapshot(snapshot_path: &Path) -> Result<DisplayConfig, String> {
-    let bytes = std::fs::read(snapshot_path).map_err(|error| format!("read privacy topology snapshot: {error}"))?;
+fn read_snapshot(snapshot_path: &Path) -> Result<DisplayConfig, CcdError> {
+    let bytes = std::fs::read(snapshot_path).map_err(CcdError::snapshot_io("read privacy topology snapshot"))?;
     let mut offset = 0;
     if bytes.len() < 28 || &bytes[..8] != SNAPSHOT_MAGIC {
-        return Err("privacy topology snapshot has an invalid magic value".into());
+        return Err(CcdError::snapshot_invalid("has an invalid magic value"));
     }
     offset += 8;
     let version = read_snapshot_u32(&bytes, &mut offset)?;
     if version != SNAPSHOT_VERSION {
-        return Err(format!("unsupported privacy topology snapshot version {version}"));
+        return Err(CcdError::snapshot_invalid(format!("version {version} is unsupported")));
     }
     let path_size = read_snapshot_u32(&bytes, &mut offset)?;
     let mode_size = read_snapshot_u32(&bytes, &mut offset)?;
     if path_size as usize != size_of::<DISPLAYCONFIG_PATH_INFO>()
         || mode_size as usize != size_of::<DISPLAYCONFIG_MODE_INFO>()
     {
-        return Err(format!(
-            "privacy topology snapshot struct sizes do not match (path {path_size}, mode {mode_size})"
-        ));
+        return Err(CcdError::snapshot_invalid(format!(
+            "struct sizes do not match (path {path_size}, mode {mode_size})"
+        )));
     }
     let boot_session = read_snapshot_u64(&bytes, &mut offset)?;
     let current_boot_session = boot_session_id();
     if boot_session != current_boot_session {
-        return Err(format!(
-            "privacy topology snapshot belongs to boot session {boot_session}, current session is {current_boot_session}"
-        ));
+        return Err(CcdError::snapshot_invalid(format!(
+            "belongs to boot session {boot_session}, current session is {current_boot_session}"
+        )));
     }
     let paths = read_snapshot_vec::<DISPLAYCONFIG_PATH_INFO>(&bytes, &mut offset)?;
     let modes = read_snapshot_vec::<DISPLAYCONFIG_MODE_INFO>(&bytes, &mut offset)?;
     if offset != bytes.len() {
-        return Err("privacy topology snapshot contains trailing data".into());
+        return Err(CcdError::snapshot_invalid("contains trailing data"));
     }
     Ok(DisplayConfig { paths, modes })
 }
@@ -370,16 +411,16 @@ fn append_snapshot_vec<T: Copy>(bytes: &mut Vec<u8>, values: &[T]) {
     bytes.extend_from_slice(raw);
 }
 
-fn read_snapshot_vec<T: Copy>(bytes: &[u8], offset: &mut usize) -> Result<Vec<T>, String> {
+fn read_snapshot_vec<T: Copy>(bytes: &[u8], offset: &mut usize) -> Result<Vec<T>, CcdError> {
     let count = read_snapshot_u32(bytes, offset)? as usize;
     let size = size_of::<T>()
         .checked_mul(count)
-        .ok_or_else(|| "privacy topology snapshot size overflow".to_string())?;
+        .ok_or_else(|| CcdError::snapshot_invalid("size overflow"))?;
     let end = offset
         .checked_add(size)
-        .ok_or_else(|| "privacy topology snapshot offset overflow".to_string())?;
+        .ok_or_else(|| CcdError::snapshot_invalid("offset overflow"))?;
     if end > bytes.len() {
-        return Err("privacy topology snapshot is truncated".into());
+        return Err(CcdError::snapshot_invalid("is truncated"));
     }
     let mut values = Vec::with_capacity(count);
     for chunk in bytes[*offset..end].chunks_exact(size_of::<T>()) {
@@ -393,24 +434,24 @@ fn read_snapshot_vec<T: Copy>(bytes: &[u8], offset: &mut usize) -> Result<Vec<T>
     Ok(values)
 }
 
-fn read_snapshot_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+fn read_snapshot_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, CcdError> {
     let end = offset
         .checked_add(4)
-        .ok_or_else(|| "privacy topology snapshot offset overflow".to_string())?;
+        .ok_or_else(|| CcdError::snapshot_invalid("offset overflow"))?;
     if end > bytes.len() {
-        return Err("privacy topology snapshot is truncated".into());
+        return Err(CcdError::snapshot_invalid("is truncated"));
     }
     let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
     *offset = end;
     Ok(value)
 }
 
-fn read_snapshot_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, String> {
+fn read_snapshot_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, CcdError> {
     let end = offset
         .checked_add(8)
-        .ok_or_else(|| "privacy topology snapshot offset overflow".to_string())?;
+        .ok_or_else(|| CcdError::snapshot_invalid("offset overflow"))?;
     if end > bytes.len() {
-        return Err("privacy topology snapshot is truncated".into());
+        return Err(CcdError::snapshot_invalid("is truncated"));
     }
     let value = u64::from_le_bytes(bytes[*offset..end].try_into().unwrap());
     *offset = end;
@@ -428,21 +469,24 @@ fn boot_session_id() -> u64 {
     now.saturating_sub(uptime_ms / 1000)
 }
 
-fn lock_workstation() -> Result<(), String> {
-    unsafe {
-        windows::Win32::System::Shutdown::LockWorkStation().map_err(|error| format!("LockWorkStation failed: {error}"))
-    }
+fn lock_workstation() -> Result<(), CcdError> {
+    unsafe { windows::Win32::System::Shutdown::LockWorkStation().map_err(CcdError::LockWorkstation) }
 }
 
 /// Apply a temporary Extend topology and the requested mode to the virtual
 /// source. No persistence flag is used; the user's saved display database is
 /// intentionally left unchanged.
-pub fn configure_virtual_display(target: &DisplayInfo, width: u32, height: u32, refresh_hz: u32) -> Result<(), String> {
+pub fn configure_virtual_display(
+    target: &DisplayInfo,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> Result<(), CcdError> {
     let adapter_luid = target
         .adapter_luid
-        .ok_or_else(|| format!("DXGI output {} has no adapter LUID", target.name))?;
+        .ok_or_else(|| CcdError::topology(format!("DXGI output {} has no adapter LUID", target.name)))?;
     let deadline = Instant::now() + CONFIGURATION_TIMEOUT;
-    let mut last_error = "CCD path never appeared".to_string();
+    let mut last_error = CcdError::topology("CCD path never appeared");
     let mut resolved_path_logged = false;
 
     while Instant::now() < deadline {
@@ -462,10 +506,10 @@ pub fn configure_virtual_display(target: &DisplayInfo, width: u32, height: u32, 
         }
     }
 
-    Err(format!(
-        "CCD configuration did not settle within {:?}: {}",
-        CONFIGURATION_TIMEOUT, last_error
-    ))
+    Err(CcdError::Timeout {
+        timeout: CONFIGURATION_TIMEOUT,
+        last: Box::new(last_error),
+    })
 }
 
 fn configure_once(
@@ -475,7 +519,7 @@ fn configure_once(
     height: u32,
     refresh_hz: u32,
     resolved_path_logged: &mut bool,
-) -> Result<(), String> {
+) -> Result<(), CcdError> {
     let mut config = query_config(ACTIVE_QUERY_FLAGS)?;
     let (virtual_index, ccd_adapter_luid) = find_source_path(&config.paths, adapter_luid, &target.name)?;
     if !*resolved_path_logged {
@@ -509,10 +553,10 @@ fn configure_once(
             })
             .copied()
             .ok_or_else(|| {
-                format!(
+                CcdError::topology(format!(
                     "CCD target {} has no independent source path for Extend",
                     active_path.targetInfo.id
-                )
+                ))
             })?;
         config.paths[virtual_index] = copy_path_modes(replacement, &all_paths.modes, &mut config.modes)?;
     }
@@ -526,9 +570,12 @@ fn configure_once(
     let source = config
         .modes
         .get_mut(source_index)
-        .ok_or_else(|| format!("CCD source mode index {} is invalid", source_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD source mode index {} is invalid", source_index)))?;
     if source.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-        return Err(format!("CCD source mode index {} is not a source mode", source_index));
+        return Err(CcdError::topology(format!(
+            "CCD source mode index {} is not a source mode",
+            source_index
+        )));
     }
     unsafe {
         let mode = &mut source.Anonymous.sourceMode;
@@ -540,9 +587,12 @@ fn configure_once(
     let target_mode = config
         .modes
         .get_mut(target_index)
-        .ok_or_else(|| format!("CCD target mode index {} is invalid", target_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD target mode index {} is invalid", target_index)))?;
     if target_mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET {
-        return Err(format!("CCD target mode index {} is not a target mode", target_index));
+        return Err(CcdError::topology(format!(
+            "CCD target mode index {} is not a target mode",
+            target_index
+        )));
     }
     unsafe {
         let signal = &mut target_mode.Anonymous.targetMode.targetVideoSignalInfo;
@@ -559,14 +609,7 @@ fn configure_once(
         Denominator: 1,
     };
 
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
-    if status != 0 {
-        return Err(format!("CCD validate rejected (status {}): SetDisplayConfig", status));
-    }
-    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
-    if status != 0 {
-        return Err(format!("CCD apply failed (status {}): SetDisplayConfig", status));
-    }
+    set_display_config(&config, ConfigOp::Mode)?;
 
     verify_config(
         &target.name,
@@ -579,16 +622,29 @@ fn configure_once(
     )
 }
 
-fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, String> {
+/// Validate `config` with `SDC_VALIDATE`, then apply it with `SDC_APPLY`.
+fn set_display_config(config: &DisplayConfig, op: ConfigOp) -> Result<(), CcdError> {
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), VALIDATE_FLAGS) };
+    if status != 0 {
+        return Err(CcdError::ValidateRejected { op, status });
+    }
+    let status = unsafe { SetDisplayConfig(Some(&config.paths), Some(&config.modes), APPLY_FLAGS) };
+    if status != 0 {
+        return Err(CcdError::ApplyFailed { op, status });
+    }
+    Ok(())
+}
+
+fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, CcdError> {
     for _ in 0..QUERY_RETRIES {
         let mut path_count = 0u32;
         let mut mode_count = 0u32;
         let status = unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
         if status.0 != 0 {
-            return Err(format!(
+            return Err(CcdError::topology(format!(
                 "CCD query failed (GetDisplayConfigBufferSizes status {})",
                 status.0
-            ));
+            )));
         }
 
         let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
@@ -611,17 +667,20 @@ fn query_config(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<DisplayConfig, Stri
         // ERROR_INSUFFICIENT_BUFFER: the topology changed between the size
         // query and QueryDisplayConfig. Start over with fresh arrays.
         if status.0 != 122 {
-            return Err(format!("CCD query failed (QueryDisplayConfig status {})", status.0));
+            return Err(CcdError::topology(format!(
+                "CCD query failed (QueryDisplayConfig status {})",
+                status.0
+            )));
         }
     }
-    Err("CCD query failed: topology changed while querying".into())
+    Err(CcdError::topology("CCD query failed: topology changed while querying"))
 }
 
 fn find_source_path(
     paths: &[DISPLAYCONFIG_PATH_INFO],
     dxgi_adapter_luid: u64,
     expected_name: &str,
-) -> Result<(usize, u64), String> {
+) -> Result<(usize, u64), CcdError> {
     let mut matches = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         if source_name(path.sourceInfo.adapterId, path.sourceInfo.id)? == expected_name {
@@ -629,7 +688,10 @@ fn find_source_path(
         }
     }
     match matches.as_slice() {
-        [] => Err(format!("CCD path never appeared for source {}", expected_name)),
+        [] => Err(CcdError::topology(format!(
+            "CCD path never appeared for source {}",
+            expected_name
+        ))),
         [match_] => Ok(*match_),
         matches => {
             let dxgi_matches: Vec<_> = matches
@@ -639,18 +701,18 @@ fn find_source_path(
                 .collect();
             match dxgi_matches.as_slice() {
                 [match_] => Ok(*match_),
-                _ => Err(format!(
+                _ => Err(CcdError::topology(format!(
                     "CCD source {} is ambiguous across {} paths (DXGI adapter LUID 0x{:016X})",
                     expected_name,
                     matches.len(),
                     dxgi_adapter_luid
-                )),
+                ))),
             }
         }
     }
 }
 
-fn source_name(adapter_id: LUID, source_id: u32) -> Result<String, String> {
+fn source_name(adapter_id: LUID, source_id: u32) -> Result<String, CcdError> {
     let mut packet = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
     packet.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
         r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -660,10 +722,10 @@ fn source_name(adapter_id: LUID, source_id: u32) -> Result<String, String> {
     };
     let status = unsafe { DisplayConfigGetDeviceInfo(&mut packet as *mut _ as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER) };
     if status != 0 {
-        return Err(format!(
+        return Err(CcdError::topology(format!(
             "DisplayConfigGetDeviceInfo source {} failed: {}",
             source_id, status
-        ));
+        )));
     }
     let length = packet
         .viewGdiDeviceName
@@ -687,18 +749,18 @@ fn copy_path_modes(
     mut path: DISPLAYCONFIG_PATH_INFO,
     source_modes: &[DISPLAYCONFIG_MODE_INFO],
     modes: &mut Vec<DISPLAYCONFIG_MODE_INFO>,
-) -> Result<DISPLAYCONFIG_PATH_INFO, String> {
+) -> Result<DISPLAYCONFIG_PATH_INFO, CcdError> {
     let source_index = source_mode_index(&path)?;
     let target_index = target_mode_index(&path)?;
     let source = *source_modes
         .get(source_index)
-        .ok_or_else(|| format!("CCD candidate source mode index {} is invalid", source_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD candidate source mode index {} is invalid", source_index)))?;
     let target = *source_modes
         .get(target_index)
-        .ok_or_else(|| format!("CCD candidate target mode index {} is invalid", target_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD candidate target mode index {} is invalid", target_index)))?;
     if source.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE || target.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET
     {
-        return Err("CCD candidate path has invalid source/target modes".into());
+        return Err(CcdError::topology("CCD candidate path has invalid source/target modes"));
     }
     let new_source_index = modes.len() as u32;
     modes.push(source);
@@ -709,35 +771,35 @@ fn copy_path_modes(
     Ok(path)
 }
 
-fn source_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
+fn source_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, CcdError> {
     let index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
     if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
-        Err("CCD path has no source mode".into())
+        Err(CcdError::topology("CCD path has no source mode"))
     } else {
         Ok(index as usize)
     }
 }
 
-fn target_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, String> {
+fn target_mode_index(path: &DISPLAYCONFIG_PATH_INFO) -> Result<usize, CcdError> {
     let index = unsafe { path.targetInfo.Anonymous.modeInfoIdx };
     if index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID {
-        Err("CCD path has no target mode".into())
+        Err(CcdError::topology("CCD path has no target mode"))
     } else {
         Ok(index as usize)
     }
 }
 
-fn set_source_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
+fn set_source_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), CcdError> {
     path.sourceInfo.Anonymous.modeInfoIdx = index;
     Ok(())
 }
 
-fn set_target_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), String> {
+fn set_target_mode_index(path: &mut DISPLAYCONFIG_PATH_INFO, index: u32) -> Result<(), CcdError> {
     path.targetInfo.Anonymous.modeInfoIdx = index;
     Ok(())
 }
 
-fn non_overlapping_position(config: &DisplayConfig, virtual_index: usize) -> Result<POINTL, String> {
+fn non_overlapping_position(config: &DisplayConfig, virtual_index: usize) -> Result<POINTL, CcdError> {
     let mut rightmost = 0i32;
     for (index, path) in config.paths.iter().enumerate() {
         if index == virtual_index || path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
@@ -747,7 +809,7 @@ fn non_overlapping_position(config: &DisplayConfig, virtual_index: usize) -> Res
         let mode = config
             .modes
             .get(source_index)
-            .ok_or_else(|| format!("CCD source mode index {} is invalid", source_index))?;
+            .ok_or_else(|| CcdError::topology(format!("CCD source mode index {} is invalid", source_index)))?;
         let source = unsafe { &mode.Anonymous.sourceMode };
         rightmost = rightmost.max(source.position.x.saturating_add(source.width as i32));
     }
@@ -762,32 +824,41 @@ fn verify_config(
     height: u32,
     refresh_hz: u32,
     expected_position: POINTL,
-) -> Result<(), String> {
+) -> Result<(), CcdError> {
     let config = query_config(ACTIVE_QUERY_FLAGS)?;
     let (index, ccd_adapter_luid) = find_source_path(&config.paths, dxgi_adapter_luid, expected_name)?;
     if ccd_adapter_luid != expected_ccd_adapter_luid {
-        return Err(format!(
-            "CCD verification resolved source {} on unexpected adapter LUID 0x{:016X} (expected 0x{:016X})",
-            expected_name, ccd_adapter_luid, expected_ccd_adapter_luid
+        return Err(CcdError::verify_mismatch(
+            ConfigOp::Mode,
+            format!(
+                "source {} resolved on unexpected adapter LUID 0x{:016X} (expected 0x{:016X})",
+                expected_name, ccd_adapter_luid, expected_ccd_adapter_luid
+            ),
         ));
     }
     let path = &config.paths[index];
     if path.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
-        return Err("CCD virtual path is not active after apply".into());
+        return Err(CcdError::verify_mismatch(
+            ConfigOp::Mode,
+            "virtual path is not active after apply",
+        ));
     }
     if has_duplicate_active_source(&config.paths, index) {
-        return Err("CCD virtual source remains cloned after apply".into());
+        return Err(CcdError::verify_mismatch(
+            ConfigOp::Mode,
+            "virtual source remains cloned after apply",
+        ));
     }
     let source_index = source_mode_index(path)?;
     let target_index = target_mode_index(path)?;
     let source_mode = config
         .modes
         .get(source_index)
-        .ok_or_else(|| format!("CCD source mode index {} is invalid", source_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD source mode index {} is invalid", source_index)))?;
     let target_mode = config
         .modes
         .get(target_index)
-        .ok_or_else(|| format!("CCD target mode index {} is invalid", target_index))?;
+        .ok_or_else(|| CcdError::topology(format!("CCD target mode index {} is invalid", target_index)))?;
     let (source_width, source_height, source_position) = unsafe {
         let source = &source_mode.Anonymous.sourceMode;
         (source.width, source.height, source.position)
@@ -810,15 +881,18 @@ fn verify_config(
         || target_height != height
         || target_refresh != refresh_hz
     {
-        return Err(format!(
-            "CCD verification mismatch: source={}x{} at ({},{}), target={}x{}@{}Hz",
-            source_width,
-            source_height,
-            source_position.x,
-            source_position.y,
-            target_width,
-            target_height,
-            target_refresh
+        return Err(CcdError::verify_mismatch(
+            ConfigOp::Mode,
+            format!(
+                "source={}x{} at ({},{}), target={}x{}@{}Hz",
+                source_width,
+                source_height,
+                source_position.x,
+                source_position.y,
+                target_width,
+                target_height,
+                target_refresh
+            ),
         ));
     }
     if source_position != expected_position {

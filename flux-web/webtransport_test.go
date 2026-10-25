@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"testing"
 	"time"
@@ -29,6 +30,31 @@ func TestVideoFrameHeaderEncoding(t *testing.T) {
 		binary.BigEndian.Uint64(header[5:13]) != frame.tsMicros || header[13] != 1 ||
 		binary.BigEndian.Uint32(header[14:18]) != 3 {
 		t.Fatalf("unexpected video stream header: %x", header)
+	}
+}
+
+func TestSendResolutionChangeQueuesCommandUnlessFull(t *testing.T) {
+	u := newMachineUpstream("a", "m", nil, func(string) {})
+	if !u.sendResolutionChange(1920, 1080) {
+		t.Fatal("sendResolutionChange with free command channel = false, want true")
+	}
+	if cmd := <-u.commandChan; !bytes.Equal(cmd, []byte{cmdResolution, 0x07, 0x80, 0x04, 0x38}) {
+		t.Fatalf("resolution command = %x, want 0607800438", cmd)
+	}
+	for len(u.commandChan) < cap(u.commandChan) {
+		u.commandChan <- nil
+	}
+	if u.sendResolutionChange(1920, 1080) {
+		t.Fatal("sendResolutionChange with full command channel = true, want false")
+	}
+}
+
+func TestResolutionParseErrorsShareInvalidResolution(t *testing.T) {
+	for _, query := range []string{"width=x&height=480", "width=640&height=x", "width=641&height=480"} {
+		r := &http.Request{URL: &url.URL{RawQuery: query}}
+		if _, _, err := requestedResolution(r); err != errInvalidResolution {
+			t.Fatalf("requestedResolution(%q) error = %v, want errInvalidResolution", query, err)
+		}
 	}
 }
 

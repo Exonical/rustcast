@@ -97,66 +97,125 @@ pub async fn write_login_frame(
     w.write_all(&encode_login_frame(frame)).await
 }
 
+/// Upper bound for any length-prefixed command payload.
+const MAX_COMMAND_PAYLOAD: usize = 64 * 1024 * 1024;
+
+/// Wire shape of a relay→host command after its type byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameShape {
+    /// No body.
+    Bare,
+    /// A fixed number of body bytes.
+    Fixed(usize),
+    /// `[len u32 BE][payload]`.
+    LengthPrefixed,
+}
+
+/// The relay→host command table: IDR(0x01) is bare,
+/// bitrate/viewer/resolution (0x03/0x04/0x06) carry 4 bytes, quality(0x05)
+/// 2 bytes; input(0x02), clipboard(0x07), login response(0x08), lock(0x09)
+/// and hello(0x0A) are length-prefixed. `None` for unknown types.
+fn command_frame_spec(ty: u8) -> Option<FrameShape> {
+    match ty {
+        0x01 => Some(FrameShape::Bare),
+        0x03 | 0x04 | 0x06 => Some(FrameShape::Fixed(4)),
+        0x05 => Some(FrameShape::Fixed(2)),
+        0x02 | 0x07 | CMD_LOGIN_RESPONSE | CMD_LOCK | CMD_HELLO => Some(FrameShape::LengthPrefixed),
+        _ => None,
+    }
+}
+
+/// Read a command type byte; `None` on clean EOF.
+async fn read_command_type(r: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<Option<u8>> {
+    let mut ty = [0u8; 1];
+    match r.read_exact(&mut ty).await {
+        Ok(_) => Ok(Some(ty[0])),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the rest of a command of type `ty` and return its full wire bytes
+/// (type byte included). Length-prefixed payloads above `cap` are rejected.
+async fn read_command_body(
+    r: &mut (impl AsyncReadExt + Unpin),
+    ty: u8,
+    shape: FrameShape,
+    cap: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![ty];
+    match shape {
+        FrameShape::Bare => {}
+        FrameShape::Fixed(n) => {
+            bytes.resize(1 + n, 0);
+            r.read_exact(&mut bytes[1..]).await?;
+        }
+        FrameShape::LengthPrefixed => {
+            let mut len_buf = [0u8; 4];
+            r.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > cap {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("command payload too large: {len}"),
+                ));
+            }
+            bytes.extend_from_slice(&len_buf);
+            bytes.resize(5 + len, 0);
+            r.read_exact(&mut bytes[5..]).await?;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Read one client command. Returns `None` on EOF / malformed stream.
-/// Pre-login, unknown command bytes kill the connection (cannot resync).
+/// Pre-login, unknown command bytes kill the connection (cannot resync), as
+/// do lock (0x09) and hello (0x0A), which are only valid around a session.
 pub async fn read_client_command(
     r: &mut (impl AsyncReadExt + Unpin),
 ) -> std::io::Result<Option<ClientCommand>> {
-    let mut ty = [0u8; 1];
-    match r.read_exact(&mut ty).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    let Some(ty) = read_command_type(r).await? else {
+        return Ok(None);
+    };
+    let shape = match command_frame_spec(ty) {
+        Some(shape) if ty != CMD_LOCK && ty != CMD_HELLO => shape,
+        _ => {
+            tracing::warn!("login: unknown command byte 0x{ty:02x}; closing");
+            return Ok(None);
+        }
+    };
+    if ty != CMD_LOGIN_RESPONSE {
+        read_command_body(r, ty, shape, MAX_COMMAND_PAYLOAD).await?;
+        return Ok(Some(ClientCommand::Dropped(ty)));
     }
-    // Consume a length-prefixed payload, capped at `cap`.
-    async fn read_len_payload(
-        r: &mut (impl AsyncReadExt + Unpin),
-        cap: usize,
-    ) -> std::io::Result<Option<Vec<u8>>> {
-        let mut len_buf = [0u8; 4];
-        r.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("command payload too large: {len}"),
-            ));
-        }
-        let mut payload = vec![0u8; len];
-        r.read_exact(&mut payload).await?;
-        Ok(Some(payload))
-    }
-    match ty[0] {
-        CMD_LOGIN_RESPONSE => match read_len_payload(r, MAX_LOGIN_PAYLOAD).await? {
-            Some(payload) => match serde_json::from_slice::<LoginResponse>(&payload) {
-                Ok(resp) => Ok(Some(ClientCommand::Login(resp.response))),
-                Err(_) => Ok(None),
-            },
-            None => Ok(None),
-        },
-        // Fixed-size commands: IDR(0x01)=bare, bitrate/viewer/resolution
-        // (0x03/0x04/0x06)=4 bytes, quality(0x05)=2 bytes. Length-prefixed:
-        // input(0x02), clipboard(0x07). Drop them all pre-login.
-        0x01 => Ok(Some(ClientCommand::Dropped(0x01))),
-        0x03 | 0x04 | 0x06 => {
-            let mut buf = [0u8; 4];
-            r.read_exact(&mut buf).await?;
-            Ok(Some(ClientCommand::Dropped(ty[0])))
-        }
-        0x05 => {
-            let mut buf = [0u8; 2];
-            r.read_exact(&mut buf).await?;
-            Ok(Some(ClientCommand::Dropped(0x05)))
-        }
-        0x02 | 0x07 => {
-            read_len_payload(r, 64 * 1024 * 1024).await?;
-            Ok(Some(ClientCommand::Dropped(ty[0])))
-        }
-        other => {
-            tracing::warn!("login: unknown command byte 0x{other:02x}; closing");
-            Ok(None)
-        }
-    }
+    let bytes = read_command_body(r, ty, shape, MAX_LOGIN_PAYLOAD).await?;
+    Ok(serde_json::from_slice::<LoginResponse>(&bytes[5..])
+        .ok()
+        .map(|resp| ClientCommand::Login(resp.response)))
+}
+
+/// One full client command as raw wire bytes plus its type byte. Used by the
+/// proxy: everything is forwarded verbatim except intercepted commands.
+#[derive(Debug)]
+pub struct RawCommand {
+    pub ty: u8,
+    pub bytes: Vec<u8>,
+}
+
+/// Read one client command and keep its raw bytes. Returns `None` on EOF or
+/// malformed framing.
+pub async fn read_raw_command(
+    r: &mut (impl AsyncReadExt + Unpin),
+) -> std::io::Result<Option<RawCommand>> {
+    let Some(ty) = read_command_type(r).await? else {
+        return Ok(None);
+    };
+    let Some(shape) = command_frame_spec(ty) else {
+        tracing::warn!("proxy: unknown command byte 0x{ty:02x}; closing");
+        return Ok(None);
+    };
+    let bytes = read_command_body(r, ty, shape, MAX_COMMAND_PAYLOAD).await?;
+    Ok(Some(RawCommand { ty, bytes }))
 }
 
 #[cfg(test)]
@@ -242,59 +301,93 @@ mod tests {
         let mut cur = Cursor::new(Vec::new());
         assert_eq!(read_client_command(&mut cur).await.unwrap(), None);
     }
-}
 
-/// One full client command as raw wire bytes plus its type byte. Used by the
-/// proxy: everything is forwarded verbatim except intercepted commands.
-#[derive(Debug)]
-pub struct RawCommand {
-    pub ty: u8,
-    pub bytes: Vec<u8>,
-}
-
-/// Read one client command and keep its raw bytes. Returns `None` on EOF or
-/// malformed framing.
-pub async fn read_raw_command(
-    r: &mut (impl AsyncReadExt + Unpin),
-) -> std::io::Result<Option<RawCommand>> {
-    let mut ty = [0u8; 1];
-    match r.read_exact(&mut ty).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let mut bytes = ty.to_vec();
-    match ty[0] {
-        0x01 => {}
-        0x03 | 0x04 | 0x06 => {
-            let mut b = [0u8; 4];
-            r.read_exact(&mut b).await?;
-            bytes.extend_from_slice(&b);
-        }
-        0x05 => {
-            let mut b = [0u8; 2];
-            r.read_exact(&mut b).await?;
-            bytes.extend_from_slice(&b);
-        }
-        0x02 | 0x07 | 0x08 | CMD_LOCK | CMD_HELLO => {
-            let mut len_buf = [0u8; 4];
-            r.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 64 * 1024 * 1024 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "payload too large",
-                ));
+    /// One well-formed command of each known type, as wire bytes.
+    fn sample_command(ty: u8) -> Vec<u8> {
+        let mut wire = vec![ty];
+        match command_frame_spec(ty).unwrap() {
+            FrameShape::Bare => {}
+            FrameShape::Fixed(n) => wire.extend((0..n).map(|i| i as u8 + 1)),
+            FrameShape::LengthPrefixed => {
+                let payload = br#"{"response":"x"}"#;
+                wire.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                wire.extend_from_slice(payload);
             }
-            bytes.extend_from_slice(&len_buf);
-            let mut payload = vec![0u8; len];
-            r.read_exact(&mut payload).await?;
-            bytes.extend_from_slice(&payload);
         }
-        other => {
-            tracing::warn!("proxy: unknown command byte 0x{other:02x}; closing");
-            return Ok(None);
+        wire
+    }
+
+    #[tokio::test]
+    async fn raw_command_keeps_exact_bytes() {
+        for ty in 0u8..=0xff {
+            if command_frame_spec(ty).is_none() {
+                continue;
+            }
+            let cmd = sample_command(ty);
+            let mut wire = cmd.clone();
+            wire.push(0x01);
+            let mut cur = Cursor::new(wire);
+            let raw = read_raw_command(&mut cur).await.unwrap().unwrap();
+            assert_eq!(raw.ty, ty);
+            assert_eq!(raw.bytes, cmd, "type 0x{ty:02x}");
+            assert_eq!(read_raw_command(&mut cur).await.unwrap().unwrap().ty, 0x01);
         }
     }
-    Ok(Some(RawCommand { ty: ty[0], bytes }))
+
+    #[tokio::test]
+    async fn client_and_raw_readers_consume_same_bytes() {
+        for ty in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, CMD_LOGIN_RESPONSE] {
+            let mut wire = sample_command(ty);
+            wire.push(0x01);
+            let mut cur = Cursor::new(wire);
+            let cmd = read_client_command(&mut cur).await.unwrap();
+            let expected = if ty == CMD_LOGIN_RESPONSE {
+                ClientCommand::Login("x".into())
+            } else {
+                ClientCommand::Dropped(ty)
+            };
+            assert_eq!(cmd, Some(expected));
+            assert_eq!(
+                read_client_command(&mut cur).await.unwrap(),
+                Some(ClientCommand::Dropped(0x01)),
+                "type 0x{ty:02x} left the stream misaligned"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_and_hello_end_stream_before_login() {
+        for ty in [CMD_LOCK, CMD_HELLO] {
+            let mut cur = Cursor::new(sample_command(ty));
+            assert_eq!(read_client_command(&mut cur).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_command_ends_raw_stream() {
+        let mut cur = Cursor::new(vec![0x7f]);
+        assert!(read_raw_command(&mut cur).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn login_response_cap_is_tighter_than_proxy_cap() {
+        let len = MAX_LOGIN_PAYLOAD + 1;
+        let mut wire = vec![CMD_LOGIN_RESPONSE];
+        wire.extend_from_slice(&(len as u32).to_be_bytes());
+        wire.resize(5 + len, b' ');
+        let err = read_client_command(&mut Cursor::new(wire.clone())).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let raw = read_raw_command(&mut Cursor::new(wire.clone())).await.unwrap().unwrap();
+        assert_eq!(raw.bytes, wire);
+    }
+
+    #[tokio::test]
+    async fn oversized_payload_rejected() {
+        let mut wire = vec![0x02];
+        wire.extend_from_slice(&((MAX_COMMAND_PAYLOAD + 1) as u32).to_be_bytes());
+        let err = read_raw_command(&mut Cursor::new(wire.clone())).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = read_client_command(&mut Cursor::new(wire)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
