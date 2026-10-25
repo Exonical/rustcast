@@ -811,16 +811,11 @@ impl CaptureLoop {
         let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
         let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
-        // Verification file (first ~5 seconds)
-        let h264_path = std::path::PathBuf::from("flux_capture_test.h264");
-        let mut h264_file = std::fs::File::create(&h264_path).ok();
-        let max_verify_frames = target_fps as u64 * 5;
         let mut total_encoded_bytes: u64 = 0;
 
         tracing::info!(
-            "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame; verify: {})",
-            target_fps,
-            h264_path.display()
+            "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame)",
+            target_fps
         );
 
         let mut frame_count: u64 = 0;
@@ -1208,20 +1203,6 @@ impl CaptureLoop {
                             crate::metrics::encoded_frame(pkt.is_keyframe, pkt.data.len());
                             if pkt.is_keyframe {
                                 keyframe_bytes = Some(pkt.data.len());
-                            }
-
-                            if frame_count <= max_verify_frames {
-                                if let Some(ref mut f) = h264_file {
-                                    use std::io::Write;
-                                    let _ = f.write_all(&pkt.data);
-                                }
-                            } else if h264_file.is_some() {
-                                h264_file.take();
-                                tracing::info!(
-                                    "H.264 verification file closed ({} frames, {} bytes)",
-                                    max_verify_frames,
-                                    total_encoded_bytes
-                                );
                             }
 
                             let _ = h264_tx.send(Arc::new((ts_micros, pkt.data)));
