@@ -1380,11 +1380,7 @@ impl EncodeSession for AmfSession {
             tracing::warn!("AMF Drain returned {}", drain_result);
         }
 
-        // Collect remaining output
-        let mut packets = Vec::new();
-        while let (AMF_OK, Some(data)) = self.encoder.query_output() {
-            packets.push(self.extract_output(&data));
-        }
+        let packets = self.drain_output();
 
         tracing::debug!("AMF flush: {} remaining packets", packets.len());
         Ok(packets)
