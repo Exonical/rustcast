@@ -400,7 +400,7 @@ func (u *machineUpstream) queueFrame(frame frameMsg) (dropped bool) {
 
 func (u *machineUpstream) readPayload(reader io.Reader, messageType byte, size int) (frameMsg, error) {
 	var frame frameMsg
-	if messageType == 0x01 {
+	if messageType == msgVideo {
 		frame.buffers = &u.frameBuffers
 		frame.data = u.frameBuffers.get(size)
 	} else {
@@ -442,7 +442,7 @@ func (u *machineUpstream) sendIDRRequest() bool {
 	if !u.idrGate.allow() {
 		return false
 	}
-	if u.send([]byte{0x01}) {
+	if u.send([]byte{cmdIDR}) {
 		return true
 	}
 	u.idrGate.last = time.Time{}
@@ -459,7 +459,7 @@ func (u *machineUpstream) requestInitialIDR(session *Session) bool {
 	if !session.initialIDRRequested.CompareAndSwap(false, true) {
 		return false
 	}
-	if !u.send([]byte{0x01}) {
+	if !u.send([]byte{cmdIDR}) {
 		session.initialIDRRequested.Store(false)
 		return false
 	}
@@ -511,10 +511,7 @@ func (u *machineUpstream) sendAudio(msg audioMsg) {
 func (u *machineUpstream) sendViewerCount(count int) bool {
 	u.viewerCount.Store(uint32(count))
 	u.metrics.viewers.Set(float64(count))
-	cmd := make([]byte, 5)
-	cmd[0] = 0x04
-	binary.BigEndian.PutUint32(cmd[1:], uint32(count))
-	return u.send(cmd)
+	return u.send(u32Command(cmdViewers, uint32(count)))
 }
 
 func (u *machineUpstream) bindSession(session *Session) *Session {
@@ -544,7 +541,7 @@ func (u *machineUpstream) sendResolutionStatus(data []byte) {
 	if sess == nil || !json.Valid(data) {
 		return
 	}
-	if err := sess.sendMetadataStream(0x03, data); err != nil {
+	if err := sess.sendMetadataStream(streamResolutionStatus, data); err != nil {
 		log.Printf("[wt:%s] resolution status stream failed: %v", u.id, err)
 	}
 }
@@ -691,7 +688,7 @@ func (u *machineUpstream) readFrame(reader io.Reader) (frameHeader, frameMsg, er
 func (u *machineUpstream) dispatchFrame(header frameHeader, frame frameMsg, transport string, frameCount *uint64) error {
 	data := frame.data
 	switch header.messageType {
-	case 0x01:
+	case msgVideo:
 		*frameCount++
 		u.metrics.upstreamFrames.Inc()
 		u.metrics.upstreamBytes.Add(float64(len(data)))
@@ -703,21 +700,21 @@ func (u *machineUpstream) dispatchFrame(header frameHeader, frame frameMsg, tran
 		if u.queueFrame(frame) {
 			u.requestIDR(idrReasonUpstreamDrop)
 		}
-	case 0x02:
+	case msgCursor:
 		if !json.Valid(data) {
 			log.Printf("[frame:%s] invalid cursor JSON", u.id)
 			return nil
 		}
 		u.sendCursor(cursorMsg{tsMicros: header.tsMicros, data: data})
-	case 0x03:
+	case msgResolutionStatus:
 		u.sendResolutionStatus(data)
-	case 0x04:
+	case msgAudio:
 		u.metrics.upstreamAudioPackets.Inc()
 		u.metrics.upstreamAudioBytes.Add(float64(len(data)))
 		u.sendAudio(audioMsg{tsMicros: header.tsMicros, data: data})
-	case 0x05:
+	case msgClipboard:
 		u.handleClipboardFrame(data)
-	case 0x06:
+	case msgLogin:
 		u.handleLoginFrame(data)
 	default:
 		return fmt.Errorf("unknown frame message type: 0x%02x", header.messageType)
@@ -938,7 +935,7 @@ func (u *machineUpstream) framePusher() {
 
 func encodeVideoFrameHeader(seq uint32, msg frameMsg, keyframe bool) [18]byte {
 	var header [18]byte
-	header[0] = 0x01
+	header[0] = streamVideo
 	binary.BigEndian.PutUint32(header[1:5], seq)
 	binary.BigEndian.PutUint64(header[5:13], msg.tsMicros)
 	if keyframe {
@@ -1006,18 +1003,14 @@ func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool)
 	return time.Since(start), false, nil
 }
 
-// helloCommand builds the 0x0A hello carrying the relay auth token.
+// helloCommand builds the cmdHello command carrying the relay auth token.
 // Returns nil when no token is configured.
 func helloCommand() []byte {
 	token := os.Getenv("FLUX_RELAY_TOKEN")
 	if token == "" {
 		return nil
 	}
-	cmd := make([]byte, 5+len(token))
-	cmd[0] = 0x0A
-	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(token)))
-	copy(cmd[5:], token)
-	return cmd
+	return commandFrame(cmdHello, []byte(token))
 }
 
 // setQuicCertSHA256 refreshes the pinned fingerprint from the latest

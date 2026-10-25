@@ -25,7 +25,7 @@ func TestVideoFrameHeaderEncoding(t *testing.T) {
 		data:     []byte{1, 2, 3},
 	}
 	header := encodeVideoFrameHeader(0x01020304, frame, true)
-	if header[0] != 0x01 || binary.BigEndian.Uint32(header[1:5]) != 0x01020304 ||
+	if header[0] != streamVideo || binary.BigEndian.Uint32(header[1:5]) != 0x01020304 ||
 		binary.BigEndian.Uint64(header[5:13]) != frame.tsMicros || header[13] != 1 ||
 		binary.BigEndian.Uint32(header[14:18]) != 3 {
 		t.Fatalf("unexpected video stream header: %x", header)
@@ -218,12 +218,12 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	})
 	select {
 	case command := <-upstream.commandChan:
-		want := []byte{0x06, 0x05, 0x00, 0x02, 0xd0}
+		want := []byte{cmdResolution, 0x05, 0x00, 0x02, 0xd0}
 		if string(command) != string(want) {
 			t.Fatalf("upstream resolution command = %x, want %x", command, want)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("resolution request did not reach upstream as command 0x06")
+		t.Fatal("resolution request did not reach upstream as cmdResolution")
 	}
 	statusStream, err := clientSession.AcceptUniStream(ctx)
 	if err != nil {
@@ -233,8 +233,8 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if _, err := io.ReadFull(statusStream, statusHeader[:]); err != nil {
 		t.Fatalf("read resolution status header: %v", err)
 	}
-	if statusHeader[0] != 0x03 {
-		t.Fatalf("resolution status stream type = %02x, want 03", statusHeader[0])
+	if statusHeader[0] != streamResolutionStatus {
+		t.Fatalf("resolution status stream type = %02x, want streamResolutionStatus", statusHeader[0])
 	}
 	statusPayload := make([]byte, binary.BigEndian.Uint32(statusHeader[1:]))
 	if _, err := io.ReadFull(statusStream, statusPayload); err != nil {
@@ -257,11 +257,11 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	writeTestControlMessage(t, control, controlMessage{Type: "keyframe-request"})
 	select {
 	case command := <-upstream.commandChan:
-		if len(command) != 1 || command[0] != 0x01 {
-			t.Fatalf("upstream command = %x, want keyframe command 01", command)
+		if len(command) != 1 || command[0] != cmdIDR {
+			t.Fatalf("upstream command = %x, want cmdIDR", command)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("keyframe-request did not reach upstream as command 0x01")
+		t.Fatal("keyframe-request did not reach upstream as cmdIDR")
 	}
 
 	payload := []byte{0, 0, 0, 1, 0x65, 1, 2, 3}
@@ -415,7 +415,7 @@ func TestLoopbackWebTransportAudioStream(t *testing.T) {
 	if _, err := io.ReadFull(audio, header[:]); err != nil {
 		t.Fatalf("read audio header: %v", err)
 	}
-	if header[0] != 0x04 || binary.BigEndian.Uint64(header[1:9]) != 987654 ||
+	if header[0] != streamAudio || binary.BigEndian.Uint64(header[1:9]) != 987654 ||
 		binary.BigEndian.Uint32(header[9:13]) != 42 ||
 		binary.BigEndian.Uint32(header[13:17]) != uint32(len(opus)) {
 		t.Fatalf("unexpected audio stream header: %x", header)
@@ -529,7 +529,7 @@ func waitForUpstreamIDR(t *testing.T, upstream *machineUpstream) {
 	for {
 		select {
 		case command := <-upstream.commandChan:
-			if len(command) == 1 && command[0] == 0x01 {
+			if len(command) == 1 && command[0] == cmdIDR {
 				return
 			}
 		case <-deadline:

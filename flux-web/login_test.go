@@ -66,8 +66,8 @@ func TestLoginPrefillUsername(t *testing.T) {
 	}
 	h.u.handleLoginFrame(loginJSON(map[string]any{"state": "prompt", "style": "echo_on", "message": "Username"}))
 	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) != 1 || h.sent[0][0] != 0x08 {
-		t.Fatalf("expected 0x08 response, got %v", h.sent)
+	if len(h.sent) != 1 || h.sent[0][0] != cmdLoginResponse {
+		t.Fatalf("expected cmdLoginResponse, got %v", h.sent)
 	}
 	var resp struct {
 		Response string `json:"response"`
@@ -92,11 +92,11 @@ func TestLoginPrefillDisabled(t *testing.T) {
 	if len(*msgs) != 1 {
 		t.Fatalf("expected prompt forwarded, got %v", *msgs)
 	}
-	// Answering relays a 0x08.
+	// Answering relays a cmdLoginResponse.
 	h.u.sendLoginResponseIfAuth(sess, "devuser")
 	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) != 1 || h.sent[0][0] != 0x08 {
-		t.Fatalf("expected 0x08, got %v", h.sent)
+	if len(h.sent) != 1 || h.sent[0][0] != cmdLoginResponse {
+		t.Fatalf("expected cmdLoginResponse, got %v", h.sent)
 	}
 	// Another session may not answer.
 	h.u.sendLoginResponseIfAuth(&Session{id: "other"}, "x")
@@ -133,7 +133,7 @@ func TestLoginOkFailedBusy(t *testing.T) {
 		t.Fatalf("sessionInfo os fields: %+v", info)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) == 0 || h.sent[len(h.sent)-1][0] != 0x01 {
+	if len(h.sent) == 0 || h.sent[len(h.sent)-1][0] != cmdIDR {
 		t.Fatalf("expected IDR after ok, got %v", h.sent)
 	}
 
@@ -168,14 +168,14 @@ func TestLoginGateAndLock(t *testing.T) {
 		t.Fatalf("same-sub viewer rejected: %q %q", role, reason)
 	}
 
-	// Register sessions; last leave → 0x09.
+	// Register sessions; last leave → cmdLock.
 	h.sessions.add(sessionInfo{ID: "s1", MachineID: "m1"}, s1, nil)
 	h.sessions.add(sessionInfo{ID: "s3", MachineID: "m1"}, s3, nil)
 	h.sessions.remove("s3")
 	h.u.onSessionLeft(s3)
 	time.Sleep(20 * time.Millisecond)
 	for _, c := range h.sent {
-		if c[0] == 0x09 {
+		if c[0] == cmdLock {
 			t.Fatal("lock sent while a viewer remains")
 		}
 	}
@@ -184,12 +184,12 @@ func TestLoginGateAndLock(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	found := false
 	for _, c := range h.sent {
-		if c[0] == 0x09 && len(c) == 5 {
+		if c[0] == cmdLock && len(c) == 5 {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("expected 0x09 lock after last viewer left")
+		t.Fatal("expected cmdLock after last viewer left")
 	}
 	if h.u.loginSnapshot().state != loginIdle {
 		t.Fatal("expected idle after lock")

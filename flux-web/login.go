@@ -1,13 +1,12 @@
 package main
 
 // Per-machine host login state machine (flux-hostd wire login). The host
-// daemon gates the frame stream behind a PAM conversation carried in 0x06
-// frames (prompts/results out) and 0x08 commands (responses in). Exactly one
-// viewer performs the login at a time; while active the machine is bound to
-// that viewer's relay identity.
+// daemon gates the frame stream behind a PAM conversation carried in msgLogin
+// frames (prompts/results out) and cmdLoginResponse commands (responses in).
+// Exactly one viewer performs the login at a time; while active the machine
+// is bound to that viewer's relay identity.
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"log"
 	"os"
@@ -43,7 +42,7 @@ type loginInfo struct {
 	relayName string
 }
 
-// loginFrameJSON is the hostd 0x06 frame payload.
+// loginFrameJSON is the hostd msgLogin frame payload.
 type loginFrameJSON struct {
 	State      string `json:"state"`
 	Style      string `json:"style,omitempty"`
@@ -118,11 +117,7 @@ func (u *machineUpstream) loginOSUser() string {
 
 func (u *machineUpstream) sendLoginResponse(resp string) {
 	data, _ := json.Marshal(map[string]string{"response": resp})
-	cmd := make([]byte, 5+len(data))
-	cmd[0] = 0x08
-	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(data)))
-	copy(cmd[5:], data)
-	u.send(cmd)
+	u.send(commandFrame(cmdLoginResponse, data))
 }
 
 // sendLoginResponseIfAuth forwards a viewer's login answer only when that
@@ -137,7 +132,7 @@ func (u *machineUpstream) sendLoginResponseIfAuth(sess *Session, resp string) {
 }
 
 func (u *machineUpstream) sendLock() {
-	u.send([]byte{0x09, 0, 0, 0, 0})
+	u.send(commandFrame(cmdLock, nil))
 }
 
 // viewerLock handles a viewer {"type":"lock"}: only the logged-in relay
@@ -233,7 +228,7 @@ func (u *machineUpstream) insertHostLogin(sess *Session, osUser, result string) 
 	}
 }
 
-// handleLoginFrame processes a hostd 0x06 frame.
+// handleLoginFrame processes a hostd msgLogin frame.
 func (u *machineUpstream) handleLoginFrame(data []byte) {
 	var f loginFrameJSON
 	if err := json.Unmarshal(data, &f); err != nil {

@@ -7,12 +7,11 @@ package main
 //   relay→browser control:  same "clipboard" message, plus "clipboard-status"
 //                           {"direction","result","policy"} after each send
 //                           and on connect.
-//   relay→host command 0x07: [0x07][len u32 BE][JSON {"mime","data"}]
-//   host→relay frame 0x05:   [type][ts][len][JSON {"mime","data"}]
+//   relay→host cmdClipboard (0x07): [0x07][len u32 BE][JSON {"mime","data"}]
+//   host→relay msgClipboard (0x05): [type][ts][len][JSON {"mime","data"}]
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -129,7 +128,7 @@ func (s *Session) auditClipboard(store *store, direction, mime string, data []by
 }
 
 // handleClipboard processes a viewer `{"type":"clipboard"}` control message:
-// validate, enforce per-machine policy, audit, forward 0x07 upstream, and
+// validate, enforce per-machine policy, audit, forward cmdClipboard upstream, and
 // always answer with `clipboard-status`.
 func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
 	machine := s.getMachine()
@@ -162,18 +161,14 @@ func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
 	if err != nil {
 		return status(clipResultInvalid)
 	}
-	cmd := make([]byte, 5+len(payload))
-	cmd[0] = 0x07
-	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(payload)))
-	copy(cmd[5:], payload)
-	if !machine.send(cmd) {
+	if !machine.send(commandFrame(cmdClipboard, payload)) {
 		log.Printf("[control] upstream command channel full, dropped clipboard set")
 	}
 	s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultOK, policy.CaptureContent)
 	return status(clipResultOK)
 }
 
-// handleClipboardFrame processes a host→relay 0x05 frame: rate-limit, parse,
+// handleClipboardFrame processes a host→relay msgClipboard frame: rate-limit, parse,
 // enforce host_to_client policy, fan out to the machine's viewers as a
 // `clipboard` control message, and audit once per delivered viewer (one row
 // when there are no viewers or the event is rejected).

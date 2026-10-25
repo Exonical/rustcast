@@ -10,12 +10,12 @@ import (
 	"testing"
 )
 
-// The hello (0x0A) must be the first bytes on a new connection even when
+// The hello (cmdHello) must be the first bytes on a new connection even when
 // the shared command channel still holds stale commands.
 func TestHelloIsFirstCommandOnConnect(t *testing.T) {
 	t.Setenv("FLUX_RELAY_TOKEN", "tok-123")
 	hello := helloCommand()
-	if len(hello) != 5+len("tok-123") || hello[0] != 0x0A || string(hello[5:]) != "tok-123" {
+	if len(hello) != 5+len("tok-123") || hello[0] != cmdHello || string(hello[5:]) != "tok-123" {
 		t.Fatalf("bad hello bytes: %v", hello)
 	}
 
@@ -41,8 +41,8 @@ func TestHelloIsFirstCommandOnConnect(t *testing.T) {
 
 	u := newMachineUpstream(l.Addr().String(), "m1", nil, func(string) {})
 	// Poison the channel like a dead connection would leave it.
-	u.commandChan <- []byte{0x01}
-	u.commandChan <- []byte{0x04, 0, 0, 0, 1}
+	u.commandChan <- []byte{cmdIDR}
+	u.commandChan <- u32Command(cmdViewers, 1)
 	u.drainCommands()
 	if _, err := conn.Write(hello); err != nil {
 		t.Fatal(err)
@@ -53,8 +53,8 @@ func TestHelloIsFirstCommandOnConnect(t *testing.T) {
 	if _, err := io.ReadFull(srv, buf); err != nil {
 		t.Fatal(err)
 	}
-	if buf[0] != 0x0A {
-		t.Fatalf("first command was 0x%02x, want 0x0A", buf[0])
+	if buf[0] != cmdHello {
+		t.Fatalf("first command was 0x%02x, want cmdHello", buf[0])
 	}
 	// After the drain the stale commands are gone.
 	select {
