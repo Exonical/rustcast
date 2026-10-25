@@ -27,6 +27,15 @@ test("drops startup deltas older than the first keyframe", () => {
   const result = sequencer.push(frame(5, true), 3);
   assert.deepEqual(result.ready.map((item) => item.seq), [5]);
   assert.equal(result.dropped, 2);
+  assert.equal(result.awaitingKeyframe, 2);
+});
+
+test("counts startup buffer overflow as awaiting a keyframe", () => {
+  const sequencer = new FrameSequencer(100, 1);
+  sequencer.push(frame(1), 1);
+  const result = sequencer.push(frame(2), 2);
+  assert.equal(result.dropped, 1);
+  assert.equal(result.awaitingKeyframe, 1);
 });
 
 test("pre-sync expiry drops stale deltas and requests a keyframe", () => {
@@ -34,6 +43,7 @@ test("pre-sync expiry drops stale deltas and requests a keyframe", () => {
   sequencer.push(frame(1), 0);
   const result = sequencer.expire(102);
   assert.equal(result.dropped, 1);
+  assert.equal(result.awaitingKeyframe, 1);
   assert.equal(result.requestKeyframe, true);
   assert.deepEqual(result.ready, []);
   assert.deepEqual(sequencer.push(frame(0, true), 103).ready.map((item) => item.seq), [0]);
@@ -54,6 +64,8 @@ test("expired gaps discard deltas until a keyframe arrives", () => {
   const result = sequencer.expire(111);
   assert.deepEqual(result.ready, []);
   assert.equal(result.dropped, 2);
+  assert.equal(result.awaitingKeyframe, 1);
+  assert.equal(result.dropped - result.awaitingKeyframe, 1);
   assert.equal(result.requestKeyframe, true);
   assert.deepEqual(sequencer.push(frame(3, true), 112).ready.map((item) => item.seq), [3]);
 });
@@ -63,6 +75,7 @@ test("reset streams advance lost sequences and request a keyframe", () => {
   sequencer.push(frame(0, true), 0);
   const result = sequencer.markLost(1, 1);
   assert.equal(result.dropped, 1);
+  assert.equal(result.awaitingKeyframe, 0);
   assert.equal(result.requestKeyframe, true);
   assert.deepEqual(sequencer.push(frame(2), 2).ready, []);
 });
