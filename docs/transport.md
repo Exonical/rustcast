@@ -2,6 +2,8 @@
 
 **Short answer:** the system uses both TCP and UDP, for different legs. HTTP(S) APIs and host registration use TCP; the relay prefers QUIC over UDP for the host frame link, with TCP fallback; browser media and control use WebTransport over HTTP/3/QUIC on UDP. Application messages use streams, not datagrams.
 
+Proposed Relay/Direct connection modes: [design/connection-modes.md](design/connection-modes.md).
+
 ## Protocol and port map
 
 | Leg | Transport | L4 | Port | Authentication | What it carries |
