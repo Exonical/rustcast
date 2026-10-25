@@ -47,6 +47,10 @@ type machineUpstream struct {
 	connectedOnce atomic.Bool
 	deps          *relayDeps
 	clipRate      clipboardRate
+	loginMu       sync.Mutex
+	login         loginInfo
+	lastPrompt    *loginFrameJSON
+	loginSpoken   bool
 }
 
 const (
@@ -668,6 +672,8 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		case 0x05:
 			u.handleClipboardFrame(data)
+		case 0x06:
+			u.handleLoginFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -777,6 +783,8 @@ func (u *machineUpstream) connectQUIC() error {
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		case 0x05:
 			u.handleClipboardFrame(data)
+		case 0x06:
+			u.handleLoginFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}

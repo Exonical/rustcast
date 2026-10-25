@@ -21,9 +21,12 @@ entries:
       client_id: flux-relay
       client_secret: !Env FLUX_OIDC_CLIENT_SECRET
       authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
-      invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
       signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
       sub_mode: hashed_user_id
+      grant_types:
+        - authorization_code
+        - refresh_token
       redirect_uris:
         - matching_mode: strict
           url: "http://localhost:8080/auth/callback"
@@ -51,3 +54,19 @@ entries:
     attrs:
       users:
         - !Find [authentik_core.user, [username, akadmin]]
+  # Device-domain connector for pam/nss-authentik logins on the host.
+  - model: authentik_endpoints_connectors_agent.agentconnector
+    id: flux-agent-connector
+    identifiers:
+      name: flux-agent
+    attrs: {}
+  # Enrollment token consumed by flux-ak-join (ak-sysd domains join). The key
+  # comes from .env.authentik so pod re-plays can re-enroll.
+  - model: authentik_endpoints_connectors_agent.enrollmenttoken
+    id: flux-enrollment-token
+    identifiers:
+      name: flux-enrollment
+    attrs:
+      connector: !KeyOf flux-agent-connector
+      key: !Env FLUX_AK_ENROLLMENT_TOKEN
+      expiring: false

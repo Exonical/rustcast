@@ -25,7 +25,7 @@ encoder-ffmpeg = ["flux-encode/encoder-ffmpeg"]
 encoder-vulkan = ["flux-encode/encoder-vulkan"]
 
 [dependencies]
-flux-core = { workspace = true }
+flux-core = { workspace = true, features = ["registration"] }
 flux-capture = { workspace = true }
 flux-encode = { workspace = true }
 flux-audio = { workspace = true }

@@ -89,6 +89,11 @@ export function MachineCard({ machine, onConnect }: {
             <span className={`h-1.5 w-1.5 rounded-full ${state === "available" ? "bg-emerald-400" : state === "in-use" ? "bg-amber-300" : "bg-zinc-500"}`} />
             {state === "available" ? "Online" : state === "in-use" ? "In use" : "Offline"}
           </Badge>
+          {machine.logged_in_user && (
+            <span title={`Host login: ${machine.logged_in_user}`}>
+              <Badge tone="amber">In use by {machine.logged_in_user}</Badge>
+            </span>
+          )}
           {machine.clipboard_policy && (
             <span title={`Clipboard: ${policyLabel(machine.clipboard_policy)}`}>
               <Badge tone={machine.clipboard_policy === "both" ? "neutral" : "amber"}>

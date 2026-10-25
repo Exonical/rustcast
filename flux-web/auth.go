@@ -83,13 +83,16 @@ func authConfigFromEnv() authConfig {
 }
 
 type identity struct {
-	Sub     string    `json:"sub"`
-	Email   string    `json:"email,omitempty"`
-	Name    string    `json:"name,omitempty"`
-	Groups  []string  `json:"groups,omitempty"`
-	Admin   bool      `json:"admin"`
-	Expires time.Time `json:"exp"`
-	IDToken string    `json:"id_token,omitempty"`
+	Sub   string `json:"sub"`
+	Email string `json:"email,omitempty"`
+	Name  string `json:"name,omitempty"`
+	// Username is the OIDC preferred_username, used to pre-answer the host's
+	// login "Username" prompt.
+	Username string    `json:"username,omitempty"`
+	Groups   []string  `json:"groups,omitempty"`
+	Admin    bool      `json:"admin"`
+	Expires  time.Time `json:"exp"`
+	IDToken  string    `json:"id_token,omitempty"`
 }
 
 var anonymousAdmin = &identity{Sub: "anonymous", Name: "Anonymous", Admin: true}
@@ -379,7 +382,8 @@ func (a *authService) callback(c *gin.Context) {
 	}
 	user := &identity{
 		Sub: idToken.Subject, Email: claims.Email, Name: name,
-		Groups: claims.Groups, Admin: admin, Expires: expires,
+		Username: claims.PreferredUsername,
+		Groups:   claims.Groups, Admin: admin, Expires: expires,
 		IDToken: rawIDToken,
 	}
 	sessionPayload, _ := json.Marshal(user)

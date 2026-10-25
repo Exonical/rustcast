@@ -4,6 +4,8 @@ pub mod cursor;
 pub mod error;
 pub mod frame;
 pub mod platform;
+#[cfg(feature = "registration")]
+pub mod registration;
 pub mod types;
 
 pub use cursor::{CursorBitmap, CursorMetadata};

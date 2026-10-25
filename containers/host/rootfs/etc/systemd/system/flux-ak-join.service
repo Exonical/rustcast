@@ -1,0 +1,14 @@
+[Unit]
+Description=Enroll the host into the authentik device domain
+After=ak-sysd.service flux-env.service
+Wants=ak-sysd.service
+ConditionPathExists=!/etc/authentik/domains/flux.json
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/flux/env
+ExecStart=/usr/local/bin/flux-ak-join
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

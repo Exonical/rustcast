@@ -10,6 +10,7 @@ members = [
     "crates/flux-crypto",
     "crates/flux-protocol",
     "crates/flux-server",
+    "crates/flux-hostd",
     "crates/flux-client",
 ]
 

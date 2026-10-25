@@ -57,6 +57,8 @@ type Session struct {
 	sessionDone       chan struct{}
 
 	controlMu           sync.Mutex
+	pendingWidth        uint32
+	pendingHeight       uint32
 	needsIDR            atomic.Bool
 	audioEnabled        atomic.Bool
 	hasStarted          atomic.Bool
@@ -167,6 +169,18 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		session.fail(err.Error())
 		return
 	}
+	// Gate on the machine's host-login state before binding.
+	role, rejectReason := upstream.gateViewer(session)
+	if rejectReason != "" {
+		registry.metrics.reject(registry.metricMachineID(machineID), "login_gate")
+		_ = session.writeControl(controlMessage{
+			Type: "session-rejected",
+			Data: mustJSON(map[string]string{"reason": rejectReason}),
+		})
+		session.fail(rejectReason)
+		registry.release(upstream)
+		return
+	}
 	session.setMachine(upstream)
 	session.metrics = upstream.metrics
 	session.acceptedAt = time.Now()
@@ -188,18 +202,26 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		old.releaseNow()
 		_ = old.transport.CloseWithError(sessionErrorCode, "session replaced")
 	}
-	session.needsIDR.Store(true)
-	upstream.requestInitialIDR(session)
-	if width != 0 && height != 0 {
-		status, _ := json.Marshal(map[string]any{
-			"state":  "transitioning",
-			"width":  width,
-			"height": height,
-		})
-		upstream.sendResolutionStatus(status)
-		if !upstream.send([]byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}) {
-			session.fail("resolution change could not be queued")
-			return
+	if role == "auth" {
+		// The frame flow starts after the host login completes (see
+		// deferredStart); stash the requested resolution for then and replay
+		// any prompt hostd already emitted.
+		session.pendingWidth, session.pendingHeight = width, height
+		upstream.replayPrompt(session)
+	} else {
+		session.needsIDR.Store(true)
+		upstream.requestInitialIDR(session)
+		if width != 0 && height != 0 {
+			status, _ := json.Marshal(map[string]any{
+				"state":  "transitioning",
+				"width":  width,
+				"height": height,
+			})
+			upstream.sendResolutionStatus(status)
+			if !upstream.send([]byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}) {
+				session.fail("resolution change could not be queued")
+				return
+			}
 		}
 	}
 	clientIP := r.RemoteAddr
@@ -298,6 +320,27 @@ func validateResolution(width, height uint32) error {
 	return nil
 }
 
+// deferredStart begins the frame flow for an authenticating viewer whose
+// host login just succeeded (resolution change + initial IDR).
+func (s *Session) deferredStart(u *machineUpstream) {
+	s.needsIDR.Store(true)
+	if s.pendingWidth != 0 && s.pendingHeight != 0 {
+		width, height := s.pendingWidth, s.pendingHeight
+		s.pendingWidth, s.pendingHeight = 0, 0
+		status, _ := json.Marshal(map[string]any{
+			"state":  "transitioning",
+			"width":  width,
+			"height": height,
+		})
+		u.sendResolutionStatus(status)
+		if !u.send([]byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}) {
+			s.fail("resolution change could not be queued")
+			return
+		}
+	}
+	u.requestInitialIDR(s)
+}
+
 func (s *Session) setMachine(machine *machineUpstream) {
 	s.machineMu.Lock()
 	s.machine = machine
@@ -326,6 +369,9 @@ func (s *Session) releaseNow() {
 		}
 		if s.release != nil {
 			s.release()
+		}
+		if machine := s.getMachine(); machine != nil {
+			machine.onSessionLeft(s)
 		}
 		close(s.sessionDone)
 	})
@@ -418,6 +464,20 @@ func (s *Session) readControlMessages() {
 func (s *Session) handleControlMessage(message controlMessage) error {
 	machine := s.getMachine()
 	switch message.Type {
+	case "login-response":
+		var resp struct {
+			Response string `json:"response"`
+		}
+		if err := json.Unmarshal(message.Data, &resp); err != nil {
+			return errors.New("invalid login-response")
+		}
+		if machine != nil {
+			machine.sendLoginResponseIfAuth(s, resp.Response)
+		}
+	case "lock":
+		if machine != nil {
+			machine.viewerLock(s)
+		}
 	case "input":
 		if machine == nil || !json.Valid(message.Data) {
 			return errors.New("invalid input")

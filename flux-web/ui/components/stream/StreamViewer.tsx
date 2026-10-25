@@ -5,6 +5,7 @@ import { WebTransportClient, type ConnectionState, type CursorMetadata, type Res
 import { getContainedVideoGeometry, mapCursorToVideo } from "@/lib/cursor-overlay";
 import { scanCodeFor } from "@/lib/keycodes";
 import { isLocalControlTarget, isLocalKeyboardTarget } from "@/lib/local-controls";
+import { initialLoginCard, reduceLoginMessage, reduceLoginSubmit, type LoginCardState } from "@/lib/login";
 import { modifierFlags } from "@/lib/protocol";
 import { AudioPlayer } from "@/lib/audio-player";
 import { ClipboardDedup, PendingRemoteClipboard, isPasteChord, policyAllowsClientSend, withinSizeCap } from "@/lib/clipboard";
@@ -92,6 +93,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const clientRef = useRef<WebTransportClient | null>(null);
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
+  const [login, setLogin] = useState<LoginCardState | null>(null);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showStats, setShowStats] = useState(true);
@@ -253,6 +255,15 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     });
   }, []);
 
+  const sendLock = useCallback(() => {
+    clientRef.current?.sendLock();
+  }, []);
+
+  const submitLogin = useCallback((response: string) => {
+    clientRef.current?.sendLoginResponse(response);
+    setLogin((prev) => (prev ? reduceLoginSubmit(prev) : prev));
+  }, []);
+
   const sendLocalClipboard = useCallback(async () => {
     const client = clientRef.current;
     if (!client || !navigator.clipboard) return;
@@ -288,6 +299,8 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
     }
     client.onStateChange = (state) => {
       setConnectionState(state);
+      if (state === "connecting" || state === "disconnected") setLogin(null);
+      if (state === "login") setLogin((prev) => prev ?? initialLoginCard());
       if (state === "connected") {
         try {
           if (localStorage.getItem("flux.audio.muted") === "1") client.setAudioEnabled(false);
@@ -335,6 +348,9 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       if (!payload || typeof payload.data !== "string") return;
       pendingRemoteClipboard.current.store(payload.data);
       flushRemoteClipboard();
+    };
+    client.onLogin = (message) => {
+      setLogin((prev) => reduceLoginMessage(prev ?? initialLoginCard(), message));
     };
     client.onClipboardStatus = (status) => {
       clipboardPolicyRef.current = status.policy;
@@ -652,6 +668,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isLocalKeyboardTarget(e.target)) return;
+      if (connectionState === "login") return;
       resumeAudioOnce();
       flushRemoteClipboard();
 
@@ -660,6 +677,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         if (e.code === "KeyS") { e.preventDefault(); setShowStats((visible) => !visible); return; }
         if (e.code === "KeyF") { e.preventDefault(); toggleFullscreen(); return; }
         if (e.code === "KeyM") { e.preventDefault(); toggleAudioMuted(); return; }
+        if (e.code === "KeyL") { e.preventDefault(); sendLock(); return; }
       }
       if (e.code === "F11") { e.preventDefault(); toggleFullscreen(); return; }
 
@@ -753,7 +771,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       window.removeEventListener("blur", releaseAllInput);
       window.removeEventListener("pagehide", releaseAllInput);
     };
-  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen, resumeAudioOnce, toggleAudioMuted, clipboardSupported, flushRemoteClipboard, showClipboardToast, flashClipboardBlocked]);
+  }, [connectionState, reconnect, releaseAllInput, toggleFullscreen, resumeAudioOnce, toggleAudioMuted, clipboardSupported, flushRemoteClipboard, showClipboardToast, flashClipboardBlocked, sendLock]);
 
   const visibleControls = showControls || connectionState !== "connected" || !!endedReason;
 
@@ -790,6 +808,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         clipboardPolicy={clipboardPolicy}
         clipboardFlash={clipboardFlash}
         onClipboardSync={() => void sendLocalClipboard()}
+        onLock={sendLock}
         qualityLevel={qualityLevel}
         fpsCap={fpsCap}
         onBack={onBack}
@@ -815,6 +834,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
             <ShortcutRow keys="Ctrl + Alt + Shift + S" label="Toggle stats" />
             <ShortcutRow keys="Ctrl + Alt + Shift + F" label="Toggle fullscreen" />
             {audioSupported && <ShortcutRow keys="Ctrl + Alt + Shift + M" label="Mute audio" />}
+            <ShortcutRow keys="Ctrl + Alt + Shift + L" label="Lock host" />
             <ShortcutRow keys="Esc" label="Exit pointer lock" />
           </div>
         </div>
@@ -833,6 +853,8 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         error={clientError}
         endedReason={endedReason}
         resolutionStatus={resolutionStatus}
+        login={login}
+        onLoginSubmit={submitLogin}
         onReconnect={reconnect}
         onBack={onBack}
       />

@@ -1,7 +1,7 @@
 [Unit]
 Description=Export Flux container settings
 DefaultDependencies=no
-Before=user@1000.service basic.target
+Before=basic.target
 
 [Service]
 Type=oneshot

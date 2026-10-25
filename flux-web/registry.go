@@ -34,6 +34,8 @@ type machineInfo struct {
 	TargetBitrate   uint32    `json:"target_bitrate_kbps,omitempty"`
 	Viewers         int       `json:"viewers"`
 	ClipboardPolicy string    `json:"clipboard_policy"`
+	LoggedInUser    string    `json:"logged_in_user"`
+	LoginState      string    `json:"login_state"`
 	LastSeen        time.Time `json:"last_seen"`
 	Status          string    `json:"status"`
 	UpstreamStatus  string    `json:"upstream_status"`
@@ -182,6 +184,11 @@ func (r *machineRegistry) list() []machineInfo {
 		info := m.machineInfo
 		if m.upstream != nil {
 			info.Viewers = m.upstream.viewers
+			ls := m.upstream.loginSnapshot()
+			info.LoginState = ls.state.String()
+			info.LoggedInUser = ls.osUser
+		} else {
+			info.LoginState = loginIdle.String()
 		}
 		if r.deps != nil && r.deps.store != nil {
 			info.ClipboardPolicy = r.deps.store.getPolicy(info.ID).Mode
@@ -386,6 +393,22 @@ func registerPolicyRoutes(admin *gin.RouterGroup, registry *machineRegistry, aut
 		limit, _ := strconv.ParseInt(c.DefaultQuery("limit", "100"), 10, 64)
 		before, _ := strconv.ParseInt(c.Query("before"), 10, 64)
 		rows, err := st.listAudit(c.Query("machine"), limit, before)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, rows)
+	})
+
+	admin.GET("/audit/logins", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit store unavailable"})
+			return
+		}
+		limit, _ := strconv.ParseInt(c.DefaultQuery("limit", "100"), 10, 64)
+		before, _ := strconv.ParseInt(c.Query("before"), 10, 64)
+		rows, err := st.listLogins(c.Query("machine"), limit, before)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit query failed"})
 			return

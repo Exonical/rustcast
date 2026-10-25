@@ -13,7 +13,7 @@ import { policyLabel } from "@/lib/clipboard";
 
 export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
   qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio,
-  clipboardSupported, clipboardPolicy, clipboardFlash, onClipboardSync,
+  clipboardSupported, clipboardPolicy, clipboardFlash, onClipboardSync, onLock,
   onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
   onQualityChange, onFpsChange, onCommit, onResolution }: {
   machine: Machine;
@@ -30,6 +30,7 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
   clipboardPolicy: string;
   clipboardFlash: boolean;
   onClipboardSync: () => void;
+  onLock: () => void;
   qualityLevel: number | null;
   fpsCap: number | null;
   onBack: () => void;
@@ -113,6 +114,7 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
           onClick={onClipboardSync}
           className={`h-9 w-9 rounded-xl p-0 transition-colors ${clipboardFlash ? "bg-red-400/25 text-red-200" : ""} ${clipboardPolicy === "off" ? "opacity-50" : ""}`}
         >⧉</Button>
+        <Button aria-label="Lock host" title="Lock host · Ctrl+Alt+Shift+L" onClick={onLock} className="h-9 w-9 rounded-xl p-0 text-base">🔒</Button>
         <Button aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"} title="Fullscreen · Ctrl+Alt+Shift+F" onClick={onFullscreen} className="hidden h-9 w-9 rounded-xl p-0 sm:inline-flex">{isFullscreen ? "↙" : "↗"}</Button>
         <Button variant="danger" onClick={onBack} className="h-9 px-3 text-xs sm:px-4">Disconnect</Button>
       </div>

@@ -19,6 +19,8 @@ type sessionInfo struct {
 	UserAgent   string    `json:"user_agent"`
 	User        string    `json:"user,omitempty"`
 	UserSub     string    `json:"user_sub,omitempty"`
+	OSUser      string    `json:"os_user,omitempty"`
+	OSUID       int64     `json:"os_uid,omitempty"`
 	StartedAt   time.Time `json:"started_at"`
 	Width       uint32    `json:"width"`
 	Height      uint32    `json:"height"`
@@ -91,6 +93,31 @@ func (r *sessionRegistry) sessionsFor(machineID string) []sessionViewer {
 		}
 	}
 	return out
+}
+
+// setOSInfo records the OS login bound to a session.
+func (r *sessionRegistry) setOSInfo(id, osUser string, osUID int64) {
+	r.mu.Lock()
+	if entry, ok := r.m[id]; ok {
+		entry.info.OSUser = osUser
+		entry.info.OSUID = osUID
+	}
+	r.mu.Unlock()
+}
+
+// endByID ends a session with a specific reason.
+func (r *sessionRegistry) endByID(id, reason string) {
+	r.mu.Lock()
+	entry := r.m[id]
+	r.mu.Unlock()
+	if entry == nil {
+		return
+	}
+	entry.endOnce.Do(func() {
+		if entry.end != nil {
+			entry.end(reason)
+		}
+	})
 }
 
 func (r *sessionRegistry) disconnect(id string) bool {

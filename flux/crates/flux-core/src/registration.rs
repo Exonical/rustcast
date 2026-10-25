@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use flux_core::config::{FluxConfig, VirtualDisplayConfig};
-use flux_core::platform::PlatformInfo;
+use crate::config::{FluxConfig, VirtualDisplayConfig};
+use crate::platform::PlatformInfo;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -46,6 +46,7 @@ pub fn start(
     platform: &PlatformInfo,
     frame_endpoint: String,
     status: Arc<RwLock<RuntimeStatus>>,
+    machine_id_path: &Path,
 ) -> Option<RegistrationHandle> {
     let base_url = config.relay.base_url.clone()?;
     let parsed_base_url = match reqwest::Url::parse(&base_url) {
@@ -72,8 +73,7 @@ pub fn start(
             return None;
         }
     };
-    let id_path = config_path(config).with_file_name("flux-machine-id");
-    let id = match load_or_create_id(&id_path) {
+    let id = match load_or_create_id(machine_id_path) {
         Ok(id) => id,
         Err(error) => {
             tracing::warn!("Relay registration disabled: cannot persist machine ID: {error}");
@@ -176,10 +176,6 @@ pub fn start(
         }
     });
     Some(RegistrationHandle { stop: stop_tx })
-}
-
-fn config_path(config: &FluxConfig) -> PathBuf {
-    PathBuf::from(&config.security.cert_path)
 }
 
 fn load_or_create_id(path: &Path) -> std::io::Result<String> {

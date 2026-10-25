@@ -5,8 +5,9 @@ import { ResolutionPaintTracker } from "./resolution-paint";
 import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readControlMessage } from "./wt-framing";
 import { parseAudioHeader } from "./audio-framing";
 import { CLIPBOARD_MIME, type ClipboardPayload, type ClipboardStatus } from "./clipboard";
+import type { HostLoginMessage } from "./login";
 
-export type ConnectionState = "disconnected" | "connecting" | "connected" | "failed";
+export type ConnectionState = "disconnected" | "connecting" | "login" | "connected" | "failed";
 
 export interface StreamStats {
   fps: number;
@@ -174,6 +175,7 @@ export class WebTransportClient {
   onSessionEnded: ((reason: string) => void) | null = null;
   onClipboard: ((payload: ClipboardPayload) => void) | null = null;
   onClipboardStatus: ((status: ClipboardStatus) => void) | null = null;
+  onLogin: ((message: HostLoginMessage) => void) | null = null;
   private clipboardWaiter: {
     resolve: (status: ClipboardStatus | null) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -275,6 +277,14 @@ export class WebTransportClient {
     this.sendControl("clipboard", { mime: CLIPBOARD_MIME, data: text });
   }
 
+  sendLoginResponse(response: string): void {
+    this.sendControl("login-response", { response });
+  }
+
+  sendLock(): void {
+    this.sendControl("lock");
+  }
+
   /** Send clipboard text, then wait up to `timeoutMs` for the relay's
    *  `clipboard-status` verdict (null on timeout). */
   sendClipboardAndWait(text: string, timeoutMs = 150): Promise<ClipboardStatus | null> {
@@ -349,6 +359,19 @@ export class WebTransportClient {
       this.intentionalClose = true;
       this.closeCurrent();
       this.setState("disconnected");
+      this.onSessionEnded?.(reason);
+    } else if (message.type === "login") {
+      const data = message.data as HostLoginMessage;
+      if (data.state === "ok") {
+        this.setState("connected");
+      } else {
+        this.setState("login");
+      }
+      this.onLogin?.(data);
+    } else if (message.type === "session-rejected") {
+      const data = message.data as { reason?: unknown } | undefined;
+      const reason = typeof data?.reason === "string" ? data.reason : "Session rejected";
+      this.intentionalClose = true;
       this.onSessionEnded?.(reason);
     } else if (message.type === "clipboard") {
       this.onClipboard?.(message.data as ClipboardPayload);

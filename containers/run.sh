@@ -28,9 +28,19 @@ if [ ! -f "$env_file" ]; then
     echo "FLUX_OIDC_CLIENT_SECRET=$(gen_secret)"
     echo "FLUX_SESSION_SECRET=$(gen_secret)"
     echo "FLUX_RELAY_TOKEN=$(gen_secret)"
+    echo "FLUX_DEVUSER_PASSWORD=$(gen_secret)"
+    echo "FLUX_AK_ENROLLMENT_TOKEN=$(gen_secret)"
   } > "$env_file"
   chmod 600 "$env_file"
   echo "Generated $env_file (akadmin password, OIDC secrets; gitignored)."
+else
+  # Backfill keys added after the file was first generated.
+  gen_secret() { LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 48; }
+  for key in FLUX_DEVUSER_PASSWORD FLUX_AK_ENROLLMENT_TOKEN; do
+    if ! grep -q "^$key=" "$env_file"; then
+      echo "$key=$(gen_secret)" >> "$env_file"
+    fi
+  done
 fi
 set -a
 # shellcheck disable=SC1090
@@ -112,6 +122,8 @@ sed \
   -e "s|%%FLUX_OIDC_CLIENT_SECRET%%|$FLUX_OIDC_CLIENT_SECRET|g" \
   -e "s|%%FLUX_SESSION_SECRET%%|$FLUX_SESSION_SECRET|g" \
   -e "s|%%FLUX_RELAY_TOKEN%%|$FLUX_RELAY_TOKEN|g" \
+  -e "s|%%FLUX_DEVUSER_PASSWORD%%|$FLUX_DEVUSER_PASSWORD|g" \
+  -e "s|%%FLUX_AK_ENROLLMENT_TOKEN%%|$FLUX_AK_ENROLLMENT_TOKEN|g" \
   -e "s|%%BLUEPRINT_DIR%%|$here/authentik/blueprints|g" \
   "$pod_yaml" > "$templated"
 pod_yaml="$templated"

@@ -12,6 +12,13 @@ get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
   echo "RUST_LOG=$(get RUST_LOG | grep . || echo info)"
   token=$(get FLUX_RELAY_TOKEN || true)
   if [ -n "$token" ]; then echo "FLUX_RELAY_TOKEN=$token"; fi
+  enroll=$(get FLUX_AK_ENROLLMENT_TOKEN || true)
+  if [ -n "$enroll" ]; then echo "FLUX_AK_ENROLLMENT_TOKEN=$enroll"; fi
+  name=$(get FLUX_NAME || true)
+  if [ -n "$name" ]; then echo "FLUX_NAME=$name"; fi
   api=$(get FLUX_CAPTURE_API || true)
   if [ -n "$api" ]; then echo "FLUX_CAPTURE_API=$api"; fi
 } > /etc/flux/env
+# Local test user password, injected at container start (never baked in).
+devpw=$(get FLUX_DEVUSER_PASSWORD || true)
+if [ -n "$devpw" ]; then echo "devuser:$devpw" | chpasswd; fi

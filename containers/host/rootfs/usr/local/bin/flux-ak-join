@@ -1,0 +1,15 @@
+#!/bin/bash
+# Enroll this host with authentik's agent connector (idempotent).
+set -u
+[ -n "${FLUX_AK_ENROLLMENT_TOKEN:-}" ] || exit 0
+[ -f /etc/authentik/domains/flux.json ] && exit 0
+for _ in $(seq 1 30); do
+  if AK_SYS_INSECURE_ENV_TOKEN="$FLUX_AK_ENROLLMENT_TOKEN" \
+     ak-sysd domains join flux \
+       --authentik-url "${FLUX_AUTHENTIK_URL:-http://localhost:9000}"; then
+    exit 0
+  fi
+  sleep 2
+done
+echo "authentik domain join failed" >&2
+exit 1

@@ -15,5 +15,15 @@
   ],
   "yaml.schemas": {
     "https://goauthentik.io/blueprints/schema.json": "containers/authentik/blueprints/*.yaml"
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/node_modules/**": true,
+    "**/.next/**": true
+  },
+  "search.exclude": {
+    "**/target/**": true,
+    "**/node_modules/**": true,
+    "**/.next/**": true
   }
 }

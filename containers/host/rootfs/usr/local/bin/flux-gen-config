@@ -1,21 +1,25 @@
 #!/bin/bash
-# Generate ~/.config/flux/flux.toml for the host from the container environment.
+# Generate ~/.config/flux/flux.toml for the per-user flux-server agent.
+# The agent binds loopback only (flux-hostd fronts it) and does no relay
+# registration or QUIC listener.
 set -eu
 cfg="${XDG_CONFIG_HOME:-$HOME/.config}/flux/flux.toml"
 mkdir -p "$(dirname "$cfg")"
 flux-server --generate-config -c "$cfg" >/dev/null 2>&1
 sed -i '/^\[relay\]/,$d' "$cfg"
-sed -i 's/^bind_address = .*/bind_address = "0.0.0.0"/' "$cfg"
+sed -i 's/^bind_address = .*/bind_address = "127.0.0.1"/' "$cfg"
+sed -i 's/^signaling_port = .*/signaling_port = 8555/' "$cfg"
+sed -i 's/^frame_quic = .*/frame_quic = false/' "$cfg"
 size="${FLUX_DISPLAY_SIZE:-1920x1080}"
 width="${size%%x*}"
 height="${size##*x}"
-cat >> "$cfg" <<EOF
-[relay]
-base_url = "${FLUX_RELAY_URL}"
-advertise_host = "${FLUX_ADVERTISE_HOST}"
-
+if grep -q '^\[video.virtual_display\]' "$cfg"; then
+  sed -i '/^\[video.virtual_display\]/,/^\[/ s/^width = .*/width = '"$width"'/; /^\[video.virtual_display\]/,/^\[/ s/^height = .*/height = '"$height"'/; /^\[video.virtual_display\]/,/^\[/ s/^refresh_hz = .*/refresh_hz = '"${FLUX_DISPLAY_REFRESH:-60}"'/' "$cfg"
+else
+  cat >> "$cfg" <<TOML
 [video.virtual_display]
 width = ${width}
 height = ${height}
 refresh_hz = ${FLUX_DISPLAY_REFRESH:-60}
-EOF
+TOML
+fi

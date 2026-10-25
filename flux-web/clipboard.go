@@ -111,11 +111,15 @@ func (s *Session) auditClipboard(store *store, direction, mime string, data []by
 		machineID = machine.id
 		machineName = s.machineName()
 	}
+	osUser := ""
+	if machine != nil {
+		osUser = machine.loginOSUser()
+	}
 	if err := store.insertAudit(auditEvent{
 		MachineID: machineID, MachineName: machineName,
 		SessionID: sessionID, UserSub: userSub, UserName: userName,
 		ClientIP: clientIP, Direction: direction,
-		Mime: mime, Data: data, Result: result,
+		Mime: mime, Data: data, Result: result, OSUser: osUser,
 	}, capture); err != nil {
 		log.Printf("[clipboard] audit insert failed machine=%s: %v", machineID, err)
 	}
@@ -186,6 +190,7 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 	if u.deps.name != nil {
 		machineName = u.deps.name(u.id)
 	}
+	osUser := u.loginOSUser()
 
 	// record counts the event once per upstream event and writes one audit
 	// row per listed viewer (or a single viewer-less row when empty).
@@ -200,6 +205,7 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 		for _, base := range viewers {
 			ev := base
 			ev.MachineID, ev.MachineName = u.id, machineName
+			ev.OSUser = osUser
 			ev.Direction, ev.Mime, ev.Data, ev.Result = direction, mime, payload, result
 			if err := store.insertAudit(ev, policy.CaptureContent); err != nil {
 				log.Printf("[clipboard] audit insert failed machine=%s: %v", u.id, err)

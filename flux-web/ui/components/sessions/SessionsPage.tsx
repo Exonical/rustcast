@@ -64,7 +64,7 @@ export function SessionsPage() {
           <tbody className="divide-y divide-white/[0.045]">
             {sessions.data.map((session) => (
               <tr key={session.id} className="transition hover:bg-white/[0.02]">
-                <td className="px-5 py-4"><p className="text-sm font-semibold text-zinc-200">{session.machine_name}</p><p className="mt-1 font-mono text-[10px] text-zinc-600">{session.machine_id}</p></td>
+                <td className="px-5 py-4"><p className="text-sm font-semibold text-zinc-200">{session.machine_name}</p><p className="mt-1 font-mono text-[10px] text-zinc-600">{session.machine_id}</p>{session.os_user && <p className="mt-1 text-[10px] text-zinc-500">OS: {session.os_user}{session.os_uid ? ` (${session.os_uid})` : ""}</p>}</td>
                 <td className="px-5 py-4"><p className="text-sm text-zinc-300">{session.client_ip}</p><p className="mt-1 text-[11px] text-zinc-600">{shortUserAgent(session.user_agent)}</p></td>
                 <td className="px-5 py-4"><span className="font-mono text-xs text-zinc-300">{session.width && session.height ? `${session.width}×${session.height}` : "Native"}</span></td>
                 <td className="px-5 py-4 text-xs text-zinc-500">{new Date(session.started_at).toLocaleTimeString()}</td>
