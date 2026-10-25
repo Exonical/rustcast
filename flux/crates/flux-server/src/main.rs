@@ -174,11 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match action {
                                     TrayAction::ShowPin => {
                                         tracing::info!("Tray: Show PIN requested");
-                                        // TODO: Generate and display PIN
+                                        // Not implemented: there is no pairing listener that would accept a PIN.
                                     }
                                     TrayAction::OpenConfig => {
                                         tracing::info!("Tray: Open config requested");
-                                        // TODO: Open config file in default editor
+                                        // Not implemented: opening the config file in an editor.
                                     }
                                     TrayAction::Quit => {
                                         tracing::info!("Tray: Quit requested");
@@ -655,9 +655,12 @@ impl FluxServer {
             platform.clone(),
         );
 
-        // TODO: Start the QUIC server for signaling.
-        // TODO: Start mDNS/zeroconf advertisement.
-        // TODO: Start the HTTP(S) control API.
+        // main() already runs the relay frame servers (TCP, optional QUIC) and
+        // the plain-HTTP `/api/status` + `/metrics` listener. Still missing:
+        // - a client signaling/pairing listener on `server.signaling_port`
+        //   (nothing drives flux-protocol `SessionNegotiation` or `_authenticator`);
+        // - mDNS/zeroconf advertisement;
+        // - the HTTPS control API on `server.https_port`.
 
         Ok(Self {
             _config: config,
