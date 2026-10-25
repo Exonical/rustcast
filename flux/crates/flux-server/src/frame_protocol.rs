@@ -2,6 +2,11 @@
 //! frame servers.
 //!
 //! Host→relay messages: [1-byte type][8-byte BE capture-timestamp µs][4-byte BE length][payload].
+//!   0x01 H.264 access unit (`MSG_VIDEO`)
+//!   0x02 cursor JSON metadata (`MSG_CURSOR`)
+//!   0x03 resolution transition status JSON (`MSG_RESOLUTION_STATUS`)
+//!   0x04 Opus audio packet ([seq u32 BE][opus payload]) (`MSG_AUDIO`)
+//!   0x05 clipboard JSON (`MSG_CLIPBOARD`)
 //!
 //! Relay→host commands:
 //!   0x01 IDR request
@@ -22,6 +27,12 @@ use crate::display_platform::PrivacyConnection;
 use crate::resolution::{ModeRequest, validate_mode_request};
 
 pub(crate) const FRAME_HEADER_LEN: usize = 13;
+
+pub(crate) const MSG_VIDEO: u8 = 0x01;
+pub(crate) const MSG_CURSOR: u8 = 0x02;
+pub(crate) const MSG_RESOLUTION_STATUS: u8 = 0x03;
+pub(crate) const MSG_AUDIO: u8 = 0x04;
+pub(crate) const MSG_CLIPBOARD: u8 = 0x05;
 
 const CMD_IDR: u8 = 0x01;
 const CMD_INPUT: u8 = 0x02;
@@ -258,6 +269,14 @@ mod tests {
         assert_eq!(
             frame_header(0x04, 0x0102_0304_0506_0708, 0x0A0B_0C0D),
             [0x04, 1, 2, 3, 4, 5, 6, 7, 8, 0x0A, 0x0B, 0x0C, 0x0D]
+        );
+    }
+
+    #[test]
+    fn message_type_bytes() {
+        assert_eq!(
+            [MSG_VIDEO, MSG_CURSOR, MSG_RESOLUTION_STATUS, MSG_AUDIO, MSG_CLIPBOARD],
+            [0x01, 0x02, 0x03, 0x04, 0x05]
         );
     }
 

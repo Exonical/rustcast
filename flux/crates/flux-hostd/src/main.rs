@@ -32,6 +32,7 @@ const AGENT_PORT: u16 = 8557;
 const MACHINE_ID_PATH: &str = "/var/lib/flux/machine-id";
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(60);
 const USER_MANAGER_TIMEOUT: Duration = Duration::from_secs(30);
+const USER_MANAGER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_LOGIN_FAILURES: u32 = 3;
 const LOGIN_COOLDOWN: Duration = Duration::from_secs(10);
 const USERNAME_PROMPT: &str = "Username";
@@ -60,13 +61,9 @@ fn env(name: &str) -> Option<String> {
 }
 
 /// Sync the registration heartbeat's login fields with the session manager.
-fn update_login_status(shared: &Shared, active: bool) {
+fn update_login_status(shared: &Shared) {
     if let Ok(mut s) = shared.status.write() {
         match shared.manager.state() {
-            SessionState::Active { user } if active => {
-                s.login_state = "active".into();
-                s.logged_in_user = Some(user);
-            }
             SessionState::Active { user } => {
                 s.login_state = "active".into();
                 s.logged_in_user = Some(user);
@@ -362,7 +359,7 @@ where
                             .await?;
                             return Ok(());
                         }
-                        update_login_status(&shared, true);
+                        update_login_status(&shared);
                         break Login::Reattach {
                             user: username,
                         };
@@ -446,7 +443,7 @@ where
             shared
                 .manager
                 .open(user, outcome.session.expect("fresh login opens pam session"));
-            update_login_status(&shared, true);
+            update_login_status(&shared);
             spawn_agent_watcher(uid, name.clone(), shared.clone());
             proto::write_login_frame(
                 &mut wr,
@@ -472,7 +469,7 @@ where
     };
     schedule_idle_logout(shared.clone());
     shared.manager.lock();
-    update_login_status(&shared, false);
+    update_login_status(&shared);
     match end {
         // Relay dropped: the OS session stays alive but locked.
         ProxyEnd::Disconnected => return Ok(()),
@@ -598,24 +595,10 @@ async fn start_user_session(
             home,
             shell,
         };
-        loop {
-            match osuser::run_as_user(
-                &user,
-                &pam_env,
-                "systemctl",
-                &["--user", "start", "flux-session.target"],
-            ) {
-                Ok(mut child) => match child.wait() {
-                    Ok(status) if status.success() => return Ok(()),
-                    Ok(_) | Err(_) => {}
-                },
-                Err(_) => {}
-            }
-            if std::time::Instant::now() > deadline {
-                return Err("timed out waiting for user manager".to_string());
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        retry_until(deadline, USER_MANAGER_RETRY_INTERVAL, || {
+            start_session_target(&user, &pam_env)
+        })
+        .map_err(|last| format!("timed out waiting for user manager (last: {last})"))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -631,6 +614,56 @@ async fn start_user_session(
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
         }
+    }
+}
+
+/// Run `systemctl --user start flux-session.target` as `user` once,
+/// describing a spawn failure or non-zero exit (with its stderr) on error.
+fn start_session_target(user: &OsUser, pam_env: &[(std::ffi::OsString, std::ffi::OsString)]) -> Result<(), String> {
+    let output = osuser::command_as_user(user, pam_env, "systemctl", &["--user", "start", "flux-session.target"])
+        .and_then(|mut cmd| cmd.stderr(std::process::Stdio::piped()).spawn())
+        .map_err(|e| format!("spawning systemctl: {e}"))?
+        .wait_with_output()
+        .map_err(|e| format!("waiting for systemctl: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(describe_exit_failure(output.status, &output.stderr))
+    }
+}
+
+/// Longest stderr excerpt kept in a session-start error.
+const MAX_STDERR_CHARS: usize = 300;
+
+/// `"exit status: 1: <stderr lines joined by "; ">"`, stderr truncated.
+fn describe_exit_failure(status: std::process::ExitStatus, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return status.to_string();
+    }
+    let joined = lines.join("; ");
+    let excerpt: String = joined.chars().take(MAX_STDERR_CHARS).collect();
+    let ellipsis = if excerpt.len() < joined.len() { "…" } else { "" };
+    format!("{status}: {excerpt}{ellipsis}")
+}
+
+/// Call `attempt` every `interval` until it succeeds or `deadline` passes,
+/// returning the last attempt's error on timeout.
+fn retry_until(
+    deadline: std::time::Instant,
+    interval: Duration,
+    mut attempt: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    loop {
+        let err = match attempt() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if std::time::Instant::now() > deadline {
+            return Err(err);
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -857,5 +890,68 @@ mod drive_pam_tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.unwrap().user, "devuser");
+    }
+}
+
+#[cfg(test)]
+mod start_session_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use std::time::Instant;
+
+    #[test]
+    fn retry_until_returns_ok_after_transient_failures() {
+        let mut calls = 0;
+        let result = retry_until(Instant::now() + Duration::from_secs(5), Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                Err(format!("attempt {calls}"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn retry_until_reports_last_error_after_deadline() {
+        let mut calls = 0;
+        let result = retry_until(
+            Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(5),
+            || {
+                calls += 1;
+                Err(format!("attempt {calls}"))
+            },
+        );
+        assert!(calls > 1, "expected retries, got {calls}");
+        assert_eq!(result, Err(format!("attempt {calls}")));
+    }
+
+    #[test]
+    fn describe_exit_failure_includes_status_and_stderr() {
+        let status = ExitStatus::from_raw(1 << 8);
+        let stderr = b"Failed to connect to bus: No medium found\n\n  second line  \n";
+        assert_eq!(
+            describe_exit_failure(status, stderr),
+            "exit status: 1: Failed to connect to bus: No medium found; second line"
+        );
+    }
+
+    #[test]
+    fn describe_exit_failure_without_stderr_is_just_status() {
+        assert_eq!(
+            describe_exit_failure(ExitStatus::from_raw(1 << 8), b" \n"),
+            "exit status: 1"
+        );
+    }
+
+    #[test]
+    fn describe_exit_failure_truncates_long_stderr() {
+        let stderr = "é".repeat(MAX_STDERR_CHARS + 10);
+        let described = describe_exit_failure(ExitStatus::from_raw(1 << 8), stderr.as_bytes());
+        assert_eq!(described, format!("exit status: 1: {}…", "é".repeat(MAX_STDERR_CHARS)));
     }
 }

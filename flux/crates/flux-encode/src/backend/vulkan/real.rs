@@ -43,6 +43,17 @@ fn init_err(what: &str, e: vk::Result) -> FluxError {
     FluxError::EncoderInit(format!("Vulkan Video: {what} failed: {e:?}"))
 }
 
+/// The error for "no usable encode device", naming each skipped device and why.
+fn no_suitable_device_error(skipped: &[String]) -> FluxError {
+    let mut msg = String::from("no Vulkan device with H.264 video encode support found");
+    if !skipped.is_empty() {
+        msg.push_str(" (skipped: ");
+        msg.push_str(&skipped.join("; "));
+        msg.push(')');
+    }
+    FluxError::EncoderInit(msg)
+}
+
 // ───────────────────────────── profile chain ─────────────────────────────
 
 /// The H.264 encode video profile with its full pNext chain, boxed so the
@@ -245,41 +256,57 @@ impl VulkanVideoEncoder {
             vk::KHR_VIDEO_ENCODE_H264_NAME,
         ];
 
+        let mut skipped = Vec::new();
         for pd in devices {
             let props = unsafe { instance.get_physical_device_properties(pd) };
+            let device_name = props
+                .device_name_as_c_str()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut skip = |reason: String| {
+                tracing::debug!("Vulkan Video: skipping device {device_name:?}: {reason}");
+                skipped.push(format!("{device_name}: {reason}"));
+            };
+
             if props.api_version < vk::API_VERSION_1_3 {
+                skip(format!(
+                    "Vulkan {}.{} < 1.3",
+                    vk::api_version_major(props.api_version),
+                    vk::api_version_minor(props.api_version)
+                ));
                 continue;
             }
-            let exts = unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+            let exts = match unsafe { instance.enumerate_device_extension_properties(pd) } {
+                Ok(exts) => exts,
+                Err(e) => {
+                    skip(format!("vkEnumerateDeviceExtensionProperties failed: {e:?}"));
+                    continue;
+                }
+            };
             let has = |name: &std::ffi::CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
             if !required_exts.iter().all(|n| has(n)) {
+                skip("missing VK_KHR_video_queue/video_encode_queue/video_encode_h264".into());
                 continue;
             }
 
             let Some((encode_qf, transfer_qf)) = Self::find_queue_families(instance, pd) else {
+                skip("no H.264 encode queue family".into());
                 continue;
             };
 
             let caps = match Self::query_h264_caps(entry, instance, pd) {
                 Ok(caps) => caps,
                 Err(e) => {
-                    tracing::debug!("Vulkan Video: skipping device: {e}");
+                    skip(e.to_string());
                     continue;
                 }
             };
-
-            let device_name = props
-                .device_name_as_c_str()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
 
             let device = Self::create_device(instance, pd, encode_qf, transfer_qf, &required_exts)?;
             return Ok((pd, device, encode_qf, transfer_qf, caps, device_name));
         }
 
-        Err(FluxError::EncoderInit(
-            "no Vulkan device with H.264 video encode support found".into(),
-        ))
+        Err(no_suitable_device_error(&skipped))
     }
 
     /// Find (encode queue family, transfer queue family). The transfer family
@@ -1501,5 +1528,35 @@ impl Drop for SessionGuard {
             }
             (self.ctx.video_queue_fn.destroy_video_session_khr)(device.handle(), self.session, std::ptr::null());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_suitable_device_error_without_devices_keeps_generic_message() {
+        let err = no_suitable_device_error(&[]);
+        assert!(matches!(
+            err,
+            FluxError::EncoderInit(ref m) if m == "no Vulkan device with H.264 video encode support found"
+        ));
+    }
+
+    #[test]
+    fn no_suitable_device_error_lists_skip_reasons() {
+        let skipped = [
+            "GPU A: vkEnumerateDeviceExtensionProperties failed: ERROR_INITIALIZATION_FAILED".to_string(),
+            "GPU B: no H.264 encode queue family".to_string(),
+        ];
+        let FluxError::EncoderInit(msg) = no_suitable_device_error(&skipped) else {
+            panic!("expected EncoderInit");
+        };
+        assert_eq!(
+            msg,
+            "no Vulkan device with H.264 video encode support found (skipped: GPU A: \
+             vkEnumerateDeviceExtensionProperties failed: ERROR_INITIALIZATION_FAILED; GPU B: no H.264 encode queue family)"
+        );
     }
 }

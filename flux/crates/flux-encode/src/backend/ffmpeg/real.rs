@@ -7,7 +7,7 @@
 //!
 //! Like the cros-codecs path, an `AVCodecContext` is `!Send`, so the whole
 //! encode pipeline runs on one dedicated thread and the public
-//! [`EncodeSession`] talks to it over channels.
+//! [`EncodeSession`] talks to it over channels ([`ThreadedSession`]).
 //!
 //! Frame flow (CPU-upload path, mirroring the Phase 2 SHM approach):
 //!
@@ -25,10 +25,7 @@
 
 use std::ffi::c_int;
 use std::ptr;
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{bounded, unbounded, Sender};
 use ff::format::Pixel;
 use ff::util::error::EAGAIN;
 use ff::Error as FfError;
@@ -38,6 +35,7 @@ use flux_core::error::{FluxError, Result};
 use flux_core::frame::{CapturedFrame, EncodedPacket};
 use flux_core::types::{DynamicRange, PixelFormat, Resolution, VideoCodec};
 
+use crate::session_thread::{ThreadEncoder, ThreadedSession};
 use crate::traits::{EncodeConfig, EncodeSession, EncoderCapabilities, VideoEncoder};
 
 /// VA-API surfaces kept in the encoder's hardware frame pool.
@@ -366,7 +364,7 @@ impl VideoEncoder for FfmpegVaapiEncoder {
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
-        Ok(Box::new(FfmpegSession::spawn(
+        Ok(Box::new(spawn_session(
             config,
             Accel::Hardware,
             Some(self.device.new_ref()),
@@ -438,136 +436,20 @@ impl VideoEncoder for FfmpegSoftwareEncoder {
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
-        Ok(Box::new(FfmpegSession::spawn(config, Accel::Software, None)?))
+        Ok(Box::new(spawn_session(config, Accel::Software, None)?))
     }
 }
 
 // ───────────────────────────── session ─────────────────────────────
 
-enum Cmd {
-    Encode {
-        frame: Arc<CapturedFrame>,
-        reply: Sender<Result<Vec<EncodedPacket>>>,
-    },
-    RequestIdr,
-    SetBitrate(u32),
-    Flush {
-        reply: Sender<Result<Vec<EncodedPacket>>>,
-    },
-    Stop,
+/// Start an encode session whose FFmpeg state lives on its own thread.
+fn spawn_session(config: EncodeConfig, accel: Accel, device: Option<HwDevice>) -> Result<ThreadedSession> {
+    ThreadedSession::spawn("FFmpeg", "flux-ffmpeg-encode", move || {
+        EncoderState::new(&config, accel, device)
+    })
 }
 
-/// Handle to an FFmpeg VA-API encode session running on its own thread.
-pub struct FfmpegSession {
-    tx: Sender<Cmd>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl FfmpegSession {
-    fn spawn(config: EncodeConfig, accel: Accel, device: Option<HwDevice>) -> Result<Self> {
-        let (tx, rx) = unbounded::<Cmd>();
-        let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
-
-        let handle = thread::Builder::new()
-            .name("flux-ffmpeg-encode".into())
-            .spawn(move || run_encode_thread(config, accel, device, rx, ready_tx))
-            .map_err(|e| FluxError::EncoderInit(format!("failed to spawn encode thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                tx,
-                handle: Some(handle),
-            }),
-            Ok(Err(e)) => {
-                let _ = handle.join();
-                Err(e)
-            }
-            Err(_) => {
-                let _ = handle.join();
-                Err(FluxError::EncoderInit(
-                    "encode thread exited before signalling readiness".into(),
-                ))
-            }
-        }
-    }
-
-    fn request(&self, make: impl FnOnce(Sender<Result<Vec<EncodedPacket>>>) -> Cmd) -> Result<Vec<EncodedPacket>> {
-        let (reply_tx, reply_rx) = bounded::<Result<Vec<EncodedPacket>>>(1);
-        self.tx
-            .send(make(reply_tx))
-            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| FluxError::EncoderInit("encode thread dropped the reply".into()))?
-    }
-}
-
-impl EncodeSession for FfmpegSession {
-    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
-        self.request(|reply| Cmd::Encode { frame, reply })
-    }
-
-    fn request_idr(&mut self) {
-        let _ = self.tx.send(Cmd::RequestIdr);
-    }
-
-    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        self.request(|reply| Cmd::Flush { reply })
-    }
-
-    fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
-        self.tx
-            .send(Cmd::SetBitrate(bitrate_kbps))
-            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))
-    }
-}
-
-impl Drop for FfmpegSession {
-    fn drop(&mut self) {
-        let _ = self.tx.send(Cmd::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-// ─────────────────────────── encode thread ───────────────────────────
-
-fn run_encode_thread(
-    config: EncodeConfig,
-    accel: Accel,
-    device: Option<HwDevice>,
-    rx: crossbeam_channel::Receiver<Cmd>,
-    ready_tx: Sender<Result<()>>,
-) {
-    let mut state = match EncoderState::new(&config, accel, device) {
-        Ok(state) => {
-            let _ = ready_tx.send(Ok(()));
-            state
-        }
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Encode { frame, reply } => {
-                let result = state.encode(&frame);
-                // Release the frame before replying so the caller can reclaim it.
-                drop(frame);
-                let _ = reply.send(result);
-            }
-            Cmd::Flush { reply } => {
-                let _ = reply.send(state.flush());
-            }
-            Cmd::RequestIdr => state.force_idr = true,
-            Cmd::SetBitrate(kbps) => state.set_bitrate(kbps),
-            Cmd::Stop => break,
-        }
-    }
-}
+// ─────────────────────────── encode state ───────────────────────────
 
 /// All `!Send` FFmpeg state, owned by the encode thread.
 struct EncoderState {
@@ -723,6 +605,51 @@ impl EncoderState {
         Ok(&mut self.scaler.as_mut().expect("scaler just set").1)
     }
 
+    /// Drain `receive_packet` until the encoder needs more input / hits EOF.
+    fn drain(&mut self, frame: u64) -> Result<Vec<EncodedPacket>> {
+        let mut out = Vec::new();
+        loop {
+            let mut packet = ff::codec::packet::Packet::empty();
+            match self.encoder.receive_packet(&mut packet) {
+                Ok(()) => {
+                    if let Some(data) = packet.data() {
+                        out.push(EncodedPacket {
+                            frame_index: packet.pts().unwrap_or(self.pts) as u64,
+                            pts: packet.pts().unwrap_or(self.pts) as u64,
+                            is_keyframe: packet.is_key(),
+                            data: data.to_vec(),
+                        });
+                    }
+                }
+                Err(FfError::Other { errno }) if errno == EAGAIN => break,
+                Err(FfError::Eof) => break,
+                Err(e) => return Err(self.enc_err(frame, format!("receive_packet failed: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Allocate a hardware frame backed by the VA-API surface pool.
+    fn alloc_hw_frame(
+        &self,
+        frames_ctx: *mut ff::ffi::AVBufferRef,
+        frame: u64,
+    ) -> Result<ff::frame::Video> {
+        let mut hw = ff::frame::Video::empty();
+        // SAFETY: `frames_ctx` is a valid hwframe context; `hw` is a fresh frame.
+        let ret = unsafe { ff::ffi::av_hwframe_get_buffer(frames_ctx, hw.as_mut_ptr(), 0) };
+        if ret < 0 {
+            return Err(self.enc_err(frame, format!("hwframe pool exhausted ({ret})")));
+        }
+        Ok(hw)
+    }
+
+    fn enc_err(&self, frame: u64, reason: String) -> FluxError {
+        FluxError::Encode { frame, reason }
+    }
+}
+
+impl ThreadEncoder for EncoderState {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
         let src_format = source_pixel_format(frame.format).ok_or_else(|| FluxError::Encode {
             frame: frame.sequence,
@@ -798,50 +725,11 @@ impl EncoderState {
         self.drain(self.pts as u64)
     }
 
-    /// Drain `receive_packet` until the encoder needs more input / hits EOF.
-    fn drain(&mut self, frame: u64) -> Result<Vec<EncodedPacket>> {
-        let mut out = Vec::new();
-        loop {
-            let mut packet = ff::codec::packet::Packet::empty();
-            match self.encoder.receive_packet(&mut packet) {
-                Ok(()) => {
-                    if let Some(data) = packet.data() {
-                        out.push(EncodedPacket {
-                            frame_index: packet.pts().unwrap_or(self.pts) as u64,
-                            pts: packet.pts().unwrap_or(self.pts) as u64,
-                            is_keyframe: packet.is_key(),
-                            data: data.to_vec(),
-                        });
-                    }
-                }
-                Err(FfError::Other { errno }) if errno == EAGAIN => break,
-                Err(FfError::Eof) => break,
-                Err(e) => return Err(self.enc_err(frame, format!("receive_packet failed: {e}"))),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Allocate a hardware frame backed by the VA-API surface pool.
-    fn alloc_hw_frame(
-        &self,
-        frames_ctx: *mut ff::ffi::AVBufferRef,
-        frame: u64,
-    ) -> Result<ff::frame::Video> {
-        let mut hw = ff::frame::Video::empty();
-        // SAFETY: `frames_ctx` is a valid hwframe context; `hw` is a fresh frame.
-        let ret = unsafe { ff::ffi::av_hwframe_get_buffer(frames_ctx, hw.as_mut_ptr(), 0) };
-        if ret < 0 {
-            return Err(self.enc_err(frame, format!("hwframe pool exhausted ({ret})")));
-        }
-        Ok(hw)
-    }
-
     /// Best-effort runtime bitrate update. VA-API encoders configure their
     /// rate controller at `avcodec_open2`, so most drivers ignore changes to
     /// these fields on an open context; this updates them for drivers/codecs
     /// that do re-read them, and is a no-op otherwise.
-    fn set_bitrate(&mut self, kbps: u32) {
+    fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
         let bits = (kbps as i64) * 1000;
         // SAFETY: encoder owns a valid, opened `AVCodecContext`.
         unsafe {
@@ -849,10 +737,11 @@ impl EncoderState {
             (*ctx).bit_rate = bits;
             (*ctx).rc_max_rate = bits;
         }
+        Ok(())
     }
 
-    fn enc_err(&self, frame: u64, reason: String) -> FluxError {
-        FluxError::Encode { frame, reason }
+    fn request_idr(&mut self) {
+        self.force_idr = true;
     }
 }
 

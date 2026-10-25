@@ -14,11 +14,11 @@ Flux follows a modular, layered architecture where each concern is isolated into
 ### Server (Host) Pipeline
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│   Screen     │     │   Color     │     │    Video     │     │   RTP       │
-│   Capture    │────▶│   Convert   │────▶│   Encoder    │────▶│ Packetizer  │──▶ UDP
-│  (DXGI/PW)  │     │  (GPU CSC)  │     │(NVENC/AMF/..)│     │  + FEC      │
-└─────────────┘     └─────────────┘     └──────────────┘     └─────────────┘
+┌─────────────┐     ┌─────────────┐     ┌──────────────┐
+│   Screen     │     │   Color     │     │    Video     │
+│   Capture    │────▶│   Convert   │────▶│   Encoder    │──▶ frame server (TCP / QUIC uni-streams) ──▶ relay
+│  (DXGI/PW)  │     │  (GPU CSC)  │     │(NVENC/AMF/..)│
+└─────────────┘     └─────────────┘     └──────────────┘
 
 ┌─────────────┐     ┌─────────────┐
 │   Audio     │     │    Opus     │
@@ -32,7 +32,7 @@ Flux follows a modular, layered architecture where each concern is isolated into
 ### Client (Viewer) Pipeline
 
 ```
-UDP ──▶ Depacketizer ──▶ FEC Reconstruct ──▶ Video Decoder ──▶ Renderer ──▶ Display
+UDP ──▶ (planned transport) ──▶ Video Decoder ──▶ Renderer ──▶ Display
 UDP ──▶ Opus Decoder ──▶ Audio Output
 Input Capture ──▶ Serialize ──▶ Encrypt ──▶ UDP ──▶ Server
 ```
@@ -44,7 +44,6 @@ flux-server ──┬── flux-capture ──── flux-core
               ├── flux-encode  ──── flux-core
               ├── flux-audio   ──── flux-core
               ├── flux-input   ──── flux-core
-              ├── flux-transport ── flux-core
               ├── flux-crypto  ──── flux-core
               └── flux-protocol ─── flux-core
 
@@ -100,9 +99,10 @@ Planned: Reed-Solomon erasure coding generates parity packets alongside data
 packets, so the receiver can reconstruct lost data without requesting
 retransmission — critical for maintaining low latency.
 
-Current status (`flux-transport::fec`): placeholder. Each frame gets a single
-XOR parity packet regardless of the configured overhead (`fec_percentage`,
-default 20%), and there is no decoder yet, so lost packets are not recovered.
+Current status: not implemented. The RTP packetizer/FEC scaffolding
+(`flux-transport`) had no caller and was removed; the live media path is
+`flux-server`'s frame server (TCP or QUIC uni-streams) to the relay, and
+`video.fec_percentage` is currently unused.
 
 ## Session Lifecycle
 

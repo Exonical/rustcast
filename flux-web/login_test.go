@@ -28,13 +28,28 @@ func newLoginHarness(t *testing.T) *loginHarness {
 	deps := &relayDeps{store: st, sessions: sessions, name: func(string) string { return "m" }}
 	u := newMachineUpstream("127.0.0.1:9", "m1", deps, func(string) {})
 	u.loginSpoken = true
-	h := &loginHarness{u: u, sessions: sessions}
-	go func() {
-		for cmd := range u.commandChan {
+	return &loginHarness{u: u, sessions: sessions}
+}
+
+// commands returns every host command queued so far. machineUpstream.send
+// enqueues on the caller's goroutine, so draining here (on the test
+// goroutine) sees everything the preceding calls sent, with no shared state.
+func (h *loginHarness) commands() [][]byte {
+	for {
+		select {
+		case cmd := <-h.u.commandChan:
 			h.sent = append(h.sent, cmd)
+		default:
+			return h.sent
 		}
-	}()
-	return h
+	}
+}
+
+// waitForSent polls until at least n host commands have been queued.
+func (h *loginHarness) waitForSent(t *testing.T, n int) [][]byte {
+	t.Helper()
+	waitForTestCondition(t, time.Second, func() bool { return len(h.commands()) >= n })
+	return h.sent
 }
 
 func (h *loginHarness) newSession(id string, sub, username string) (*Session, *[]controlMessage) {
@@ -65,14 +80,14 @@ func TestLoginPrefillUsername(t *testing.T) {
 		t.Fatalf("gate: %q %q", role, reason)
 	}
 	h.u.handleLoginFrame(loginJSON(map[string]any{"state": "prompt", "style": "echo_on", "message": "Username"}))
-	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) != 1 || h.sent[0][0] != 0x08 {
-		t.Fatalf("expected 0x08 response, got %v", h.sent)
+	sent := h.waitForSent(t, 1)
+	if len(sent) != 1 || sent[0][0] != 0x08 {
+		t.Fatalf("expected 0x08 response, got %v", sent)
 	}
 	var resp struct {
 		Response string `json:"response"`
 	}
-	_ = json.Unmarshal(h.sent[0][5:], &resp)
+	_ = json.Unmarshal(sent[0][5:], &resp)
 	if resp.Response != "akadmin" {
 		t.Fatalf("prefill answered %q", resp.Response)
 	}
@@ -94,14 +109,12 @@ func TestLoginPrefillDisabled(t *testing.T) {
 	}
 	// Answering relays a 0x08.
 	h.u.sendLoginResponseIfAuth(sess, "devuser")
-	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) != 1 || h.sent[0][0] != 0x08 {
-		t.Fatalf("expected 0x08, got %v", h.sent)
+	if sent := h.waitForSent(t, 1); len(sent) != 1 || sent[0][0] != 0x08 {
+		t.Fatalf("expected 0x08, got %v", sent)
 	}
 	// Another session may not answer.
 	h.u.sendLoginResponseIfAuth(&Session{id: "other"}, "x")
-	time.Sleep(20 * time.Millisecond)
-	if len(h.sent) != 1 {
+	if len(h.commands()) != 1 {
 		t.Fatalf("non-auth session sent a response")
 	}
 }
@@ -132,9 +145,8 @@ func TestLoginOkFailedBusy(t *testing.T) {
 	if info.OSUser != "devuser" || info.OSUID != 2101 {
 		t.Fatalf("sessionInfo os fields: %+v", info)
 	}
-	time.Sleep(30 * time.Millisecond)
-	if len(h.sent) == 0 || h.sent[len(h.sent)-1][0] != 0x01 {
-		t.Fatalf("expected IDR after ok, got %v", h.sent)
+	if sent := h.waitForSent(t, 1); sent[len(sent)-1][0] != 0x01 {
+		t.Fatalf("expected IDR after ok, got %v", sent)
 	}
 
 	rows, err := h.u.deps.store.listLogins("m1", 10, 0)
@@ -173,17 +185,15 @@ func TestLoginGateAndLock(t *testing.T) {
 	h.sessions.add(sessionInfo{ID: "s3", MachineID: "m1"}, s3, nil)
 	h.sessions.remove("s3")
 	h.u.onSessionLeft(s3)
-	time.Sleep(20 * time.Millisecond)
-	for _, c := range h.sent {
+	for _, c := range h.commands() {
 		if c[0] == 0x09 {
 			t.Fatal("lock sent while a viewer remains")
 		}
 	}
 	h.sessions.remove("s1")
 	h.u.onSessionLeft(s1)
-	time.Sleep(30 * time.Millisecond)
 	found := false
-	for _, c := range h.sent {
+	for _, c := range h.commands() {
 		if c[0] == 0x09 && len(c) == 5 {
 			found = true
 		}

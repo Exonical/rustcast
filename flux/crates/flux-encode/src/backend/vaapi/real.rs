@@ -4,7 +4,8 @@
 //! and [`cros-libva`] (safe libva wrappers). The libva `Display` and the
 //! `cros-codecs` encoder are `!Send` (they hold `Rc`s), so — exactly like the
 //! PipeWire capture loop — the whole VA pipeline runs on one dedicated thread
-//! and the public [`EncodeSession`] talks to it over channels.
+//! and the public [`EncodeSession`] talks to it over channels
+//! ([`ThreadedSession`]).
 //!
 //! Phase 2 scope (matches the roadmap): VA-API init/probe + H.264 encode of
 //! SHM-uploaded NV12 surfaces, producing a real Annex-B bitstream. Zero-copy
@@ -13,16 +14,13 @@
 
 use std::borrow::Borrow;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-
-use crossbeam_channel::{bounded, unbounded, Sender};
 
 use flux_core::error::{FluxError, Result};
 use flux_core::frame::{CapturedFrame, EncodedPacket};
 use flux_core::types::{PixelFormat, Resolution, VideoCodec};
 
 use crate::nv12::frame_to_nv12;
+use crate::session_thread::{ThreadEncoder, ThreadedSession};
 use crate::traits::{EncodeConfig, EncodeSession, EncoderCapabilities, VideoEncoder};
 
 use cros_codecs::backend::vaapi::surface_pool::{PooledVaSurface, VaSurfacePool};
@@ -108,136 +106,15 @@ impl VideoEncoder for VaapiEncoder {
 
     fn create_session(&self, config: EncodeConfig) -> Result<Box<dyn EncodeSession>> {
         self.validate_config(&config)?;
-        Ok(Box::new(VaapiSession::spawn(config)?))
+        Ok(Box::new(ThreadedSession::spawn(
+            "VA-API",
+            "flux-vaapi-encode",
+            move || EncoderState::new(&config),
+        )?))
     }
 }
 
-// ───────────────────────────── session ─────────────────────────────
-
-/// A command sent from [`VaapiSession`] to the encode thread.
-enum Cmd {
-    Encode {
-        frame: Arc<CapturedFrame>,
-        reply: Sender<Result<Vec<EncodedPacket>>>,
-    },
-    RequestIdr,
-    SetBitrate(u32),
-    Flush {
-        reply: Sender<Result<Vec<EncodedPacket>>>,
-    },
-    Stop,
-}
-
-/// Handle to a VA-API encode session running on its own thread.
-pub struct VaapiSession {
-    tx: Sender<Cmd>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl VaapiSession {
-    fn spawn(config: EncodeConfig) -> Result<Self> {
-        let (tx, rx) = unbounded::<Cmd>();
-        // Surface init failures synchronously so `create_session` can report them.
-        let (ready_tx, ready_rx) = bounded::<Result<()>>(1);
-
-        let handle = thread::Builder::new()
-            .name("flux-vaapi-encode".into())
-            .spawn(move || run_encode_thread(config, rx, ready_tx))
-            .map_err(|e| FluxError::EncoderInit(format!("failed to spawn encode thread: {e}")))?;
-
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                tx,
-                handle: Some(handle),
-            }),
-            Ok(Err(e)) => {
-                let _ = handle.join();
-                Err(e)
-            }
-            Err(_) => {
-                let _ = handle.join();
-                Err(FluxError::EncoderInit(
-                    "encode thread exited before signalling readiness".into(),
-                ))
-            }
-        }
-    }
-
-    fn request(&self, make: impl FnOnce(Sender<Result<Vec<EncodedPacket>>>) -> Cmd) -> Result<Vec<EncodedPacket>> {
-        let (reply_tx, reply_rx) = bounded::<Result<Vec<EncodedPacket>>>(1);
-        self.tx
-            .send(make(reply_tx))
-            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| FluxError::EncoderInit("encode thread dropped the reply".into()))?
-    }
-}
-
-impl EncodeSession for VaapiSession {
-    fn encode(&mut self, frame: Arc<CapturedFrame>) -> Result<Vec<EncodedPacket>> {
-        self.request(|reply| Cmd::Encode { frame, reply })
-    }
-
-    fn request_idr(&mut self) {
-        let _ = self.tx.send(Cmd::RequestIdr);
-    }
-
-    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        self.request(|reply| Cmd::Flush { reply })
-    }
-
-    fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
-        self.tx
-            .send(Cmd::SetBitrate(bitrate_kbps))
-            .map_err(|_| FluxError::EncoderInit("encode thread is gone".into()))
-    }
-}
-
-impl Drop for VaapiSession {
-    fn drop(&mut self) {
-        let _ = self.tx.send(Cmd::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-// ─────────────────────────── encode thread ───────────────────────────
-
-fn run_encode_thread(config: EncodeConfig, rx: crossbeam_channel::Receiver<Cmd>, ready_tx: Sender<Result<()>>) {
-    let mut state = match EncoderState::new(&config) {
-        Ok(state) => {
-            let _ = ready_tx.send(Ok(()));
-            state
-        }
-        Err(e) => {
-            let _ = ready_tx.send(Err(e));
-            return;
-        }
-    };
-
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Encode { frame, reply } => {
-                let result = state.encode(&frame);
-                // Release the frame before replying so the caller can reclaim it.
-                drop(frame);
-                let _ = reply.send(result);
-            }
-            Cmd::Flush { reply } => {
-                let _ = reply.send(state.flush());
-            }
-            Cmd::RequestIdr => state.force_idr = true,
-            Cmd::SetBitrate(kbps) => {
-                if let Err(e) = state.set_bitrate(kbps) {
-                    tracing::warn!("VA-API set_bitrate failed: {e}");
-                }
-            }
-            Cmd::Stop => break,
-        }
-    }
-}
+// ─────────────────────────── encode state ───────────────────────────
 
 /// All `!Send` VA state, owned exclusively by the encode thread.
 struct EncoderState {
@@ -307,6 +184,24 @@ impl EncoderState {
         })
     }
 
+    /// Drain whatever coded bitstream the encoder has ready into `out`.
+    fn collect(&mut self, out: &mut Vec<EncodedPacket>) -> Result<()> {
+        while let Some(coded) = self.encoder.poll().map_err(|e| FluxError::Encode {
+            frame: self.timestamp,
+            reason: e.to_string(),
+        })? {
+            out.push(EncodedPacket {
+                frame_index: coded.metadata.timestamp,
+                pts: coded.metadata.timestamp,
+                is_keyframe: bitstream_has_idr(&coded.bitstream),
+                data: coded.bitstream,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ThreadEncoder for EncoderState {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
         let frame_no = self.timestamp;
         let nv12 = frame_to_nv12(frame, self.width, self.height)?;
@@ -357,20 +252,8 @@ impl EncoderState {
             .map_err(|e| FluxError::EncoderInit(format!("VA-API tune failed: {e}")))
     }
 
-    /// Drain whatever coded bitstream the encoder has ready into `out`.
-    fn collect(&mut self, out: &mut Vec<EncodedPacket>) -> Result<()> {
-        while let Some(coded) = self.encoder.poll().map_err(|e| FluxError::Encode {
-            frame: self.timestamp,
-            reason: e.to_string(),
-        })? {
-            out.push(EncodedPacket {
-                frame_index: coded.metadata.timestamp,
-                pts: coded.metadata.timestamp,
-                is_keyframe: bitstream_has_idr(&coded.bitstream),
-                data: coded.bitstream,
-            });
-        }
-        Ok(())
+    fn request_idr(&mut self) {
+        self.force_idr = true;
     }
 }
 

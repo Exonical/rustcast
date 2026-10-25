@@ -6,7 +6,7 @@ Flux is a high-performance remote desktop streaming solution built in Rust, desi
 
 - **GPU-Accelerated Encoding** — NVENC (NVIDIA), AMF (AMD/Windows), VA-API (AMD+Intel/Linux), Vulkan Video (cross-vendor)
 - **Zero-Copy Capture** — DXGI Desktop Duplication (Windows), PipeWire/DRM (Linux) with DMA-BUF passthrough
-- **Low-Latency Transport** — RTP over UDP with FEC (placeholder single XOR parity; Reed-Solomon planned), QUIC for signaling and reliable control
+- **Low-Latency Transport** — H.264 frames over TCP or QUIC uni-streams to the relay, then WebTransport to the browser (RTP/UDP with Reed-Solomon FEC is planned, not implemented)
 - **Multi-Codec** — H.264, H.265/HEVC, AV1 (where hardware supports it)
 - **HDR Support** — 10-bit encoding with BT.2020 color space
 - **Full Input Forwarding** — Keyboard, mouse, and gamepad (virtual Xbox 360 via ViGEmBus/uinput)
@@ -26,7 +26,6 @@ flux/
 │   ├── flux-encode/      # GPU video encoding (NVENC, AMF, VA-API, Vulkan Video, software)
 │   ├── flux-audio/       # Audio capture (WASAPI, PipeWire) + Opus encoding
 │   ├── flux-input/       # Input forwarding (keyboard, mouse, gamepad)
-│   ├── flux-transport/   # Networking (RTP, FEC, packetizer)
 │   ├── flux-crypto/      # TLS certificates, AES-GCM, PIN authentication
 │   ├── flux-protocol/    # Wire protocol messages, session negotiation
 │   ├── flux-server/      # Server binary (host)
@@ -81,7 +80,7 @@ Key settings:
 | `video` | `codec` | `H265` | Preferred codec (H264, H265, Av1) |
 | `video` | `max_fps` | `60` | Maximum framerate |
 | `video` | `bitrate_kbps` | `20000` | Target video bitrate |
-| `video` | `fec_percentage` | `20` | FEC overhead (0-100%) |
+| `video` | `fec_percentage` | `20` | FEC overhead (0-100%); currently unused (no FEC on the live path) |
 | `audio` | `codec` | `Opus` | Audio codec |
 | `audio` | `sample_rate` | `48000` | Audio sample rate |
 | `security` | `pin_pairing` | `true` | Require PIN for new clients |

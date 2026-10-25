@@ -168,68 +168,59 @@ fn replug_capture(
         mode.height
     );
     display.unplug()?;
-    let removal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let after_unplug = loop {
-        let displays = capture
-            .enumerate_displays()
-            .map_err(|error| format!("enumerate displays after unplug: {error}"))?;
-        if displays.len() < before.len() {
-            tracing::info!("Resolution transition: virtual output disappeared");
-            break displays;
-        }
-        if std::time::Instant::now() >= removal_deadline {
-            return Err("virtual output did not disappear after unplug".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let Some(after_unplug) = wait_for_displays(
+        capture,
+        std::time::Duration::from_secs(5),
+        "virtual output removal",
+        |displays| (displays.len() < before.len()).then_some(displays),
+    ) else {
+        return Err("virtual output did not disappear after unplug".into());
     };
+    tracing::info!("Resolution transition: virtual output disappeared");
     let replug_baseline: std::collections::HashSet<String> =
         after_unplug.iter().map(|display| display.name.clone()).collect();
     display.plug_in_mode(mode.width, mode.height, 60)?;
-    let arrival_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let target = loop {
-        let displays = capture
-            .enumerate_displays()
-            .map_err(|error| format!("enumerate displays after plug-in: {error}"))?;
-        if let Some(target) = displays
-            .into_iter()
-            .find(|display| !replug_baseline.contains(&display.name))
-        {
-            tracing::info!(
-                "Resolution transition: virtual output arrived as {} on adapter LUID {:?}",
-                target.name,
-                target.adapter_luid
-            );
-            break target;
-        }
-        if std::time::Instant::now() >= arrival_deadline {
-            return Err("virtual output did not reappear after plug-in".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let Some(target) = wait_for_displays(
+        capture,
+        std::time::Duration::from_secs(10),
+        "virtual output arrival",
+        |displays| {
+            displays
+                .into_iter()
+                .find(|display| !replug_baseline.contains(&display.name))
+        },
+    ) else {
+        return Err("virtual output did not reappear after plug-in".into());
     };
+    tracing::info!(
+        "Resolution transition: virtual output arrived as {} on adapter LUID {:?}",
+        target.name,
+        target.adapter_luid
+    );
     ccd_display::configure_virtual_display(&target, mode.width, mode.height, 60)
         .map_err(|error| format!("apply CCD mode {}x{}: {error}", mode.width, mode.height))?;
-    let configured_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let target = loop {
-        let displays = capture
-            .enumerate_displays()
-            .map_err(|error| format!("enumerate configured output: {error}"))?;
-        if let Some(target) = displays.into_iter().find(|display| {
-            !replug_baseline.contains(&display.name)
-                && display.native_resolution.width == mode.width
-                && display.native_resolution.height == mode.height
-        }) {
-            tracing::info!(
-                "Resolution transition: CCD apply succeeded for {}x{}",
-                mode.width,
-                mode.height
-            );
-            break target;
-        }
-        if std::time::Instant::now() >= configured_deadline {
-            return Err("virtual output did not settle at requested dimensions".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // CCD was applied to exactly this output, so pin its name and adapter
+    // like the startup path does instead of accepting any new output.
+    let Some(target) = wait_for_displays(
+        capture,
+        std::time::Duration::from_secs(5),
+        "configured virtual output",
+        |displays| {
+            displays.into_iter().find(|display| {
+                display.name == target.name
+                    && display.adapter_luid == target.adapter_luid
+                    && display.native_resolution.width == mode.width
+                    && display.native_resolution.height == mode.height
+            })
+        },
+    ) else {
+        return Err("virtual output did not settle at requested dimensions".into());
     };
+    tracing::info!(
+        "Resolution transition: CCD apply succeeded for {}x{}",
+        mode.width,
+        mode.height
+    );
     let session = starter
         .restart_on(&target)
         .map_err(|error| format!("restart capture after resolution transition: {error}"))?;
@@ -811,16 +802,11 @@ impl CaptureLoop {
         let mut capture_resolution = flux_core::types::Resolution::new(0, 0);
         let mut encode_resolution = flux_core::types::Resolution::new(0, 0);
 
-        // Verification file (first ~5 seconds)
-        let h264_path = std::path::PathBuf::from("flux_capture_test.h264");
-        let mut h264_file = std::fs::File::create(&h264_path).ok();
-        let max_verify_frames = target_fps as u64 * 5;
         let mut total_encoded_bytes: u64 = 0;
 
         tracing::info!(
-            "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame; verify: {})",
-            target_fps,
-            h264_path.display()
+            "Capture+encode loop starting @{}fps → H.264 (encoder built from first frame)",
+            target_fps
         );
 
         let mut frame_count: u64 = 0;
@@ -1208,20 +1194,6 @@ impl CaptureLoop {
                             crate::metrics::encoded_frame(pkt.is_keyframe, pkt.data.len());
                             if pkt.is_keyframe {
                                 keyframe_bytes = Some(pkt.data.len());
-                            }
-
-                            if frame_count <= max_verify_frames {
-                                if let Some(ref mut f) = h264_file {
-                                    use std::io::Write;
-                                    let _ = f.write_all(&pkt.data);
-                                }
-                            } else if h264_file.is_some() {
-                                h264_file.take();
-                                tracing::info!(
-                                    "H.264 verification file closed ({} frames, {} bytes)",
-                                    max_verify_frames,
-                                    total_encoded_bytes
-                                );
                             }
 
                             let _ = h264_tx.send(Arc::new((ts_micros, pkt.data)));
