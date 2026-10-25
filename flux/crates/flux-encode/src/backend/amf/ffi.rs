@@ -8,6 +8,17 @@
 //! All AMF objects are reference-counted via `AMFInterface` (AddRef/Release).
 //! We model vtables as `#[repr(C)]` structs of function pointers matching the
 //! exact C++ vtable layout emitted by MSVC.
+//!
+//! The layouts are hand-maintained against the AMF SDK 1.5.3 public headers
+//! (tag `v1.5.3`, `AMF_VERSION_MAJOR/MINOR/RELEASE` = 1/5/3 in `core/Version.h`,
+//! <https://github.com/GPUOpen-LibrariesAndSDKs/AMF/tree/v1.5.3/amf/public/include>).
+//! Method order must match the declaration order in `core/Interface.h`, `core/PropertyStorage.h`,
+//! `core/Factory.h`, `core/Context.h`, `core/Data.h`, `core/Buffer.h` and
+//! `components/Component.h`; recheck every vtable here against those headers
+//! when moving to a newer SDK. AMF only appends methods to existing interfaces,
+//! so the runtime check against [`AMF_MIN_VERSION`] keeps older runtimes out.
+//!
+//! The safe wrappers in `encoder.rs` are the only code that reads these vtables.
 
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
@@ -185,6 +196,8 @@ impl AMFVariantStruct {
             data: [0u64; 2],
         };
         // Write width (i32) and height (i32) into first 8 bytes of union
+        // SAFETY: `data` is 16 bytes, 8-byte aligned, so two i32 writes at its
+        // start are in bounds and aligned.
         unsafe {
             let ptr = s.data.as_mut_ptr() as *mut amf_int32;
             *ptr = sz.width;
@@ -200,6 +213,8 @@ impl AMFVariantStruct {
             data: [0u64; 2],
         };
         // Write num (u32) and den (u32) into first 8 bytes of union
+        // SAFETY: `data` is 16 bytes, 8-byte aligned, so two u32 writes at its
+        // start are in bounds and aligned.
         unsafe {
             let ptr = s.data.as_mut_ptr() as *mut amf_uint32;
             *ptr = r.num;
@@ -638,9 +653,9 @@ pub struct AMFDataVtbl {
     pub GetDuration: unsafe extern "system" fn(this: *mut AMFDataObj) -> amf_pts,
 }
 
-// ─── AMFBuffer vtable slot indices ───────────────────────────────────────────
+// ─── AMFBuffer vtable ────────────────────────────────────────────────────────
 // AMFBuffer extends AMFData. GetSize and GetNative are AMFBuffer-specific methods,
-// NOT on AMFData. We access them via raw vtable slot offsets.
+// NOT on AMFData; `AMFBufferVtbl` models them as the slots that follow `AMFDataVtbl`.
 //
 // Full AMFBuffer vtable layout (from Buffer.h C vtable):
 //   0-2:   AMFInterface (Acquire, Release, QueryInterface)
@@ -654,6 +669,21 @@ pub struct AMFDataVtbl {
 
 pub const AMFBUFFER_VTABLE_SLOT_GET_SIZE: usize = 24;
 pub const AMFBUFFER_VTABLE_SLOT_GET_NATIVE: usize = 25;
+
+/// Leading part of the `AMFBuffer` vtable (observer slots 26-27 omitted).
+#[repr(C)]
+pub struct AMFBufferVtbl {
+    pub data: AMFDataVtbl,
+    pub SetSize: unsafe extern "system" fn(this: *mut AMFBufferObj, newSize: amf_size) -> AMF_RESULT,
+    pub GetSize: unsafe extern "system" fn(this: *mut AMFBufferObj) -> amf_size,
+    pub GetNative: unsafe extern "system" fn(this: *mut AMFBufferObj) -> *mut c_void,
+}
+
+const VTABLE_SLOT_SIZE: usize = std::mem::size_of::<*const c_void>();
+const _: () =
+    assert!(std::mem::offset_of!(AMFBufferVtbl, GetSize) == AMFBUFFER_VTABLE_SLOT_GET_SIZE * VTABLE_SLOT_SIZE);
+const _: () =
+    assert!(std::mem::offset_of!(AMFBufferVtbl, GetNative) == AMFBUFFER_VTABLE_SLOT_GET_NATIVE * VTABLE_SLOT_SIZE);
 
 #[repr(C)]
 pub struct AMFDataObj {
