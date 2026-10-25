@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"log"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -210,4 +214,50 @@ func TestLoginBusyEndsViewer(t *testing.T) {
 	if h.u.loginSnapshot().state != loginIdle {
 		t.Fatal("busy should reset to idle")
 	}
+}
+
+func TestLoginForwardFailuresLogged(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame map[string]any
+		want  string
+	}{
+		{"prompt", map[string]any{"state": "prompt", "style": "echo_off", "message": "Password: "}, "login prompt forward failed"},
+		{"ok", map[string]any{"state": "ok", "user": "devuser", "uid": 2101}, "login ok forward failed"},
+		{"failed", map[string]any{"state": "failed", "message": "bad", "user": "devuser"}, "login failed forward failed"},
+		{"busy", map[string]any{"state": "busy", "user": "other"}, "login busy forward failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			prev := log.Writer()
+			log.SetOutput(&buf)
+			defer log.SetOutput(prev)
+
+			h := newLoginHarness(t)
+			sess, _ := h.newSession("s1", "sub1", "")
+			sess.writeFn = func(controlMessage) error { return errors.New("stream closed") }
+			_, _ = h.u.gateViewer(sess)
+			h.u.handleLoginFrame(loginJSON(tc.frame))
+			if !strings.Contains(buf.String(), "[frame:m1] "+tc.want+": stream closed") {
+				t.Fatalf("missing %q in log:\n%s", tc.want, buf.String())
+			}
+		})
+	}
+
+	t.Run("replay", func(t *testing.T) {
+		var buf bytes.Buffer
+		prev := log.Writer()
+		log.SetOutput(&buf)
+		defer log.SetOutput(prev)
+
+		h := newLoginHarness(t)
+		h.u.handleLoginFrame(loginJSON(map[string]any{"state": "prompt", "style": "echo_off", "message": "Password: "}))
+		sess, _ := h.newSession("s1", "sub1", "")
+		sess.writeFn = func(controlMessage) error { return errors.New("stream closed") }
+		h.u.replayPrompt(sess)
+		if !strings.Contains(buf.String(), "[frame:m1] login prompt replay forward failed: stream closed") {
+			t.Fatalf("missing replay failure in log:\n%s", buf.String())
+		}
+	})
 }

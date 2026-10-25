@@ -276,9 +276,7 @@ func (u *machineUpstream) handleLoginFrame(data []byte) {
 				return
 			}
 		}
-		if err := sess.writeControl(controlMessage{Type: "login", Data: data}); err != nil {
-			log.Printf("[frame:%s] login prompt forward failed: %v", u.id, err)
-		}
+		u.forwardLogin(sess, "prompt", data)
 	case "ok":
 		u.loginMu.Lock()
 		sess := u.login.authSess
@@ -300,7 +298,7 @@ func (u *machineUpstream) handleLoginFrame(data []byte) {
 		if sess == nil {
 			return
 		}
-		_ = sess.writeControl(controlMessage{Type: "login", Data: data})
+		u.forwardLogin(sess, "ok", data)
 		// The deferred frame-flow start for the authenticating viewer.
 		sess.deferredStart(u)
 	case "failed":
@@ -309,7 +307,7 @@ func (u *machineUpstream) handleLoginFrame(data []byte) {
 		u.loginMu.Unlock()
 		u.insertHostLogin(sess, f.User, "failed")
 		if sess != nil {
-			_ = sess.writeControl(controlMessage{Type: "login", Data: data})
+			u.forwardLogin(sess, "failed", data)
 		}
 	case "busy":
 		u.loginMu.Lock()
@@ -318,7 +316,7 @@ func (u *machineUpstream) handleLoginFrame(data []byte) {
 		u.loginMu.Unlock()
 		u.insertHostLogin(sess, f.User, "busy")
 		if sess != nil {
-			_ = sess.writeControl(controlMessage{Type: "login", Data: data})
+			u.forwardLogin(sess, "busy", data)
 			if u.deps != nil && u.deps.sessions != nil {
 				u.deps.sessions.endByID(sess.id, "host in use by "+f.User)
 			}
@@ -347,5 +345,13 @@ func (u *machineUpstream) replayPrompt(sess *Session) {
 			return
 		}
 	}
-	_ = sess.writeControl(controlMessage{Type: "login", Data: data})
+	u.forwardLogin(sess, "prompt replay", data)
+}
+
+// forwardLogin sends a hostd login frame to the viewer as a "login" control
+// message, logging (not failing) when the control stream write fails.
+func (u *machineUpstream) forwardLogin(sess *Session, what string, data []byte) {
+	if err := sess.writeControl(controlMessage{Type: "login", Data: data}); err != nil {
+		log.Printf("[frame:%s] login %s forward failed: %v", u.id, what, err)
+	}
 }
