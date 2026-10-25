@@ -9,6 +9,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 #![allow(clippy::all)]
 
 include!(concat!(env!("OUT_DIR"), "/iddcx_bindings.rs"));
@@ -16,6 +17,8 @@ include!(concat!(env!("OUT_DIR"), "/iddcx_version.rs"));
 
 /// IddCxStub.lib resolves this from the client driver; it declares the
 /// minimum IddCx version the driver requires (IDDCX_MINIMUM_VERSION_REQUIRED).
+/// IddCx refuses to load the driver on an older framework, so every entry
+/// point up to that version is guaranteed to be present in `IddFunctions`.
 #[unsafe(no_mangle)]
 pub static IddMinimumVersionRequired: u32 = FLUX_IDDCX_MINIMUM_VERSION_REQUIRED;
 
@@ -51,19 +54,6 @@ macro_rules! iddcx_call_void {
     };
 }
 
-macro_rules! iddcx_function_available {
-    ($pfn:ident @ $idx:ident) => {{
-        unsafe {
-            (*(&raw const IddFunctions))
-                .as_ptr()
-                .add($idx as usize)
-                .cast::<$pfn>()
-                .read()
-                .is_some()
-        }
-    }};
-}
-
 iddcx_call!(IddCxDeviceInitConfig: PFN_IDDCXDEVICEINITCONFIG @ _IDDFUNCENUM_IddCxDeviceInitConfigTableIndex(
     device_init: *mut WDFDEVICE_INIT,
     config: *const IDD_CX_CLIENT_CONFIG,
@@ -80,17 +70,6 @@ iddcx_call_void!(IddCxAdapterSetRenderAdapter: PFN_IDDCXADAPTERSETRENDERADAPTER 
     in_args: *const IDARG_IN_ADAPTERSETRENDERADAPTER,
 ));
 
-/// Rust equivalent of the IddCx `IDD_IS_FUNCTION_AVAILABLE` macro.
-///
-/// The macro is defined in the WDK header and is not emitted by bindgen. It
-/// checks the function table entry so a 1.4-built driver can run on older
-/// IddCx versions without dereferencing an unavailable entry point.
-pub unsafe fn idd_cx_adapter_set_render_adapter_available() -> bool {
-    iddcx_function_available!(
-        PFN_IDDCXADAPTERSETRENDERADAPTER @
-        _IDDFUNCENUM_IddCxAdapterSetRenderAdapterTableIndex
-    )
-}
 iddcx_call!(IddCxMonitorCreate: PFN_IDDCXMONITORCREATE @ _IDDFUNCENUM_IddCxMonitorCreateTableIndex(
     adapter: IDDCX_ADAPTER,
     in_args: *const IDARG_IN_MONITORCREATE,

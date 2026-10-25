@@ -15,10 +15,9 @@ mod bindings;
 mod ioctl;
 mod swapchain;
 
-use core::ffi::c_void;
 use core::mem::size_of;
 use core::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, ULONG, WDFDEVICE,
@@ -35,7 +34,7 @@ const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC0000023u32 as NTSTATUS;
 const STATUS_DEVICE_BUSY: NTSTATUS = 0x80000011u32 as NTSTATUS;
 const STATUS_DEVICE_NOT_READY: NTSTATUS = 0xC00000A3u32 as NTSTATUS;
 const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC0000010u32 as NTSTATUS;
-const STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN: NTSTATUS = 0xC01E0003u32 as NTSTATUS;
+const STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN: NTSTATUS = 0xC01E0012u32 as NTSTATUS;
 const STATUS_INIT_NOT_ATTEMPTED: NTSTATUS = 0xFFFFFFFFu32 as NTSTATUS;
 
 /// Device interface used by flux-server to find and control the driver:
@@ -60,6 +59,40 @@ const DEFAULT_MODES: &[(u32, u32, u32)] = &[
     (1280, 720, 60),
     (1024, 768, 60),
 ];
+
+/// Upper bounds for modes requested through `IOCTL_FLUXIDD_PLUG_IN`. They keep
+/// the derived signal timings (`hSyncFreq`, `pixelRate`) in range and reject
+/// sizes no D3D11 render target can back.
+const MAX_MODE_DIMENSION: u32 = 16384;
+const MAX_MODE_REFRESH_HZ: u32 = 1000;
+
+/// NUL-terminated UTF-16 copy of an ASCII literal, built at compile time.
+const fn ascii_to_wide<const N: usize>(s: &str) -> [u16; N] {
+    let bytes = s.as_bytes();
+    assert!(
+        bytes.len() < N,
+        "buffer must leave room for the NUL terminator"
+    );
+    let mut wide = [0u16; N];
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii(), "only ASCII literals are supported");
+        wide[i] = bytes[i] as u16;
+        i += 1;
+    }
+    wide
+}
+
+macro_rules! wide {
+    ($s:literal) => {{
+        const WIDE: [u16; $s.len() + 1] = ascii_to_wide($s);
+        &WIDE
+    }};
+}
+
+static ADAPTER_FRIENDLY_NAME: &[u16] = wide!("Flux Virtual Display Adapter");
+static ADAPTER_MANUFACTURER: &[u16] = wide!("Rustcast");
+static ADAPTER_MODEL: &[u16] = wide!("FluxIdd");
 
 /// Single-adapter, single-monitor driver state. IddCx context plumbing in C
 /// uses per-object WDF contexts; with exactly one virtual adapter and monitor
@@ -152,7 +185,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
         );
     }
 
-    let mut idd_config = idd::IDD_CX_CLIENT_CONFIG {
+    let idd_config = idd::IDD_CX_CLIENT_CONFIG {
         Size: size_of::<idd::IDD_CX_CLIENT_CONFIG>() as u32,
         EvtIddCxDeviceIoControl: Some(ioctl::evt_io_device_control),
         EvtIddCxAdapterInitFinished: Some(evt_adapter_init_finished),
@@ -165,7 +198,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, device_init: *mut WDFDEVICE_INI
         ..Default::default()
     };
 
-    let status = unsafe { idd::IddCxDeviceInitConfig(device_init as *mut _, &mut idd_config) };
+    let status = unsafe { idd::IddCxDeviceInitConfig(device_init as *mut _, &idd_config) };
     STATE.lock().unwrap().device_init_config_status = status;
     if status < 0 {
         return status;
@@ -217,19 +250,17 @@ extern "C" fn evt_device_d0_entry(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
-    // Leaked: adapter init is asynchronous, so IddCx may read the diagnostic
-    // strings/version after this function returns. One-time allocation.
-    let firmware_version: &'static mut idd::IDDCX_ENDPOINT_VERSION =
-        Box::leak(Box::new(idd::IDDCX_ENDPOINT_VERSION {
+    // Adapter init is asynchronous, so IddCx may read the diagnostic strings
+    // and version after this function returns: they must outlive the call.
+    // D0 entry runs again on every power-up, so allocate the version once.
+    static FIRMWARE_VERSION: OnceLock<usize> = OnceLock::new();
+    let firmware_version = *FIRMWARE_VERSION.get_or_init(|| {
+        Box::into_raw(Box::new(idd::IDDCX_ENDPOINT_VERSION {
             Size: size_of::<idd::IDDCX_ENDPOINT_VERSION>() as u32,
             MajorVer: 1,
             ..Default::default()
-        }));
-
-    let friendly_name: &'static [u16] =
-        Vec::leak("Flux Virtual Display Adapter\0".encode_utf16().collect());
-    let manufacturer: &'static [u16] = Vec::leak("Rustcast\0".encode_utf16().collect());
-    let model: &'static [u16] = Vec::leak("FluxIdd\0".encode_utf16().collect());
+        })) as usize
+    }) as *mut idd::IDDCX_ENDPOINT_VERSION;
 
     let mut caps = idd::IDDCX_ADAPTER_CAPS {
         Size: size_of::<idd::IDDCX_ADAPTER_CAPS>() as u32,
@@ -241,9 +272,9 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
         idd::IDDCX_FEATURE_IMPLEMENTATION_IDDCX_FEATURE_IMPLEMENTATION_NONE;
     caps.EndPointDiagnostics.TransmissionType =
         idd::IDDCX_TRANSMISSION_TYPE_IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
-    caps.EndPointDiagnostics.pEndPointFriendlyName = friendly_name.as_ptr();
-    caps.EndPointDiagnostics.pEndPointManufacturerName = manufacturer.as_ptr();
-    caps.EndPointDiagnostics.pEndPointModelName = model.as_ptr();
+    caps.EndPointDiagnostics.pEndPointFriendlyName = ADAPTER_FRIENDLY_NAME.as_ptr();
+    caps.EndPointDiagnostics.pEndPointManufacturerName = ADAPTER_MANUFACTURER.as_ptr();
+    caps.EndPointDiagnostics.pEndPointModelName = ADAPTER_MODEL.as_ptr();
     caps.EndPointDiagnostics.pFirmwareVersion = firmware_version;
     caps.EndPointDiagnostics.pHardwareVersion = firmware_version;
     {
@@ -262,14 +293,14 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
             idd::_WDF_SYNCHRONIZATION_SCOPE_WdfSynchronizationScopeInheritFromParent,
         ..Default::default()
     };
-    let mut init = idd::IDARG_IN_ADAPTER_INIT {
+    let init = idd::IDARG_IN_ADAPTER_INIT {
         WdfDevice: device as idd::WDFDEVICE,
         pCaps: &mut caps,
         ObjectAttributes: &mut object_attributes,
     };
 
     let mut out = idd::IDARG_OUT_ADAPTER_INIT::default();
-    let status = unsafe { idd::IddCxAdapterInitAsync(&mut init, &mut out) };
+    let status = unsafe { idd::IddCxAdapterInitAsync(&init, &mut out) };
     let mut state = STATE.lock().unwrap();
     state.adapter_init_async_status = status;
     state.adapter_handle_nonnull = (!out.AdapterObject.is_null()) as u32;
@@ -280,14 +311,6 @@ fn init_adapter(device: WDFDEVICE) -> NTSTATUS {
 }
 
 fn prefer_discrete_render_adapter(adapter: idd::IDDCX_ADAPTER) {
-    let available = unsafe { idd::idd_cx_adapter_set_render_adapter_available() };
-    if !available {
-        wdk::println!(
-            "[FluxIdd] Render adapter preference skipped: IddCxAdapterSetRenderAdapter unavailable"
-        );
-        return;
-    }
-
     let candidates = match swapchain::choose_render_adapter() {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -333,6 +356,18 @@ fn prefer_discrete_render_adapter(adapter: idd::IDDCX_ADAPTER) {
 }
 
 pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTATUS {
+    let requested = (
+        if width == 0 { 1920 } else { width },
+        if height == 0 { 1080 } else { height },
+        if refresh_hz == 0 { 60 } else { refresh_hz },
+    );
+    if requested.0 > MAX_MODE_DIMENSION
+        || requested.1 > MAX_MODE_DIMENSION
+        || requested.2 > MAX_MODE_REFRESH_HZ
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     let (adapter, old_preferred) = {
         let mut state = STATE.lock().unwrap();
         if !state.adapter_ready || state.adapter.is_null() {
@@ -354,11 +389,7 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
 
         state.monitor_operation_in_progress = true;
         let old_preferred = state.preferred;
-        state.preferred = (
-            if width == 0 { 1920 } else { width },
-            if height == 0 { 1080 } else { height },
-            if refresh_hz == 0 { 60 } else { refresh_hz },
-        );
+        state.preferred = requested;
         (state.adapter, old_preferred)
     };
 
@@ -385,12 +416,12 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
         Data4: [0x8d, 0x6e, 0x7f, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e],
     };
 
-    let mut create = idd::IDARG_IN_MONITORCREATE {
+    let create = idd::IDARG_IN_MONITORCREATE {
         ObjectAttributes: ptr::null_mut(),
         pMonitorInfo: &mut monitor_info,
     };
     let mut create_out = idd::IDARG_OUT_MONITORCREATE::default();
-    let status = unsafe { idd::IddCxMonitorCreate(adapter, &mut create, &mut create_out) };
+    let status = unsafe { idd::IddCxMonitorCreate(adapter, &create, &mut create_out) };
     if status < 0 {
         let mut state = STATE.lock().unwrap();
         state.preferred = old_preferred;
@@ -401,6 +432,14 @@ pub(crate) fn plug_in_monitor(width: u32, height: u32, refresh_hz: u32) -> NTSTA
     let mut arrival_out = idd::IDARG_OUT_MONITORARRIVAL::default();
     let status = unsafe { idd::IddCxMonitorArrival(create_out.MonitorObject, &mut arrival_out) };
     if status < 0 {
+        // The monitor never arrived, so no departure will release it; delete
+        // it so a retried plug-in does not leak monitor objects.
+        unsafe {
+            call_unsafe_wdf_function_binding!(
+                WdfObjectDelete,
+                create_out.MonitorObject as wdk_sys::WDFOBJECT,
+            );
+        }
         let processor = {
             let mut state = STATE.lock().unwrap();
             state.preferred = old_preferred;
@@ -671,7 +710,7 @@ extern "C" fn evt_monitor_assign_swapchain(
     match swapchain::SwapChainProcessor::start(
         in_args.hSwapChain,
         in_args.RenderAdapterLuid,
-        in_args.hNextSurfaceAvailable as *mut c_void,
+        in_args.hNextSurfaceAvailable,
     ) {
         Ok(processor) => {
             let mut state = STATE.lock().unwrap();

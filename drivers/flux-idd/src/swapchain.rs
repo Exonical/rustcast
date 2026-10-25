@@ -7,7 +7,7 @@ use core::ffi::c_void;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-use windows::Win32::Foundation::{HANDLE, HMODULE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE, LUID, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
@@ -16,8 +16,11 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIDevice, IDXGIFactory5,
 };
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-use windows::core::Interface;
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent,
+    WaitForMultipleObjects,
+};
+use windows::core::{Interface, w};
 
 use crate::bindings as idd;
 
@@ -183,12 +186,23 @@ impl SwapChainProcessor {
             .spawn(move || {
                 let args = args;
                 let _ = started_tx.send(());
+
+                // Like Microsoft's sample, register with MMCSS so frame
+                // processing keeps up under CPU load. Best effort.
+                let mut task_index = 0u32;
+                let mmcss =
+                    unsafe { AvSetMmThreadCharacteristicsW(w!("Distribution"), &mut task_index) };
+
                 run_core(
                     args.swapchain,
                     &args.device,
                     args.new_frame_event,
                     args.terminate_event,
                 );
+
+                if let Ok(mmcss) = mmcss {
+                    let _ = unsafe { AvRevertMmThreadCharacteristics(mmcss) };
+                }
 
                 // Delete the swap-chain object to unblock IddCx teardown.
                 unsafe {
@@ -198,7 +212,12 @@ impl SwapChainProcessor {
                     );
                 }
             })
-            .map_err(|_| 0xC000009Au32 as i32)?;
+            .map_err(|_| {
+                unsafe {
+                    let _ = CloseHandle(terminate_event);
+                }
+                0xC000009Au32 as i32
+            })?;
         let _ = started_rx.recv();
 
         Ok(Self {
@@ -216,6 +235,9 @@ impl Drop for SwapChainProcessor {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        unsafe {
+            let _ = CloseHandle(self.terminate_event);
+        }
     }
 }
 
@@ -230,10 +252,10 @@ fn run_core(
         Err(_) => return,
     };
 
-    let mut set_device = idd::IDARG_IN_SWAPCHAINSETDEVICE {
+    let set_device = idd::IDARG_IN_SWAPCHAINSETDEVICE {
         pDevice: dxgi_device.as_raw() as *mut _,
     };
-    let hr = unsafe { idd::IddCxSwapChainSetDevice(swapchain, &mut set_device) };
+    let hr = unsafe { idd::IddCxSwapChainSetDevice(swapchain, &set_device) };
     if hr < 0 {
         return;
     }

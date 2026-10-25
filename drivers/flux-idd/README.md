@@ -38,14 +38,18 @@ Prerequisites:
    `rust-toolchain.toml` installs/selects it, plus `rustfmt` and `clippy`)
 5. `cargo install cargo-make --no-default-features --features tls-native`
 
-The driver is intentionally pinned to the **IddCx 1.4** header ABI. `build.rs`
-selects `um\iddcx\1.4\IddCx.h` explicitly and fails if that directory is absent;
-it must not silently switch to a newer WDK directory because bindgen structure
-layouts are part of the driver ABI. The generated bindings, `IddMinimumVersionRequired`,
-and the `IddCx0102` UMDF extension declaration in the INF are kept aligned with
-the Microsoft IddCx sample's 1.4 client configuration. The UMDF target remains
-2.31; WDK 10.0.26100 provides both pins. The INF deliberately targets Windows
-11 and later through its `10.0...22000` decoration.
+The driver is intentionally pinned to the **IddCx 1.10** header ABI and requires
+IddCx 1.10 at runtime (`IddMinimumVersionRequired = 10`). `build.rs` selects
+`um\iddcx\1.10\IddCx.h` explicitly and fails if that directory is absent; it
+must not silently switch to a newer WDK directory because bindgen structure
+layouts are part of the driver ABI. The INF's `IddCx0102` UMDF extension
+identifier is the same for every IddCx version and does not change with the
+header pin. The UMDF target remains 2.31; WDK 10.0.26100 provides both pins.
+
+Supported OS: Windows 11 22H2 (build 22621, September 2023 update or later),
+23H2, 24H2, 25H2 and newer, enforced by the INF's `10.0...22621` decoration.
+Windows 10, Windows 11 21H2 and Windows Server 2022 ship older IddCx versions
+and are not supported; IddCx refuses to load the driver there.
 
 Build & package:
 
@@ -121,6 +125,6 @@ System log around the failure timestamp.
 
 ## Status
 
-Compiles and links against WDK 10.0.26100 (UMDF 2.31, IddCx 1.4). Runtime
+Compiles and links against WDK 10.0.26100 (UMDF 2.31, IddCx 1.10). Runtime
 behavior (monitor arrival, mode list, swap-chain processing) not yet verified
 on a test machine.
