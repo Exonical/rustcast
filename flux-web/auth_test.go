@@ -428,6 +428,20 @@ func TestOIDCFlowEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("state mismatch expected 400, got %d", resp.StatusCode)
 	}
+
+	// An id_token carrying a different nonce is rejected.
+	fake.nonce = "not-the-login-nonce"
+	nonceReq, _ := http.NewRequest(http.MethodGet,
+		server.URL+"/auth/callback?state="+url.QueryEscape(state)+"&code=fake-code", nil)
+	nonceReq.AddCookie(oauthCookie)
+	resp, err = client.Do(nonceReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("nonce mismatch expected 401, got %d", resp.StatusCode)
+	}
 }
 
 // The static guard sends unauthenticated HTML navigations to login and
