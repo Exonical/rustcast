@@ -53,3 +53,4 @@ muda = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
+thiserror = { workspace = true }
