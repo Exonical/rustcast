@@ -4,7 +4,7 @@
 use crate::osuser::OsUser;
 use crate::pam_session::PamSessionGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub enum SessionState {
@@ -36,7 +36,7 @@ impl<'a> Drop for Claim<'a> {
     /// success so this is a no-op there.
     fn drop(&mut self) {
         if !self.done {
-            *self.mgr.claim.lock().unwrap() = None;
+            *self.mgr.lock_claim() = None;
         }
     }
 }
@@ -59,6 +59,17 @@ impl SessionManager {
         }
     }
 
+    // The critical sections below are plain Option/String mutations that
+    // leave the state valid even if a holder panics, so recover from poison
+    // instead of wedging every later login (same idiom as flux-input sink.rs).
+    fn lock_inner(&self) -> MutexGuard<'_, Option<ActiveSession>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_claim(&self) -> MutexGuard<'_, Option<String>> {
+        self.claim.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Monotonic counter of lock/attach/logout events.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
@@ -66,10 +77,10 @@ impl SessionManager {
 
     /// Current occupancy for the login check.
     pub fn state(&self) -> SessionState {
-        if let Some(user) = self.claim.lock().unwrap().clone() {
+        if let Some(user) = self.lock_claim().clone() {
             return SessionState::Claimed { user };
         }
-        let guard = self.inner.lock().unwrap();
+        let guard = self.lock_inner();
         match guard.as_ref() {
             None => SessionState::Free,
             Some(s) if s.locked_since.is_some() => SessionState::Locked {
@@ -84,10 +95,10 @@ impl SessionManager {
     /// Atomically claim the session slot for a fresh login. Returns None if a
     /// session or another claim already exists.
     pub fn try_claim(&self, user: &str) -> Option<Claim<'_>> {
-        if self.inner.lock().unwrap().is_some() {
+        if self.lock_inner().is_some() {
             return None;
         }
-        let mut claim = self.claim.lock().unwrap();
+        let mut claim = self.lock_claim();
         if claim.is_some() {
             return None;
         }
@@ -97,8 +108,8 @@ impl SessionManager {
 
     /// Install a freshly created session as active (consumes the claim).
     pub fn open(&self, user: OsUser, pam_guard: PamSessionGuard) {
-        *self.claim.lock().unwrap() = None;
-        *self.inner.lock().unwrap() = Some(ActiveSession {
+        *self.lock_claim() = None;
+        *self.lock_inner() = Some(ActiveSession {
             user,
             pam_guard: Some(pam_guard),
             locked_since: None,
@@ -108,7 +119,7 @@ impl SessionManager {
     /// Atomically re-attach a locked session for `user`; false when the
     /// session isn't locked by that user (already taken by another login).
     pub fn try_attach(&self, user: &str) -> bool {
-        if let Some(s) = self.inner.lock().unwrap().as_mut() {
+        if let Some(s) = self.lock_inner().as_mut() {
             if s.locked_since.is_some() && s.user.name == user {
                 s.locked_since = None;
                 self.generation.fetch_add(1, Ordering::SeqCst);
@@ -121,7 +132,7 @@ impl SessionManager {
     /// Mark the current session locked (relay dropped / lock command).
     /// Returns the user.
     pub fn lock(&self) -> Option<String> {
-        if let Some(s) = self.inner.lock().unwrap().as_mut() {
+        if let Some(s) = self.lock_inner().as_mut() {
             s.locked_since = Some(Instant::now());
             self.generation.fetch_add(1, Ordering::SeqCst);
             return Some(s.user.name.clone());
@@ -132,7 +143,7 @@ impl SessionManager {
     /// Take the session out (for logout). Caller runs cleanup.
     pub fn take(&self) -> Option<ActiveSession> {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        self.inner.lock().unwrap().take()
+        self.lock_inner().take()
     }
 }
 
@@ -173,7 +184,7 @@ mod tests {
     fn attach_only_for_locked_same_user() {
         let mgr = SessionManager::new(Duration::ZERO);
         // Simulate an installed session without a pam guard by poking state.
-        *mgr.inner.lock().unwrap() = Some(ActiveSession {
+        *mgr.lock_inner() = Some(ActiveSession {
             user: user("a"),
             pam_guard: None,
             locked_since: Some(Instant::now()),
@@ -183,5 +194,27 @@ mod tests {
         // Second attach for the same user now fails (already active).
         assert!(!mgr.try_attach("a"));
         assert!(matches!(mgr.state(), SessionState::Active { .. }));
+    }
+
+    #[test]
+    fn poisoned_locks_do_not_wedge_logins() {
+        let mgr = SessionManager::new(Duration::ZERO);
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _claim = mgr.claim.lock().unwrap();
+                    let _inner = mgr.inner.lock().unwrap();
+                    panic!("poison both locks");
+                })
+                .join();
+        });
+        assert!(mgr.claim.is_poisoned() && mgr.inner.is_poisoned());
+        assert!(matches!(mgr.state(), SessionState::Free));
+        let claim = mgr.try_claim("a").unwrap();
+        assert!(mgr.try_claim("b").is_none());
+        drop(claim);
+        assert!(mgr.try_claim("b").is_some());
+        assert!(mgr.lock().is_none());
+        assert!(mgr.take().is_none());
     }
 }
