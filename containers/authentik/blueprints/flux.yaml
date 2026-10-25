@@ -70,3 +70,69 @@ entries:
       connector: !KeyOf flux-agent-connector
       key: !Env FLUX_AK_ENROLLMENT_TOKEN
       expiring: false
+
+  # LDAP outpost so hosts can log users in through SSSD (community-friendly
+  # alternative to the Enterprise-only pam_authentik interactive auth).
+  # Explicit POSIX ids exposed through the LDAP outpost (string attributes win
+  # over uid/gid_start_number + pk). Keep local accounts (devuser 2101/8001)
+  # out of these ranges.
+  - model: authentik_core.user
+    identifiers:
+      username: akadmin
+    attrs:
+      attributes:
+        uidNumber: "3001"
+        gidNumber: "9001"
+  - model: authentik_core.group
+    identifiers:
+      name: flux-users
+    attrs:
+      attributes:
+        gidNumber: "9001"
+      users:
+        - !Find [authentik_core.user, [username, akadmin]]
+  - model: authentik_core.user
+    id: flux-ldap-svc
+    identifiers:
+      username: ldapservice
+    attrs:
+      name: Flux LDAP service account
+      type: service_account
+      password: !Env FLUX_LDAP_BIND_PASSWORD
+      path: flux
+  - model: authentik_providers_ldap.ldapprovider
+    id: flux-ldap-provider
+    identifiers:
+      name: flux-ldap
+    attrs:
+      base_dn: "dc=ldap,dc=goauthentik,dc=io"
+      bind_mode: cached
+      search_mode: cached
+      uid_start_number: 2000
+      gid_start_number: 4000
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-authentication-flow]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+    # 2026.8 replaced search_group with this object permission.
+    permissions:
+      - permission: authentik_providers_ldap.search_full_directory
+        user: !KeyOf flux-ldap-svc
+  - model: authentik_core.application
+    id: flux-ldap-app
+    identifiers:
+      slug: flux-ldap
+    attrs:
+      name: Flux LDAP
+      provider: !KeyOf flux-ldap-provider
+  - model: authentik_outposts.outpost
+    id: flux-ldap-outpost
+    identifiers:
+      name: flux-ldap
+    attrs:
+      type: ldap
+      providers:
+        - !KeyOf flux-ldap-provider
+      config:
+        authentik_host: "http://localhost:9000"
+  # The outpost's auto-created token (identifier ak-outpost-<uuid>-api) can't
+  # be addressed by a blueprint — its key is pinned to FLUX_LDAP_OUTPOST_TOKEN
+  # by containers/ak-ldap-bootstrap.sh after the first apply.

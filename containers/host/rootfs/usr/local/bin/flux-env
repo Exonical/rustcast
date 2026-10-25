@@ -22,3 +22,20 @@ get() { env_of_init | sed -n "s/^$1=//p" | head -n1; }
 # Local test user password, injected at container start (never baked in).
 devpw=$(get FLUX_DEVUSER_PASSWORD || true)
 if [ -n "$devpw" ]; then echo "devuser:$devpw" | chpasswd; fi
+
+# pam_authentik interactive auth needs an Authentik Enterprise license; unlicensed
+# it answers with a hard auth error that blocks pam_unix/pam_sss. Off by default.
+if [ "$(get FLUX_PAM_AUTHENTIK || true)" != "true" ]; then
+  sed -i '/pam_authentik\.so/d' /etc/pam.d/flux
+fi
+
+# SSSD talks to the pod-local Authentik LDAP outpost. The bind password is
+# rendered at boot so it never lands in the image. FLUX_LDAP_URI can point at
+# an ldaps:// endpoint in production.
+ldap_pw=$(get FLUX_LDAP_BIND_PASSWORD || true)
+if [ -n "$ldap_pw" ]; then
+  (umask 077
+   FLUX_LDAP_URI=$(get FLUX_LDAP_URI || true) FLUX_LDAP_CA_CERT=$(get FLUX_LDAP_CA_CERT || true) \
+     flux-render-sssd "$ldap_pw" > /etc/sssd/sssd.conf)
+  chmod 600 /etc/sssd/sssd.conf
+fi

@@ -1,9 +1,15 @@
-# flux-hostd login: authentik device-domain users first, local passwd fallback.
-auth      [success=1 auth_err=die perm_denied=die default=ignore]  pam_authentik.so
-auth      required                    pam_unix.so
-account   required                    pam_unix.so broken_shadow
-account   [success=ok default=ignore] pam_authentik.so
-session   required                    pam_mkhomedir.so umask=0077
-session   required                    pam_unix.so
-session   optional                    pam_systemd.so
-session   optional                    pam_authentik.so
+# flux-hostd login: authentik device-domain first (inert without an
+# Enterprise license), then local/SSSD password auth.
+auth     [success=done auth_err=die perm_denied=die default=ignore]  pam_authentik.so
+auth     sufficient                                                  pam_unix.so
+auth     [default=1 ignore=ignore success=ok]                        pam_usertype.so isregular
+auth     sufficient                                                  pam_sss.so forward_pass
+auth     required                                                    pam_deny.so
+account  required                                                    pam_unix.so broken_shadow
+account  [default=bad success=ok user_unknown=ignore]                pam_sss.so
+account  [success=ok default=ignore]                                 pam_authentik.so
+session  required  pam_mkhomedir.so umask=0077
+session  required  pam_unix.so
+session  optional  pam_systemd.so
+session  optional  pam_sss.so
+session  optional  pam_authentik.so

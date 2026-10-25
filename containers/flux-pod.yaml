@@ -64,6 +64,8 @@ spec:
           value: "%%FLUX_DEVUSER_PASSWORD%%"
         - name: FLUX_AK_ENROLLMENT_TOKEN
           value: "%%FLUX_AK_ENROLLMENT_TOKEN%%"
+        - name: FLUX_LDAP_BIND_PASSWORD
+          value: "%%FLUX_LDAP_BIND_PASSWORD%%"
         - name: RUST_LOG
           value: "info"
       volumeMounts:
@@ -138,16 +140,41 @@ spec:
           value: "authentik"
         - name: AUTHENTIK_POSTGRESQL__PASSWORD
           value: "%%PG_PASS%%"
+        # The 2026.8 worker binary also opens HTTP/HTTPS/metrics listeners;
+        # the pod shares one network namespace, so keep them off the server's
+        # 9000/9443/9300 or the server crash-loops on "address already in use".
+        - name: AUTHENTIK_LISTEN__HTTP
+          value: "127.0.0.1:9001"
+        - name: AUTHENTIK_LISTEN__HTTPS
+          value: "127.0.0.1:9444"
+        - name: AUTHENTIK_LISTEN__METRICS
+          value: "127.0.0.1:9301"
         - name: FLUX_AK_ENROLLMENT_TOKEN
           value: "%%FLUX_AK_ENROLLMENT_TOKEN%%"
         - name: FLUX_OIDC_CLIENT_SECRET
           value: "%%FLUX_OIDC_CLIENT_SECRET%%"
+        - name: FLUX_LDAP_OUTPOST_TOKEN
+          value: "%%FLUX_LDAP_OUTPOST_TOKEN%%"
+        - name: FLUX_LDAP_BIND_PASSWORD
+          value: "%%FLUX_LDAP_BIND_PASSWORD%%"
       volumeMounts:
         - name: authentik-media
           mountPath: /media
         - name: authentik-blueprints
           mountPath: /blueprints/custom
           readOnly: true
+    - name: authentik-ldap
+      image: ghcr.io/goauthentik/ldap:2026.8.4
+      env:
+        - name: AUTHENTIK_HOST
+          value: "http://localhost:9000"
+        - name: AUTHENTIK_INSECURE
+          value: "true"
+        - name: AUTHENTIK_TOKEN
+          value: "%%FLUX_LDAP_OUTPOST_TOKEN%%"
+        # Outposts default their metrics listener to :9300 too.
+        - name: AUTHENTIK_LISTEN__METRICS
+          value: "127.0.0.1:9302"
   volumes:
     - name: dri-render-dgpu
       hostPath:
