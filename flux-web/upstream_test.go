@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 func pooledFrame(pool *frameBufferPool, frame frameMsg) frameMsg {
@@ -473,4 +475,93 @@ func TestStageStatsReportsWorstCaseSeparatelyFromAverage(t *testing.T) {
 	if empty := (&stageStats{}).summary(); empty != "" {
 		t.Fatalf("idle window summary = %q, want empty", empty)
 	}
+}
+
+func encodeHostFrame(kind byte, ts uint64, data []byte) []byte {
+	var header [13]byte
+	header[0] = kind
+	binary.BigEndian.PutUint64(header[1:9], ts)
+	binary.BigEndian.PutUint32(header[9:13], uint32(len(data)))
+	return append(header[:], data...)
+}
+
+type resetReader struct {
+	data []byte
+	err  error
+}
+
+func (r *resetReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestReadFramesWarnsAndSkipsInvalidCursorJSON(t *testing.T) {
+	u := newMachineUpstream("", "", nil, func(string) {})
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	go func() {
+		defer writer.Close()
+		_, _ = writer.Write(encodeHostFrame(0x02, 1, []byte("{not json")))
+		_, _ = writer.Write(encodeHostFrame(0x02, 2, []byte(`{"visible":false}`)))
+	}()
+	if err := u.readFrames(reader); !errors.Is(err, io.EOF) {
+		t.Fatalf("readFrames = %v, want EOF", err)
+	}
+	if u.lastCursor.tsMicros != 2 || string(u.lastCursor.data) != `{"visible":false}` {
+		t.Fatalf("lastCursor = %+v, want only the valid cursor", u.lastCursor)
+	}
+}
+
+func TestReadFramesRejectsInvalidLength(t *testing.T) {
+	u := newMachineUpstream("", "", nil, func(string) {})
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	go func() {
+		defer writer.Close()
+		var header [13]byte
+		header[0] = 0x01
+		_, _ = writer.Write(header[:])
+	}()
+	if err := u.readFrames(reader); err == nil || err.Error() != "invalid frame length: 0" {
+		t.Fatalf("readFrames = %v, want invalid frame length", err)
+	}
+}
+
+func TestReadQUICStreamSkipsOnlyPeerResets(t *testing.T) {
+	u := newMachineUpstream("", "", nil, func(string) {})
+	var frameCount uint64
+	reset := &quic.StreamError{StreamID: 3, Remote: true}
+	video := encodeHostFrame(0x01, 7, pFrame(1).data)
+	for name, data := range map[string][]byte{"before header": nil, "mid header": video[:5], "mid payload": video[:15]} {
+		if err := u.readQUICStream(&resetReader{data: data, err: reset}, &frameCount); err != nil {
+			t.Fatalf("%s: reset stream = %v, want skipped", name, err)
+		}
+	}
+	if len(u.frameChan) != 0 || frameCount != 0 || cachedFrameBuffers(&u.frameBuffers) != 1 {
+		t.Fatalf("reset streams leaked frames: queued=%d count=%d cached=%d", len(u.frameChan), frameCount, cachedFrameBuffers(&u.frameBuffers))
+	}
+
+	for name, stream := range map[string]io.Reader{
+		"truncated":      bytes.NewReader(video[:15]),
+		"invalid length": bytes.NewReader(make([]byte, 13)),
+		"local cancel":   &resetReader{err: &quic.StreamError{StreamID: 3}},
+		"unknown type":   bytes.NewReader(encodeHostFrame(0x7f, 0, []byte{1})),
+	} {
+		if err := u.readQUICStream(stream, &frameCount); err == nil {
+			t.Fatalf("%s: readQUICStream = nil, want fatal error", name)
+		}
+	}
+
+	if err := u.readQUICStream(bytes.NewReader(video), &frameCount); err != nil {
+		t.Fatalf("complete stream = %v", err)
+	}
+	frame := <-u.frameChan
+	if frameCount != 1 || frame.tsMicros != 7 || !bytes.Equal(frame.data, pFrame(1).data) {
+		t.Fatalf("video frame = %+v (count=%d)", frame, frameCount)
+	}
+	frame.release()
 }
