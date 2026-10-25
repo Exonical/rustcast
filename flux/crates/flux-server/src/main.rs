@@ -230,26 +230,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unplug()
                 .map_err(|e| format!("unplug existing virtual display: {e}"))?;
             let display_count_before_unplug = before_names.len();
-            let unplug_deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let after_unplug = loop {
-                match capture_probe.enumerate_displays() {
-                    Ok(displays) if displays.len() < display_count_before_unplug => {
-                        break displays;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::debug!("waiting for existing virtual DXGI output removal: {e}")
-                    }
-                }
-                if std::time::Instant::now() >= unplug_deadline {
-                    drop(display);
-                    return Err(
-                        "existing virtual display could not be removed within 2 seconds"
-                            .into(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            let Some(after_unplug) = capture_loop::wait_for_displays(
+                capture_probe.as_ref(),
+                std::time::Duration::from_secs(2),
+                "existing virtual DXGI output removal",
+                |displays| (displays.len() < display_count_before_unplug).then_some(displays),
+            ) else {
+                drop(display);
+                return Err("existing virtual display could not be removed within 2 seconds".into());
             };
             before_names = after_unplug
                 .into_iter()
@@ -259,27 +247,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .plug_in_mode(vd.width, vd.height, vd.refresh_hz)
                 .map_err(|e| format!("re-plug virtual display: {e}"))?;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let target = loop {
-            if std::time::Instant::now() >= deadline {
-                drop(display);
-                return Err(
-                    "virtual display plugged in but no new DXGI output appeared within 10 seconds"
-                        .into(),
-                );
-            }
-            match capture_probe.enumerate_displays() {
-                Ok(displays) => {
-                    if let Some(display) = displays
-                        .into_iter()
-                        .find(|display| !before_names.contains(&display.name))
-                    {
-                        break display;
-                    }
-                }
-                Err(e) => tracing::debug!("waiting for virtual DXGI output: {e}"),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let Some(target) = capture_loop::wait_for_displays(
+            capture_probe.as_ref(),
+            std::time::Duration::from_secs(10),
+            "virtual DXGI output",
+            |displays| displays.into_iter().find(|output| !before_names.contains(&output.name)),
+        ) else {
+            drop(display);
+            return Err("virtual display plugged in but no new DXGI output appeared within 10 seconds".into());
         };
         tracing::info!(
             "Virtual display is available as DXGI output {} on adapter LUID {:?}",
@@ -294,31 +269,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("configure virtual display topology: {e}"))?;
 
-        let configured_deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let target = loop {
-            if std::time::Instant::now() >= configured_deadline {
-                drop(display);
-                return Err(format!(
-                    "virtual display {} did not appear at configured mode {}x{}@{}Hz after CCD apply",
-                    target.name, vd.width, vd.height, vd.refresh_hz
-                )
-                .into());
-            }
-            match capture_probe.enumerate_displays() {
-                Ok(displays) => {
-                    if let Some(display) = displays.into_iter().find(|display| {
-                        display.name == target.name
-                            && display.adapter_luid == target.adapter_luid
-                            && display.native_resolution.width == vd.width
-                            && display.native_resolution.height == vd.height
-                    }) {
-                        break display;
-                    }
-                }
-                Err(e) => tracing::debug!("waiting for configured virtual DXGI output: {e}"),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let Some(target) = capture_loop::wait_for_displays(
+            capture_probe.as_ref(),
+            std::time::Duration::from_secs(5),
+            "configured virtual DXGI output",
+            |displays| {
+                displays.into_iter().find(|output| {
+                    output.name == target.name
+                        && output.adapter_luid == target.adapter_luid
+                        && output.native_resolution.width == vd.width
+                        && output.native_resolution.height == vd.height
+                })
+            },
+        ) else {
+            drop(display);
+            return Err(format!(
+                "virtual display {} did not appear at configured mode {}x{}@{}Hz after CCD apply",
+                target.name, vd.width, vd.height, vd.refresh_hz
+            )
+            .into());
         };
         tracing::info!(
             "Virtual display configured as DXGI output {} at {}x{} on adapter LUID {:?}",
