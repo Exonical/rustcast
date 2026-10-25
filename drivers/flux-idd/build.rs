@@ -6,11 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // This ABI version is intentionally pinned; selecting the newest WDK
-// directory would silently change bindgen layouts.
+// directory would silently change bindgen layouts. IddCx 1.10 ships with
+// Windows 11 22H2 (September 2023 update) and later, so requiring it as the
+// minimum guarantees every 1.10 entry point is present in the function table.
 const IDDCX_VERSION_MAJOR: u32 = 1;
-const IDDCX_VERSION_MINOR: u32 = 4;
-const IDDCX_MINIMUM_VERSION_REQUIRED: u32 = 4;
-const IDDCX_VERSION_DIRECTORY: &str = "1.4";
+const IDDCX_VERSION_MINOR: u32 = 10;
+const IDDCX_MINIMUM_VERSION_REQUIRED: u32 = 10;
+const IDDCX_VERSION_DIRECTORY: &str = "1.10";
 
 // IddCx exposes its API as FORCEINLINE functions dispatching through the
 // IddCxFunctions table. Defining IDD_STUB before including iddcx.h makes the
