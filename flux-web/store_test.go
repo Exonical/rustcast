@@ -169,3 +169,42 @@ func TestPolicyAllowsEachMode(t *testing.T) {
 		}
 	}
 }
+
+func TestPurgeRemovesOldHostLogins(t *testing.T) {
+	st := testStore(t)
+	old := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, err := st.db.Exec(`INSERT INTO host_logins(ts,machine_id,machine_name,session_id,user_sub,user_name,client_ip,os_user,result)
+		VALUES(?,?,?,?,?,?,?,?,?)`, old, "m1", "", "s1", "", "", "", "devuser", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	st.insertLogin(hostLogin{MachineID: "m1", SessionID: "s2", OSUser: "devuser", Result: "ok"})
+	if _, err := st.purge(time.Now().Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.listLogins("", 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SessionID != "s2" {
+		t.Fatalf("expected only the fresh login row, got %+v", rows)
+	}
+}
+
+func TestAuditContentIncludesOSUser(t *testing.T) {
+	st := testStore(t)
+	st.insertAudit(auditEvent{
+		MachineID: "m1", Direction: "client_to_host", Result: "ok",
+		Mime: "text/plain;charset=utf-8", Data: []byte("hi"), OSUser: "devuser",
+	}, true)
+	list, err := st.listAudit("", 50, 0)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list: %v %v", list, err)
+	}
+	row, _, err := st.getAuditContent(list[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.OSUser != "devuser" {
+		t.Fatalf("os_user = %q", row.OSUser)
+	}
+}

@@ -12,10 +12,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   fetchClipboardAudit,
   fetchClipboardEvent,
+  fetchLogins,
   useMachines,
   useSessions,
   type ClipboardAuditDetail,
   type ClipboardAuditRow,
+  type LoginAuditRow,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
@@ -38,8 +40,10 @@ export function AuditPage() {
   const { me, loading: authLoading } = useAuth();
   const admin = !me?.auth_enabled || me?.admin === true;
 
+  const [tab, setTab] = useState<"clipboard" | "logins">("clipboard");
   const [machine, setMachine] = useState("");
   const [rows, setRows] = useState<ClipboardAuditRow[]>([]);
+  const [loginRows, setLoginRows] = useState<LoginAuditRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -48,6 +52,22 @@ export function AuditPage() {
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  const loadLogins = useCallback(async (machineId: string, before?: number) => {
+    if (before === undefined) setLoading(true);
+    else setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await fetchLogins({ machine: machineId || undefined, limit: PAGE_SIZE, before });
+      setLoginRows((prev) => (before === undefined ? page : [...prev, ...page]));
+      setHasMore(page.length === PAGE_SIZE);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Unable to load login audit");
+    } finally {
+      setLoading(false);
+      setLoadingMore(false);
+    }
+  }, []);
 
   const load = useCallback(async (machineId: string) => {
     setLoading(true);
@@ -65,11 +85,19 @@ export function AuditPage() {
 
   useEffect(() => {
     if (!admin || authLoading) return;
-    const initial = window.setTimeout(() => void load(machine), 0);
+    const initial = window.setTimeout(() => {
+      if (tab === "logins") void loadLogins(machine);
+      else void load(machine);
+    }, 0);
     return () => window.clearTimeout(initial);
-  }, [admin, authLoading, machine, load]);
+  }, [admin, authLoading, machine, tab, load, loadLogins]);
 
   const loadOlder = async () => {
+    if (tab === "logins") {
+      const oldest = loginRows[loginRows.length - 1];
+      if (oldest) await loadLogins(machine, oldest.id);
+      return;
+    }
     const oldest = rows[rows.length - 1];
     if (!oldest) return;
     setLoadingMore(true);
@@ -120,6 +148,15 @@ export function AuditPage() {
       {admin && (
         <>
           <div className="mb-5 flex items-center gap-3">
+            <div className="flex overflow-hidden rounded-lg border border-white/10 text-xs">
+              {(["clipboard", "logins"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`px-3 py-2 capitalize ${tab === t ? "bg-blue-400/15 text-blue-200" : "text-zinc-500 hover:bg-white/5"}`}
+                >{t === "clipboard" ? "Clipboard" : "Logins"}</button>
+              ))}
+            </div>
             <label className="text-xs font-medium text-zinc-500" htmlFor="audit-machine">Machine</label>
             <select
               id="audit-machine"
@@ -136,7 +173,42 @@ export function AuditPage() {
           </div>
 
           <Card className="overflow-hidden p-0">
-            {loading ? (
+            {tab === "logins" ? (
+              loading ? (
+                <div className="space-y-2 p-6">
+                  {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-9 w-full" />)}
+                </div>
+              ) : loginRows.length === 0 ? (
+                <div className="p-6">
+                  <EmptyState title="No host logins" detail="OS logins on the host are recorded here once a viewer signs in." />
+                </div>
+              ) : (
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-white/[0.07] text-[10px] uppercase tracking-[.13em] text-zinc-600">
+                      <th className="px-4 py-3 font-bold">Time</th>
+                      <th className="px-4 py-3 font-bold">Machine</th>
+                      <th className="hidden px-4 py-3 font-bold sm:table-cell">Relay user</th>
+                      <th className="px-4 py-3 font-bold">OS user</th>
+                      <th className="px-4 py-3 font-bold">Result</th>
+                      <th className="hidden px-4 py-3 font-bold md:table-cell">Client IP</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loginRows.map((row) => (
+                      <tr key={row.id} className="border-b border-white/[0.04]">
+                        <td className="px-4 py-2.5 text-zinc-400">{new Date(row.ts).toLocaleString()}</td>
+                        <td className="px-4 py-2.5 text-zinc-300">{row.machine_name || row.machine_id}</td>
+                        <td className="hidden px-4 py-2.5 text-zinc-400 sm:table-cell">{row.user_name || row.user_sub || "—"}</td>
+                        <td className="px-4 py-2.5 font-mono text-[11px] text-zinc-300">{row.os_user || "—"}</td>
+                        <td className="px-4 py-2.5"><Badge tone={resultTone(row.result)}>{row.result}</Badge></td>
+                        <td className="hidden px-4 py-2.5 text-zinc-500 md:table-cell">{row.client_ip || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )
+            ) : loading ? (
               <div className="space-y-2 p-6">
                 {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-9 w-full" />)}
               </div>

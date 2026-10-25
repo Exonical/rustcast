@@ -13,7 +13,7 @@ mod http;
 mod metrics;
 mod pipeline;
 mod quic_frames;
-mod registration;
+
 mod session;
 #[cfg(target_os = "windows")]
 mod ccd_display;
@@ -568,7 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capture_fps = config.video.max_fps.min(144);
     let forced_encoder = config.video.encoder;
     let default_quality_level = config.video.quality_level;
-    let runtime_status = Arc::new(std::sync::RwLock::new(registration::RuntimeStatus::default()));
+    let runtime_status = Arc::new(std::sync::RwLock::new(flux_core::registration::RuntimeStatus::default()));
     let runtime_status_capture = runtime_status.clone();
     let resolution_status_tx_capture = resolution_status_tx.clone();
     let initial_mode = config.video.virtual_display;
@@ -632,11 +632,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => format!("{frame_host}:{frame_port}"),
     };
-    let registration_stop = registration::start(
+    let machine_id_path = std::path::PathBuf::from(&config.security.cert_path)
+        .with_file_name("flux-machine-id");
+    let registration_stop = flux_core::registration::start(
         &config,
         &platform,
         advertised_frame_addr,
-        runtime_status,
+        runtime_status.clone(),
+        &machine_id_path,
     );
     tracing::info!("H.264 frame server listening on tcp://{}", frame_addr);
 
@@ -663,9 +666,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Report runtime status (encoder backend etc.) to flux-hostd when running
+    // as the per-user agent: written once the encoder backend is known.
+    if let Ok(agent_status_path) = std::env::var("FLUX_AGENT_STATUS_FILE") {
+        let status = runtime_status.clone();
+        tokio::spawn(async move {
+            let mut last = String::new();
+            loop {
+                let snapshot = status.read().ok().map(|s| {
+                    serde_json::json!({
+                        "encoder_backend": s.encoder_backend,
+                        "width": s.encode_width,
+                        "height": s.encode_height,
+                        "virtual_display": s.captured_virtual_display,
+                        "display_name": s.display_name,
+                    })
+                });
+                if let Some(json) = snapshot {
+                    let text = json.to_string();
+                    if text != last {
+                        let tmp = format!("{agent_status_path}.tmp");
+                        if std::fs::write(&tmp, &text).is_ok() {
+                            let _ = std::fs::rename(&tmp, &agent_status_path);
+                        }
+                        last = text;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
     // QUIC frame server on the same port number over UDP. Preferred by the
     // relay on lossy links (no head-of-line blocking); TCP remains as fallback.
-    let quic_handle = match frame_addr.parse::<std::net::SocketAddr>() {
+    let quic_handle = if !config.server.frame_quic {
+        None
+    } else {
+        match frame_addr.parse::<std::net::SocketAddr>() {
         Ok(bind_addr) => match quic_frames::make_endpoint(bind_addr, &cert_manager) {
             Ok(endpoint) => {
                 tracing::info!("H.264 frame server listening on quic://{}", frame_addr);
@@ -706,6 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             tracing::warn!("QUIC frame server bind address invalid: {} (TCP only)", e);
             None
+        }
         }
     };
 
@@ -2010,7 +2048,7 @@ fn capture_loop(
     mut virtual_display: Option<VirtualDisplayHandle>,
     initial_mode: Option<flux_core::config::VirtualDisplayConfig>,
     resolution_status_tx: tokio::sync::broadcast::Sender<ResolutionStatusMessage>,
-    runtime_status: Arc<std::sync::RwLock<registration::RuntimeStatus>>,
+    runtime_status: Arc<std::sync::RwLock<flux_core::registration::RuntimeStatus>>,
 ) {
     crate::metrics::set_host_info("unknown", &gpu_vendor, std::env::consts::OS);
     #[cfg(not(target_os = "windows"))]

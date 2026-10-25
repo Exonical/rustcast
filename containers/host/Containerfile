@@ -19,7 +19,7 @@ RUN dnf -y install dnf-plugins-core epel-release \
 FROM repos AS builder
 RUN dnf -y --setopt=install_weak_deps=False install \
       gcc gcc-c++ make clang clang-devel llvm-devel pkgconf-pkg-config curl \
-      pipewire-devel ffmpeg-devel x264-devel opus-devel \
+      pipewire-devel ffmpeg-devel x264-devel opus-devel pam-devel \
  && dnf clean all
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 WORKDIR /src/flux
@@ -32,7 +32,9 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     --mount=type=cache,target=/opt/cargo/git \
     --mount=type=cache,target=/src/flux/target \
     cargo build --release -p flux-server --no-default-features --features ${FLUX_FEATURES} \
- && install -D target/release/flux-server /out/flux-server
+ && cargo build --release -p flux-hostd \
+ && install -D target/release/flux-server /out/flux-server \
+ && install -D target/release/flux-hostd /out/flux-hostd
 
 # Mesa's Vulkan drivers built with video codecs enabled — Rocky 10 builds mesa
 # without VK_KHR_video_* (patented-codec strip), so RADV hardware encode needs
@@ -110,17 +112,23 @@ RUN dnf -y --setopt=install_weak_deps=False install \
  && dnf clean all
 COPY --from=mesa /out/usr/ /usr/
 COPY containers/host/rootfs/ /
+# authentik platform agent (repo file comes from the rootfs copy above).
+RUN dnf -y --setopt=install_weak_deps=False install \
+      authentik-sysd-0.72.3 authentik-cli-0.72.3 authentik-agent-0.72.3 \
+      libpam-authentik-0.72.3 libnss-authentik-0.72.3 \
+ && dnf clean all
 RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
- && useradd --create-home --uid 1000 --groups systemd-journal flux \
- && mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/flux \
+      /usr/local/bin/flux-ak-join \
+ && groupadd -g 8001 devgroup \
+ && useradd --no-create-home --uid 2101 --gid 8001 --groups systemd-journal devuser \
  && dconf update \
  && systemctl --global enable pipewire.socket pipewire.service wireplumber.service \
       pipewire-pulse.socket pipewire-pulse.service \
-      flux-gnome-session.service flux-server.service \
- && systemctl enable flux-env.service \
+ && systemctl enable flux-env.service flux-hostd.service flux-ak-join.service ak-sysd.service \
  && systemctl mask systemd-resolved.service polkit.service rtkit-daemon.service geoclue.service \
       systemd-networkd.service systemd-firstboot.service getty@tty1.service
 COPY --from=builder /out/flux-server /usr/local/bin/flux-server
+COPY --from=builder /out/flux-hostd /usr/local/bin/flux-hostd
 ENV container=podman
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

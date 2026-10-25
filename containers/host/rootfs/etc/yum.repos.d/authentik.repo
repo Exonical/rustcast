@@ -1,0 +1,6 @@
+[authentik]
+name=authentik
+baseurl=https://pkg.goauthentik.io
+enabled=1
+gpgcheck=1
+gpgkey=https://pkg.goauthentik.io/keys/gpg-key.asc

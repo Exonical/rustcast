@@ -89,6 +89,7 @@ type auditEvent struct {
 	Mime        string
 	Data        []byte // hashed always, stored only when policy captures content
 	Result      string
+	OSUser      string
 }
 
 // auditRow is a stored clipboard event. Content is loaded separately.
@@ -104,6 +105,7 @@ type auditRow struct {
 	Direction   string `json:"direction"`
 	Mime        string `json:"mime"`
 	Size        int64  `json:"size"`
+	OSUser      string `json:"os_user,omitempty"`
 	SHA256      string `json:"sha256"`
 	Result      string `json:"result"`
 	HasContent  bool   `json:"has_content"`
@@ -133,7 +135,12 @@ func openStore(dir string) (*store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &store{db: db}, nil
+	st := &store{db: db}
+	if err := st.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
+	return st, nil
 }
 
 // storeDirFromEnv resolves FLUX_DATA_DIR (default ./data).
@@ -171,9 +178,55 @@ CREATE TABLE IF NOT EXISTS clipboard_events (
 );
 CREATE INDEX IF NOT EXISTS clipboard_events_ts ON clipboard_events(ts);
 CREATE INDEX IF NOT EXISTS clipboard_events_machine_ts ON clipboard_events(machine_id, ts);
+CREATE TABLE IF NOT EXISTS host_logins (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    machine_id   TEXT NOT NULL,
+    machine_name TEXT,
+    session_id   TEXT,
+    user_sub     TEXT,
+    user_name    TEXT,
+    client_ip    TEXT,
+    os_user      TEXT,
+    result       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS host_logins_ts ON host_logins(ts);
+CREATE INDEX IF NOT EXISTS host_logins_machine_ts ON host_logins(machine_id, ts);
 `
 
 func (s *store) Close() error { return s.db.Close() }
+
+// migrate applies additive schema changes to existing databases.
+func (s *store) migrate() error {
+	has, err := s.hasColumn("clipboard_events", "os_user")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE clipboard_events ADD COLUMN os_user TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *store) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
 
 // getPolicy returns the stored policy for machineID, or the permissive
 // default when no row exists.
@@ -229,12 +282,13 @@ func (s *store) insertAudit(ev auditEvent, capture bool) error {
 	_, err := s.db.Exec(
 		`INSERT INTO clipboard_events
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
-		    client_ip, direction, mime, size, sha256, result, content)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		    client_ip, direction, mime, size, sha256, result, content, os_user)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().UTC().Format(time.RFC3339Nano),
 		ev.MachineID, nullIfEmpty(ev.MachineName), nullIfEmpty(ev.SessionID),
 		nullIfEmpty(ev.UserSub), nullIfEmpty(ev.UserName), nullIfEmpty(ev.ClientIP),
-		ev.Direction, nullIfEmpty(ev.Mime), int64(len(ev.Data)), sum, ev.Result, content)
+		ev.Direction, nullIfEmpty(ev.Mime), int64(len(ev.Data)), sum, ev.Result, content,
+		nullIfEmpty(ev.OSUser))
 	return err
 }
 
@@ -257,6 +311,7 @@ func (s *store) listAudit(machine string, limit, before int64) ([]auditRow, erro
 	query := `SELECT id, ts, machine_id, COALESCE(machine_name,''), COALESCE(session_id,''),
 	                 COALESCE(user_sub,''), COALESCE(user_name,''), COALESCE(client_ip,''),
 	                 direction, COALESCE(mime,''), size, sha256, result,
+	                 COALESCE(os_user,''),
 	                 content IS NOT NULL AND length(content) > 0
 	          FROM clipboard_events WHERE 1=1`
 	var args []any
@@ -281,7 +336,7 @@ func (s *store) listAudit(machine string, limit, before int64) ([]auditRow, erro
 		var r auditRow
 		if err := rows.Scan(&r.ID, &r.Timestamp, &r.MachineID, &r.MachineName,
 			&r.SessionID, &r.UserSub, &r.UserName, &r.ClientIP,
-			&r.Direction, &r.Mime, &r.Size, &r.SHA256, &r.Result, &r.HasContent); err != nil {
+			&r.Direction, &r.Mime, &r.Size, &r.SHA256, &r.Result, &r.OSUser, &r.HasContent); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -296,11 +351,11 @@ func (s *store) getAuditContent(id int64) (auditRow, []byte, error) {
 	err := s.db.QueryRow(
 		`SELECT id, ts, machine_id, COALESCE(machine_name,''), COALESCE(session_id,''),
 		        COALESCE(user_sub,''), COALESCE(user_name,''), COALESCE(client_ip,''),
-		        direction, COALESCE(mime,''), size, sha256, result, content
+		        direction, COALESCE(mime,''), size, sha256, result, COALESCE(os_user,''), content
 		 FROM clipboard_events WHERE id = ?`, id).
 		Scan(&r.ID, &r.Timestamp, &r.MachineID, &r.MachineName, &r.SessionID,
 			&r.UserSub, &r.UserName, &r.ClientIP, &r.Direction, &r.Mime,
-			&r.Size, &r.SHA256, &r.Result, &content)
+			&r.Size, &r.SHA256, &r.Result, &r.OSUser, &content)
 	if err != nil {
 		return auditRow{}, nil, err
 	}
@@ -310,12 +365,16 @@ func (s *store) getAuditContent(id int64) (auditRow, []byte, error) {
 
 // purge deletes audit rows older than the retention window.
 func (s *store) purge(olderThan time.Time) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM clipboard_events WHERE ts < ?`,
-		olderThan.UTC().Format(time.RFC3339Nano))
+	ts := olderThan.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec(`DELETE FROM clipboard_events WHERE ts < ?`, ts)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, _ := res.RowsAffected()
+	if _, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // auditRetentionDays reads FLUX_AUDIT_RETENTION_DAYS (default 30; 0 = keep).
@@ -351,4 +410,85 @@ func (s *store) startRetentionPurge(ctx context.Context, days int) {
 			}
 		}
 	}()
+}
+
+// hostLogin is one host OS-login attempt outcome.
+type hostLogin struct {
+	MachineID   string
+	MachineName string
+	SessionID   string
+	UserSub     string
+	UserName    string
+	ClientIP    string
+	OSUser      string
+	Result      string
+}
+
+// loginRow is a stored host login audit entry.
+type loginRow struct {
+	ID          int64  `json:"id"`
+	Timestamp   string `json:"ts"`
+	MachineID   string `json:"machine_id"`
+	MachineName string `json:"machine_name"`
+	SessionID   string `json:"session_id"`
+	UserSub     string `json:"user_sub"`
+	UserName    string `json:"user_name"`
+	ClientIP    string `json:"client_ip"`
+	OSUser      string `json:"os_user"`
+	Result      string `json:"result"`
+}
+
+func (s *store) insertLogin(l hostLogin) error {
+	_, err := s.db.Exec(
+		`INSERT INTO host_logins
+		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
+		    client_ip, os_user, result)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		l.MachineID, nullIfEmpty(l.MachineName), nullIfEmpty(l.SessionID),
+		nullIfEmpty(l.UserSub), nullIfEmpty(l.UserName), nullIfEmpty(l.ClientIP),
+		nullIfEmpty(l.OSUser), l.Result)
+	return err
+}
+
+// listLogins returns the newest host login rows (id DESC).
+func (s *store) listLogins(machine string, limit, before int64) ([]loginRow, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	query := `SELECT id, ts, machine_id, COALESCE(machine_name,''), COALESCE(session_id,''),
+	                 COALESCE(user_sub,''), COALESCE(user_name,''), COALESCE(client_ip,''),
+	                 COALESCE(os_user,''), result
+	          FROM host_logins WHERE 1=1`
+	var args []any
+	if machine != "" {
+		query += ` AND machine_id = ?`
+		args = append(args, machine)
+	}
+	if before > 0 {
+		query += ` AND id < ?`
+		args = append(args, before)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []loginRow
+	for rows.Next() {
+		var r loginRow
+		if err := rows.Scan(&r.ID, &r.Timestamp, &r.MachineID, &r.MachineName,
+			&r.SessionID, &r.UserSub, &r.UserName, &r.ClientIP,
+			&r.OSUser, &r.Result); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

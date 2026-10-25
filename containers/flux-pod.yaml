@@ -60,6 +60,10 @@ spec:
           value: "127.0.0.1"
         - name: FLUX_RELAY_TOKEN
           value: "%%FLUX_RELAY_TOKEN%%"
+        - name: FLUX_DEVUSER_PASSWORD
+          value: "%%FLUX_DEVUSER_PASSWORD%%"
+        - name: FLUX_AK_ENROLLMENT_TOKEN
+          value: "%%FLUX_AK_ENROLLMENT_TOKEN%%"
         - name: RUST_LOG
           value: "info"
       volumeMounts:
@@ -67,6 +71,10 @@ spec:
           mountPath: /dev/dri/renderD128
         - name: dri-render-igpu
           mountPath: /dev/dri/renderD129
+        - name: flux-home
+          mountPath: /home
+        - name: flux-machine-id
+          mountPath: /var/lib/flux
     - name: authentik-postgres
       image: docker.io/library/postgres:16-alpine
       env:
@@ -79,11 +87,8 @@ spec:
       volumeMounts:
         - name: authentik-postgres
           mountPath: /var/lib/postgresql/data
-    - name: authentik-redis
-      image: docker.io/library/redis:7-alpine
-      command: ["redis-server", "--save", "", "--appendonly", "no"]
     - name: authentik-server
-      image: ghcr.io/goauthentik/server:2025.12.6
+      image: ghcr.io/goauthentik/server:2026.8.4
       args: ["server"]
       env:
         - name: AUTHENTIK_SECRET_KEY
@@ -96,8 +101,6 @@ spec:
           value: "authentik"
         - name: AUTHENTIK_POSTGRESQL__PASSWORD
           value: "%%PG_PASS%%"
-        - name: AUTHENTIK_REDIS__HOST
-          value: "127.0.0.1"
         - name: AUTHENTIK_LISTEN__HTTP
           value: "0.0.0.0:9000"
         - name: AUTHENTIK_BOOTSTRAP_PASSWORD
@@ -109,6 +112,8 @@ spec:
         # Consumed by the flux blueprint via !Env.
         - name: FLUX_OIDC_CLIENT_SECRET
           value: "%%FLUX_OIDC_CLIENT_SECRET%%"
+        - name: FLUX_AK_ENROLLMENT_TOKEN
+          value: "%%FLUX_AK_ENROLLMENT_TOKEN%%"
       ports:
         - containerPort: 9000
           hostPort: 9000
@@ -120,7 +125,7 @@ spec:
           mountPath: /blueprints/custom
           readOnly: true
     - name: authentik-worker
-      image: ghcr.io/goauthentik/server:2025.12.6
+      image: ghcr.io/goauthentik/server:2026.8.4
       args: ["worker"]
       env:
         - name: AUTHENTIK_SECRET_KEY
@@ -133,8 +138,8 @@ spec:
           value: "authentik"
         - name: AUTHENTIK_POSTGRESQL__PASSWORD
           value: "%%PG_PASS%%"
-        - name: AUTHENTIK_REDIS__HOST
-          value: "127.0.0.1"
+        - name: FLUX_AK_ENROLLMENT_TOKEN
+          value: "%%FLUX_AK_ENROLLMENT_TOKEN%%"
         - name: FLUX_OIDC_CLIENT_SECRET
           value: "%%FLUX_OIDC_CLIENT_SECRET%%"
       volumeMounts:
@@ -161,6 +166,12 @@ spec:
     - name: relay-data
       persistentVolumeClaim:
         claimName: flux-relay-data
+    - name: flux-home
+      persistentVolumeClaim:
+        claimName: flux-home
+    - name: flux-machine-id
+      persistentVolumeClaim:
+        claimName: flux-machine-id
     - name: authentik-blueprints
       hostPath:
         path: "%%BLUEPRINT_DIR%%"

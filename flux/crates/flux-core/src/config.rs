@@ -107,6 +107,15 @@ pub struct ServerConfig {
     /// HTTP metrics listener; set to `off` to disable.
     #[serde(default = "default_metrics_addr")]
     pub metrics_addr: String,
+
+    /// QUIC frame-server listener alongside TCP. Disabled in agent mode
+    /// (behind flux-hostd, which is TCP-only in this stage).
+    #[serde(default = "default_frame_quic")]
+    pub frame_quic: bool,
+}
+
+fn default_frame_quic() -> bool {
+    true
 }
 
 fn default_metrics_addr() -> String {
@@ -121,6 +130,7 @@ impl Default for ServerConfig {
             max_sessions: 4,
             session_timeout_secs: 300,
             metrics_addr: default_metrics_addr(),
+            frame_quic: true,
         }
     }
 }

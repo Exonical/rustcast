@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Machine } from "./api.js";
-import { dedupeDefaultMachine, filterMachines, machineState } from "./machines.js";
+import { canJoinMachine, dedupeDefaultMachine, filterMachines, machineState } from "./machines.js";
 
 const machine = (overrides: Partial<Machine> = {}): Machine => ({
   id: "host-1",
@@ -49,4 +49,20 @@ test("filters and hides a duplicate static endpoint when the real host is online
   assert.deepEqual(filterMachines([duplicate, available, busy, offline], "", "available").map((m) => m.id), ["host-1"]);
   assert.deepEqual(filterMachines([available, busy, offline], "", "in-use").map((m) => m.id), ["host-2"]);
   assert.deepEqual(filterMachines([available, busy, offline], "", "offline").map((m) => m.id), ["host-3"]);
+});
+
+test("machineState: locked login state maps to locked", () => {
+  assert.equal(machineState(machine({ login_state: "locked", logged_in_user: "devuser" })), "locked");
+  assert.equal(machineState(machine({ login_state: "active", logged_in_user: "devuser" })), "available");
+});
+
+test("canJoinMachine: same os user, admin, or idle only", () => {
+  const locked = machine({ login_state: "locked", logged_in_user: "devuser" });
+  assert.equal(canJoinMachine(locked, { username: "devuser" }), true);
+  assert.equal(canJoinMachine(locked, { username: "other" }), false);
+  assert.equal(canJoinMachine(locked, { username: "other", admin: true }), true);
+  const activeOther = machine({ login_state: "active", logged_in_user: "devuser" });
+  assert.equal(canJoinMachine(activeOther, { username: "other" }), false);
+  const idle = machine({ login_state: "idle" });
+  assert.equal(canJoinMachine(idle, { username: "anyone" }), true);
 });

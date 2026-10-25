@@ -10,4 +10,4 @@ ExecStart=/usr/bin/gnome-session --session=gnome
 Restart=on-failure
 
 [Install]
-WantedBy=default.target
+WantedBy=flux-session.target

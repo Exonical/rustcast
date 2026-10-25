@@ -1,0 +1,14 @@
+[Unit]
+Description=Flux host login daemon
+After=systemd-logind.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/flux/env
+ExecStart=/usr/local/bin/flux-hostd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

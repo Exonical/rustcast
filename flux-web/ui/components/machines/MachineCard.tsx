@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { machineState } from "@/lib/machines";
+import { canJoinMachine, machineState } from "@/lib/machines";
 import type { ClipboardPolicy, Machine } from "@/lib/api";
 import { fetchPolicy, updatePolicy } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -26,6 +26,7 @@ export function MachineCard({ machine, onConnect }: {
   const admin = !!me?.admin;
   const state = machineState(machine);
   const online = state !== "offline";
+  const joinable = canJoinMachine(machine, me ? { username: me.username, admin: me.admin } : null);
   const display = machine.width && machine.height ? `${machine.width} × ${machine.height}` : "Native mode";
 
   const [policy, setPolicy] = useState<ClipboardPolicy | null>(null);
@@ -89,6 +90,11 @@ export function MachineCard({ machine, onConnect }: {
             <span className={`h-1.5 w-1.5 rounded-full ${state === "available" ? "bg-emerald-400" : state === "in-use" ? "bg-amber-300" : "bg-zinc-500"}`} />
             {state === "available" ? "Online" : state === "in-use" ? "In use" : "Offline"}
           </Badge>
+          {machine.logged_in_user && (
+            <span title={`Host login: ${machine.logged_in_user}`}>
+              <Badge tone="amber">{machine.login_state === "locked" ? `Locked (${machine.logged_in_user})` : `In use by ${machine.logged_in_user}`}</Badge>
+            </span>
+          )}
           {machine.clipboard_policy && (
             <span title={`Clipboard: ${policyLabel(machine.clipboard_policy)}`}>
               <Badge tone={machine.clipboard_policy === "both" ? "neutral" : "amber"}>

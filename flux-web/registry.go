@@ -34,6 +34,10 @@ type machineInfo struct {
 	TargetBitrate   uint32    `json:"target_bitrate_kbps,omitempty"`
 	Viewers         int       `json:"viewers"`
 	ClipboardPolicy string    `json:"clipboard_policy"`
+	LoggedInUser    string    `json:"logged_in_user"`
+	LoginState      string    `json:"login_state"`
+	QuicCertSHA256  string    `json:"quic_cert_sha256,omitempty"`
+	SupportsLogin   bool      `json:"supports_login"`
 	LastSeen        time.Time `json:"last_seen"`
 	Status          string    `json:"status"`
 	UpstreamStatus  string    `json:"upstream_status"`
@@ -53,6 +57,10 @@ type machineRegistration struct {
 	TargetFPS      uint32 `json:"target_fps"`
 	DefaultFPS     uint32 `json:"default_fps"`
 	TargetBitrate  uint32 `json:"target_bitrate_kbps"`
+	SupportsLogin  bool   `json:"supports_login"`
+	LoginState     string `json:"login_state"`
+	LoggedInUser   string `json:"logged_in_user"`
+	QuicCertSHA256 string `json:"quic_cert_sha256"`
 }
 
 type machineRecord struct {
@@ -133,8 +141,13 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		VirtualDisplay: input.VirtualDisplay, Width: input.Width, Height: input.Height,
 		TargetFPS: input.TargetFPS, DefaultFPS: input.DefaultFPS, LastSeen: now, Status: "online",
 		UpstreamStatus: upstreamStatus,
+		SupportsLogin:  input.SupportsLogin, LoginState: input.LoginState,
+		LoggedInUser: input.LoggedInUser, QuicCertSHA256: input.QuicCertSHA256,
 	}
 	m.static = static
+	if m.upstream != nil {
+		m.upstream.setQuicCertSHA256(input.QuicCertSHA256)
+	}
 	if m.upstream != nil && input.TargetBitrate != 0 {
 		m.upstream.abr.setSenderTarget(input.TargetBitrate)
 	}
@@ -182,6 +195,16 @@ func (r *machineRegistry) list() []machineInfo {
 		info := m.machineInfo
 		if m.upstream != nil {
 			info.Viewers = m.upstream.viewers
+			ls := m.upstream.loginSnapshot()
+			info.LoginState = ls.state.String()
+			info.LoggedInUser = ls.osUser
+		} else {
+			// No live upstream: report what the last registration carried.
+			info.LoginState = m.LoginState
+			if info.LoginState == "" {
+				info.LoginState = loginIdle.String()
+			}
+			info.LoggedInUser = m.LoggedInUser
 		}
 		if r.deps != nil && r.deps.store != nil {
 			info.ClipboardPolicy = r.deps.store.getPolicy(info.ID).Mode
@@ -243,6 +266,8 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		m.upstream = newMachineUpstream(m.FrameEndpoint, m.ID, r.deps, func(status string) {
 			r.setUpstreamStatus(m.ID, status)
 		}, machineMetrics)
+		m.upstream.supportsLogin = m.SupportsLogin
+		m.upstream.quicCertSHA256 = m.QuicCertSHA256
 		if m.TargetBitrate != 0 {
 			m.upstream.abr.setSenderTarget(m.TargetBitrate)
 		}
@@ -386,6 +411,22 @@ func registerPolicyRoutes(admin *gin.RouterGroup, registry *machineRegistry, aut
 		limit, _ := strconv.ParseInt(c.DefaultQuery("limit", "100"), 10, 64)
 		before, _ := strconv.ParseInt(c.Query("before"), 10, 64)
 		rows, err := st.listAudit(c.Query("machine"), limit, before)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit query failed"})
+			return
+		}
+		c.JSON(http.StatusOK, rows)
+	})
+
+	admin.GET("/audit/logins", func(c *gin.Context) {
+		st := registry.depsStore()
+		if st == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit store unavailable"})
+			return
+		}
+		limit, _ := strconv.ParseInt(c.DefaultQuery("limit", "100"), 10, 64)
+		before, _ := strconv.ParseInt(c.Query("before"), 10, 64)
+		rows, err := st.listLogins(c.Query("machine"), limit, before)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit query failed"})
 			return

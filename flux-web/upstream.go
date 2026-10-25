@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,31 +26,37 @@ import (
 // ---------------------------------------------------------------------------
 
 type machineUpstream struct {
-	id            string
-	addr          string
-	frameChan     chan frameMsg
-	frameQueueMu  sync.Mutex
-	frameBuffers  frameBufferPool
-	cursorChan    chan cursorMsg
-	audioChan     chan audioMsg
-	commandChan   chan []byte
-	abr           *abrState
-	stopChan      chan struct{}
-	stopOnce      sync.Once
-	viewers       int // Protected by machineRegistry.mu.
-	viewerCount   atomic.Uint32
-	mu            sync.Mutex
-	session       *Session
-	lastCursor    *cursorMsg
-	conn          net.Conn
-	cancel        context.CancelFunc
-	status        func(string)
-	idrGate       idrRequestGate
-	idrStats      idrStats
-	metrics       *machineMetrics
-	connectedOnce atomic.Bool
-	deps          *relayDeps
-	clipRate      clipboardRate
+	id             string
+	addr           string
+	frameChan      chan frameMsg
+	frameQueueMu   sync.Mutex
+	frameBuffers   frameBufferPool
+	cursorChan     chan cursorMsg
+	audioChan      chan audioMsg
+	commandChan    chan []byte
+	abr            *abrState
+	stopChan       chan struct{}
+	stopOnce       sync.Once
+	viewers        int // Protected by machineRegistry.mu.
+	viewerCount    atomic.Uint32
+	mu             sync.Mutex
+	session        *Session
+	lastCursor     *cursorMsg
+	conn           net.Conn
+	cancel         context.CancelFunc
+	status         func(string)
+	idrGate        idrRequestGate
+	idrStats       idrStats
+	metrics        *machineMetrics
+	connectedOnce  atomic.Bool
+	deps           *relayDeps
+	clipRate       clipboardRate
+	loginMu        sync.Mutex
+	login          loginInfo
+	lastPrompt     *loginFrameJSON
+	loginSpoken    bool
+	supportsLogin  bool
+	quicCertSHA256 string
 }
 
 const (
@@ -565,10 +575,20 @@ func (u *machineUpstream) connectFrameServer() {
 		}
 		log.Printf("[frame:%s] connected to %s", u.id, u.addr)
 		u.status("connected")
-		u.markConnected()
 		u.mu.Lock()
 		u.conn = conn
 		u.mu.Unlock()
+		// hostd demands the hello as the first command; write it
+		// directly and drop anything queued for the dead connection.
+		u.drainCommands()
+		if hello := helloCommand(); hello != nil {
+			if _, err := conn.Write(hello); err != nil {
+				log.Printf("[frame:%s] hello write failed: %v", u.id, err)
+				conn.Close()
+				continue
+			}
+		}
+		u.markConnected()
 		_ = u.sendViewerCount(int(u.viewerCount.Load()))
 
 		// Spawn writer for upstream commands.
@@ -668,6 +688,8 @@ func (u *machineUpstream) readFrames(conn net.Conn) error {
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		case 0x05:
 			u.handleClipboardFrame(data)
+		case 0x06:
+			u.handleLoginFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -678,8 +700,25 @@ func (u *machineUpstream) connectQUIC() error {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"flux-frames"},
+		NextProtos: []string{"flux-frames"},
+	}
+	expected := u.pinnedCertSHA256()
+	if expected == "" {
+		log.Printf("[frame:%s] WARN: no registered cert fingerprint; skipping TLS verification", u.id)
+		tlsConf.InsecureSkipVerify = true
+	} else {
+		tlsConf.InsecureSkipVerify = true // we verify manually below
+		tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no peer certificate")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			actual := hex.EncodeToString(sum[:])
+			if actual != expected {
+				return fmt.Errorf("quic certificate fingerprint mismatch: want %s got %s", expected, actual)
+			}
+			return nil
+		}
 	}
 	conn, err := quic.DialAddr(dialCtx, u.addr, tlsConf, &quic.Config{
 		MaxIdleTimeout:  15 * time.Second,
@@ -690,7 +729,6 @@ func (u *machineUpstream) connectQUIC() error {
 	}
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
 	u.status("connected")
-	u.markConnected()
 	ctx, connCancel := context.WithCancel(context.Background())
 	defer connCancel()
 	defer conn.CloseWithError(0, "done")
@@ -698,7 +736,6 @@ func (u *machineUpstream) connectQUIC() error {
 	u.mu.Lock()
 	u.cancel = connCancel
 	u.mu.Unlock()
-	_ = u.sendViewerCount(int(u.viewerCount.Load()))
 	defer func() {
 		u.mu.Lock()
 		u.cancel = nil
@@ -713,6 +750,16 @@ func (u *machineUpstream) connectQUIC() error {
 	if err != nil {
 		return fmt.Errorf("open control stream: %w", err)
 	}
+	// Same hello-first rule as TCP: write it directly on the command
+	// stream before the pump starts draining the shared channel.
+	u.drainCommands()
+	if hello := helloCommand(); hello != nil {
+		if _, err := control.Write(hello); err != nil {
+			return fmt.Errorf("hello write: %w", err)
+		}
+	}
+	u.markConnected()
+	_ = u.sendViewerCount(int(u.viewerCount.Load()))
 	go func() {
 		for {
 			select {
@@ -777,6 +824,8 @@ func (u *machineUpstream) connectQUIC() error {
 			u.sendAudio(audioMsg{tsMicros: tsMicros, data: data})
 		case 0x05:
 			u.handleClipboardFrame(data)
+		case 0x06:
+			u.handleLoginFrame(data)
 		default:
 			return fmt.Errorf("unknown frame message type: 0x%02x", messageType)
 		}
@@ -792,6 +841,7 @@ func (u *machineUpstream) markConnected() {
 
 func (u *machineUpstream) markDisconnected() {
 	u.metrics.upstreamConnected.Set(0)
+	u.onUpstreamDisconnected()
 }
 
 func (u *machineUpstream) framePusher() {
@@ -949,4 +999,44 @@ func (u *machineUpstream) writeFrame(sess *Session, msg frameMsg, keyframe bool)
 		return time.Since(start), false, err
 	}
 	return time.Since(start), false, nil
+}
+
+// helloCommand builds the 0x0A hello carrying the relay auth token.
+// Returns nil when no token is configured.
+func helloCommand() []byte {
+	token := os.Getenv("FLUX_RELAY_TOKEN")
+	if token == "" {
+		return nil
+	}
+	cmd := make([]byte, 5+len(token))
+	cmd[0] = 0x0A
+	binary.BigEndian.PutUint32(cmd[1:5], uint32(len(token)))
+	copy(cmd[5:], token)
+	return cmd
+}
+
+// setQuicCertSHA256 refreshes the pinned fingerprint from the latest
+// registration/heartbeat so a rotated host cert doesn't strand the link.
+func (u *machineUpstream) setQuicCertSHA256(v string) {
+	u.mu.Lock()
+	u.quicCertSHA256 = v
+	u.mu.Unlock()
+}
+
+func (u *machineUpstream) pinnedCertSHA256() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.quicCertSHA256
+}
+
+// drainCommands discards commands queued for a previous connection so the
+// new link's first bytes are always the hello.
+func (u *machineUpstream) drainCommands() {
+	for {
+		select {
+		case <-u.commandChan:
+		default:
+			return
+		}
+	}
 }

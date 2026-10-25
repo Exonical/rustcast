@@ -21,6 +21,8 @@ export interface Machine {
   status: "online" | "offline";
   upstream_status: string;
   clipboard_policy?: string;
+  logged_in_user?: string;
+  login_state?: "idle" | "authenticating" | "active" | string;
 }
 
 export interface ClipboardPolicy {
@@ -48,6 +50,19 @@ export interface ClipboardAuditRow {
   has_content?: boolean;
 }
 
+export interface LoginAuditRow {
+  id: number;
+  ts: string;
+  machine_id: string;
+  machine_name: string;
+  session_id: string;
+  user_sub: string;
+  user_name: string;
+  client_ip: string;
+  os_user: string;
+  result: string;
+}
+
 export interface ClipboardAuditDetail {
   row: ClipboardAuditRow;
   content: string | null;
@@ -60,6 +75,10 @@ export interface SessionInfo {
   machine_name: string;
   client_ip: string;
   user_agent: string;
+  user?: string;
+  user_sub?: string;
+  os_user?: string;
+  os_uid?: number;
   started_at: string;
   width: number;
   height: number;
@@ -76,6 +95,8 @@ export interface Me {
   sub: string;
   email?: string;
   name?: string;
+  /** OIDC preferred_username — must equal a locked/busy host's logged_in_user to attach. */
+  username?: string;
   admin: boolean;
   auth_enabled: boolean;
 }
@@ -131,6 +152,15 @@ export async function updatePolicy(machineId: string, body: Pick<ClipboardPolicy
   requireAuth(response);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json() as Promise<ClipboardPolicy>;
+}
+
+export function fetchLogins(opts: { machine?: string; limit?: number; before?: number } = {}): Promise<LoginAuditRow[]> {
+  const params = new URLSearchParams();
+  if (opts.machine) params.set("machine", opts.machine);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.before) params.set("before", String(opts.before));
+  const query = params.toString();
+  return fetchJSON<LoginAuditRow[]>(`/api/audit/logins${query ? `?${query}` : ""}`);
 }
 
 export function fetchClipboardAudit(opts: { machine?: string; limit?: number; before?: number } = {}): Promise<ClipboardAuditRow[]> {

@@ -1,0 +1,24 @@
+[package]
+name = "flux-hostd"
+description = "Flux host login daemon — PAM-authenticated frame-server front door spawning per-user flux agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flux-hostd"
+path = "src/main.rs"
+
+[dependencies]
+flux-core = { workspace = true, features = ["registration"] }
+flux-crypto = { workspace = true }
+quinn = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pam-client = { version = "0.5", default-features = false }
+rustls = { workspace = true }
+nix = { version = "0.30", features = ["user", "process", "fs"] }
