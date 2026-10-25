@@ -1147,6 +1147,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "thiserror 2.0.21",
  "tokio",
  "tower-http 0.7.1",
  "tracing",
