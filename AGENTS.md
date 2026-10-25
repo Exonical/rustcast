@@ -24,6 +24,7 @@
 - `bash containers/test-stall-source.sh` (looping test clip with player controls in the container's Firefox), then
   `node containers/test-stall.js "machine=default&movePattern=burst&phases=idle:10,mouse:45,idle:10,mouse:45,idle:10" report.json`
   and `bash containers/test-stall-relay.sh default <since-UTC> <until-UTC>` for relay keyframe-recovery counts.
+- With auth enabled, pass a logged-in session cookie via `FLUX_COOKIE='flux_session=<value>'`; on Linux, set `CHROME=` to a Chrome/Chromium binary.
 - The server's `Perf: N fps` is a cumulative average since start, not the current rate.
 
 ## OS logins (flux-hostd)

@@ -351,6 +351,8 @@ async function run() {
   const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
   const url = new URL(`https://${urlHost}:${port}/wt`);
   url.searchParams.set('machine', machine);
+  const ticket = params.get('ticket');
+  if (ticket) url.searchParams.set('ticket', ticket);
   if (WANT_W && WANT_H) { url.searchParams.set('width', WANT_W); url.searchParams.set('height', WANT_H); }
   result.events.push(`machine=${machine}`);
   transport = new WebTransport(url, hashes.length ? { serverCertificateHashes: hashes } : undefined);
