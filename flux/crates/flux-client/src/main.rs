@@ -1,12 +1,12 @@
-#![allow(dead_code)]
-
 use clap::Parser;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+// Decoder and renderer are scaffolding that `FluxClient::connect` does not use yet.
+#[allow(dead_code)]
 mod decoder;
-mod receiver;
+#[allow(dead_code)]
 mod renderer;
 
 use flux_core::types::{Resolution, VideoCodec};
@@ -72,31 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.bitrate,
     );
 
-    // TODO: Full client connection flow:
-    //
-    //   1. Resolve server address
-    //   2. Establish QUIC connection (via flux-transport)
-    //   3. Send Hello message
-    //   4. Receive Welcome message
-    //   5. Handle pairing if required (PIN entry)
-    //   6. Send SessionRequest
-    //   7. Receive SessionAccepted with negotiated params and port info
-    //   8. Start media receivers (video + audio UDP sockets)
-    //   9. Start input sender
-    //  10. Enter main loop:
-    //      a. Receive video RTP packets → depacketize → FEC reconstruct → decode → render
-    //      b. Receive audio RTP packets → decode → play
-    //      c. Capture local input → serialize → send to server
-    //      d. Handle keepalive ping/pong
-    //      e. Handle bitrate adaptation based on network conditions
-
     let client = FluxClient::new(args.name, codec, resolution, args.fps, args.bitrate);
 
-    match client.connect(&args.server).await {
-        Ok(()) => tracing::info!("Session ended normally"),
-        Err(e) => tracing::error!("Session error: {}", e),
+    if let Err(e) = client.connect(&args.server).await {
+        tracing::error!("Session error: {}", e);
+        return Err(e);
     }
 
+    tracing::info!("Session ended normally");
     Ok(())
 }
 
@@ -125,28 +108,27 @@ impl FluxClient {
         }
     }
 
-    async fn connect(&self, server_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!("Connecting to {}", server_addr);
-
-        // Build Hello message.
-        let hello = HelloMessage {
+    fn hello(&self) -> HelloMessage {
+        HelloMessage {
             protocol_version: version::PROTOCOL_VERSION,
             client_name: self.name.clone(),
             supported_codecs: vec![self.codec],
             max_resolution: self.resolution,
             max_fps: self.fps,
             supports_hdr: false,
-        };
+        }
+    }
 
-        tracing::debug!("Sending Hello: {:?}", hello);
-
-        // TODO: Establish QUIC connection and send Hello.
-        // TODO: Receive Welcome, negotiate session, start streaming.
-        // TODO: Create decoder, renderer, and input handler.
-        // TODO: Enter main receive/render loop.
-
-        tracing::info!("Connection flow not yet fully implemented");
-        Ok(())
+    /// Not implemented: there is no transport, session negotiation, or media path yet,
+    /// so this always fails instead of pretending a session ran.
+    async fn connect(&self, server_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::debug!(
+            "Would send Hello to {} at {} kbps: {:?}",
+            server_addr,
+            self.bitrate_kbps,
+            self.hello()
+        );
+        Err(format!("cannot connect to {server_addr}: flux-client connection flow is not implemented").into())
     }
 }
 
@@ -158,4 +140,16 @@ fn parse_resolution(s: &str) -> Result<Resolution, Box<dyn std::error::Error>> {
     let width: u32 = parts[0].parse()?;
     let height: u32 = parts[1].parse()?;
     Ok(Resolution::new(width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_fails_instead_of_faking_a_session() {
+        let client = FluxClient::new("test".into(), VideoCodec::H264, Resolution::new(1280, 720), 30, 5000);
+        let err = client.connect("127.0.0.1:8443").await.unwrap_err();
+        assert!(err.to_string().contains("not implemented"), "unexpected error: {err}");
+    }
 }

@@ -63,6 +63,8 @@ flux-server -c flux.toml
 
 ### Client (Viewer)
 
+`flux-client` is unimplemented scaffolding: it parses its arguments and then exits with a "connection flow is not implemented" error. Use the browser viewer served by the relay (`flux-web/`) instead.
+
 ```bash
 # Connect to a server
 flux-client --server 192.168.1.100:8443 --codec h265 --resolution 1920x1080 --fps 60
