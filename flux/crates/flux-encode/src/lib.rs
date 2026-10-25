@@ -7,6 +7,11 @@ pub(crate) mod nv12;
 // DXGI shared textures directly inside the AMF backend.
 #[cfg(unix)]
 pub mod import;
+#[cfg(any(
+    test,
+    all(target_os = "linux", any(feature = "encoder-vaapi", feature = "encoder-ffmpeg"))
+))]
+pub(crate) mod session_thread;
 pub mod traits;
 
 #[cfg(unix)]
