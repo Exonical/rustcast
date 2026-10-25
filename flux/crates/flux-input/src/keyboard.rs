@@ -85,40 +85,27 @@ impl KeyboardSink {
         let mut scan_code = 0;
         let mut vk_code = 0;
 
-        match event {
+        let (sc, kc, key_up) = match event {
             KeyboardEvent::KeyDown {
-                scan_code: sc,
-                key_code: kc,
-                modifiers: _,
-            } => {
-                if *sc > 0 {
-                    dw_flags |= KEYEVENTF_SCANCODE;
-                    scan_code = *sc;
-                    if scan_code & 0xFF00 == 0xE000 {
-                        dw_flags |= KEYEVENTF_EXTENDEDKEY;
-                        scan_code &= 0x00FF;
-                    }
-                } else if let Some(vk) = kc {
-                    vk_code = *vk;
-                }
-            }
+                scan_code, key_code, ..
+            } => (*scan_code, *key_code, false),
             KeyboardEvent::KeyUp {
-                scan_code: sc,
-                key_code: kc,
-                modifiers: _,
-            } => {
-                dw_flags |= KEYEVENTF_KEYUP;
-                if *sc > 0 {
-                    dw_flags |= KEYEVENTF_SCANCODE;
-                    scan_code = *sc;
-                    if scan_code & 0xFF00 == 0xE000 {
-                        dw_flags |= KEYEVENTF_EXTENDEDKEY;
-                        scan_code &= 0x00FF;
-                    }
-                } else if let Some(vk) = kc {
-                    vk_code = *vk;
-                }
+                scan_code, key_code, ..
+            } => (*scan_code, *key_code, true),
+        };
+
+        if key_up {
+            dw_flags |= KEYEVENTF_KEYUP;
+        }
+        if sc > 0 {
+            dw_flags |= KEYEVENTF_SCANCODE;
+            scan_code = sc;
+            if scan_code & 0xFF00 == 0xE000 {
+                dw_flags |= KEYEVENTF_EXTENDEDKEY;
+                scan_code &= 0x00FF;
             }
+        } else if let Some(vk) = kc {
+            vk_code = vk;
         }
 
         if scan_code == 0 && vk_code == 0 {
