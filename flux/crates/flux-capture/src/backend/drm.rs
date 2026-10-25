@@ -1,16 +1,18 @@
-//! Linux KMS/DRM direct capture backend.
+//! Linux KMS/DRM direct capture backend (not implemented).
 //!
-//! Captures frames directly from the DRM framebuffer. This is a lower-level
-//! fallback for environments without PipeWire (e.g. headless servers, bare
-//! Wayland compositors).
+//! Intended as a lower-level fallback for environments without PipeWire (e.g.
+//! headless servers, bare Wayland compositors) that captures straight from the
+//! DRM framebuffer. Until it exists, construction fails so callers get an
+//! explicit error instead of a "working" session that streams black frames.
 
 use flux_core::error::{FluxError, Result};
-use flux_core::frame::CapturedFrame;
-use flux_core::types::{PixelFormat, Resolution};
+use flux_core::types::Resolution;
 
 use crate::traits::{CaptureSession, CursorUpdateSink, DisplayInfo, ScreenCapture};
 
-/// DRM/KMS direct framebuffer capture backend.
+const NOT_IMPLEMENTED: &str = "DRM/KMS capture not implemented";
+
+/// DRM/KMS direct framebuffer capture backend — not implemented.
 pub struct DrmCapture {
     // Will hold DRM file descriptor, connector info, etc.
     _private: (),
@@ -18,14 +20,15 @@ pub struct DrmCapture {
 
 impl DrmCapture {
     pub fn new() -> Result<Self> {
-        tracing::info!("Initializing DRM/KMS capture");
-
         // TODO: Initialization:
         //   1. Open /dev/dri/card0 (or enumerate render nodes)
         //   2. drmModeGetResources → enumerate connectors, CRTCs, encoders
         //   3. For each active connector, record resolution and CRTC mapping
-
-        Ok(Self { _private: () })
+        //
+        // Capture: find the primary plane for the target CRTC, drmModeGetFB2
+        // → export DMA-BUF fd via drmPrimeHandleToFD into
+        // `GpuFrameHandle::DmaBuf`, with vblank-synchronized timing.
+        Err(FluxError::Capture(NOT_IMPLEMENTED.into()))
     }
 }
 
@@ -35,99 +38,32 @@ impl ScreenCapture for DrmCapture {
     }
 
     fn enumerate_displays(&self) -> Result<Vec<DisplayInfo>> {
-        tracing::debug!("Enumerating DRM displays (stub)");
-        Ok(vec![DisplayInfo {
-            id: 0,
-            adapter_luid: None,
-            name: "DRM Output 0".into(),
-            native_resolution: Resolution::new(1920, 1080),
-            desktop_rect: flux_core::types::DesktopRect {
-                left: 0,
-                top: 0,
-                width: 1920,
-                height: 1080,
-            },
-            primary: true,
-            capture_supported: true,
-        }])
+        Err(FluxError::Capture(NOT_IMPLEMENTED.into()))
     }
 
     fn start_capture(
         &self,
-        display_id: Option<u32>,
-        resolution: Resolution,
-        framerate: u32,
+        _display_id: Option<u32>,
+        _resolution: Resolution,
+        _framerate: u32,
         _cursor_sink: Option<CursorUpdateSink>,
     ) -> Result<Box<dyn CaptureSession>> {
-        let display_id = display_id.unwrap_or(0);
-        tracing::info!(
-            "Starting DRM capture on output {} at {}@{}fps",
-            display_id,
-            resolution,
-            framerate
-        );
-
-        Ok(Box::new(DrmCaptureSession::new(display_id, resolution, framerate)?))
+        Err(FluxError::Capture(NOT_IMPLEMENTED.into()))
     }
 }
 
-struct DrmCaptureSession {
-    display_id: u32,
-    resolution: Resolution,
-    framerate: u32,
-    frame_sequence: u64,
-    running: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl DrmCaptureSession {
-    fn new(display_id: u32, resolution: Resolution, framerate: u32) -> Result<Self> {
-        // TODO: Set up DRM plane capture:
-        //   1. Find the primary plane for the target CRTC
-        //   2. Use drmModeGetFB2 to get the framebuffer DMA-BUF handle
-        //   3. Set up vblank-synchronized capture timing
-
-        Ok(Self {
-            display_id,
-            resolution,
-            framerate,
-            frame_sequence: 0,
-            running: true,
-        })
-    }
-}
-
-impl CaptureSession for DrmCaptureSession {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        if !self.running {
-            return Err(FluxError::Capture("session stopped".into()));
-        }
-        self.frame_sequence += 1;
-
-        // TODO: drmModeGetFB2 → export DMA-BUF fd via drmPrimeHandleToFD, then
-        // populate `GpuFrameHandle::DmaBuf` with the exported plane fds. Until
-        // the real implementation lands we return an empty CPU frame so the
-        // pipeline can be exercised without fabricating an invalid fd.
-        Ok(CapturedFrame {
-            sequence: self.frame_sequence,
-            timestamp: std::time::Instant::now(),
-            format: PixelFormat::Bgra8,
-            resolution: self.resolution,
-            stride: self.resolution.width * 4,
-            data: Vec::new(),
-            gpu_handle: None,
-        })
+    #[test]
+    fn construction_fails_instead_of_faking_success() {
+        assert!(matches!(DrmCapture::new(), Err(FluxError::Capture(_))));
     }
 
-    fn try_next_frame(&mut self) -> Result<Option<CapturedFrame>> {
-        if !self.running {
-            return Ok(None);
-        }
-        Ok(Some(self.next_frame()?))
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        tracing::info!("Stopping DRM capture session");
-        self.running = false;
-        Ok(())
+    #[test]
+    fn create_capture_rejects_drm() {
+        let result = crate::create_capture(Some(flux_core::types::CaptureBackend::Drm));
+        assert!(matches!(result, Err(FluxError::Capture(_))));
     }
 }

@@ -1,17 +1,20 @@
-//! Windows WASAPI loopback audio capture.
+//! Windows WASAPI loopback audio capture (not implemented).
 //!
-//! Uses the Windows Audio Session API in loopback mode to capture the audio
+//! Will use the Windows Audio Session API in loopback mode to capture the audio
 //! output of the desktop (or a specific application). This is the standard
-//! approach used by Sunshine, Parsec, and Windows RDP.
+//! approach used by Sunshine, Parsec, and Windows RDP. Until it exists,
+//! construction fails so the host runs without audio and says so, instead of
+//! reporting a running capture that never yields a sample.
 
 use flux_core::error::{FluxError, Result};
 
 use crate::traits::{AudioCaptureSession, AudioDeviceInfo, AudioSamples};
 
-/// WASAPI loopback capture session.
+const NOT_IMPLEMENTED: &str = "WASAPI loopback capture not implemented";
+
+/// WASAPI loopback capture session — not implemented.
 pub struct WasapiCapture {
-    running: bool,
-    sequence: u64,
+    _private: (),
     // TODO: COM objects:
     //   - IMMDeviceEnumerator
     //   - IMMDevice (render endpoint)
@@ -22,17 +25,12 @@ pub struct WasapiCapture {
 
 impl WasapiCapture {
     pub fn new() -> Result<Self> {
-        tracing::info!("Initializing WASAPI audio capture");
-
         // TODO: Initialization:
         //   1. CoInitializeEx(COINIT_MULTITHREADED)
         //   2. CoCreateInstance(CLSID_MMDeviceEnumerator) → IMMDeviceEnumerator
         //   3. Enumerator ready for use
 
-        Ok(Self {
-            running: false,
-            sequence: 0,
-        })
+        Err(FluxError::AudioCapture(NOT_IMPLEMENTED.into()))
     }
 }
 
@@ -42,19 +40,10 @@ impl AudioCaptureSession for WasapiCapture {
         //   enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
         //   For each endpoint: GetId(), OpenPropertyStore → PKEY_Device_FriendlyName
 
-        tracing::debug!("Enumerating WASAPI audio devices (stub)");
-        Ok(vec![AudioDeviceInfo {
-            id: "default".into(),
-            name: "Default Audio Output".into(),
-            sample_rate: 48000,
-            channels: 2,
-            is_default: true,
-        }])
+        Err(FluxError::AudioCapture(NOT_IMPLEMENTED.into()))
     }
 
-    fn start(&mut self, device_id: Option<&str>) -> Result<()> {
-        tracing::info!("Starting WASAPI loopback capture (device={:?})", device_id);
-
+    fn start(&mut self, _device_id: Option<&str>) -> Result<()> {
         // TODO: Full capture start:
         //
         //   1. Get device:
@@ -81,17 +70,10 @@ impl AudioCaptureSession for WasapiCapture {
         //
         //   7. audio_client.Start()
 
-        self.running = true;
-        Ok(())
+        Err(FluxError::AudioCapture(NOT_IMPLEMENTED.into()))
     }
 
     fn next_samples(&mut self) -> Result<AudioSamples> {
-        if !self.running {
-            return Err(FluxError::AudioCapture("not started".into()));
-        }
-
-        self.sequence += 1;
-
         // TODO: Read from WASAPI capture client:
         //
         //   1. WaitForSingleObject(event, timeout) — wait for buffer
@@ -103,19 +85,22 @@ impl AudioCaptureSession for WasapiCapture {
         //      d. capture_client.ReleaseBuffer(frames)
         //      e. GetNextPacketSize again
 
-        Ok(AudioSamples {
-            data: Vec::new(),
-            sample_rate: 48000,
-            channels: 2,
-            sequence: self.sequence,
-            timestamp: std::time::Instant::now(),
-        })
+        Err(FluxError::AudioCapture(NOT_IMPLEMENTED.into()))
     }
 
     fn stop(&mut self) -> Result<()> {
-        tracing::info!("Stopping WASAPI capture");
         // TODO: audio_client.Stop(), release COM objects
-        self.running = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn construction_fails_instead_of_faking_success() {
+        assert!(matches!(WasapiCapture::new(), Err(FluxError::AudioCapture(_))));
+        assert!(matches!(crate::create_audio_capture(), Err(FluxError::AudioCapture(_))));
     }
 }

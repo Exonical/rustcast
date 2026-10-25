@@ -150,14 +150,8 @@ impl PlatformInfo {
     fn detect_capture_backends(os: Os) -> Vec<CaptureBackend> {
         match os {
             Os::Windows => vec![CaptureBackend::Dxgi],
-            Os::Linux => {
-                let mut backends = Vec::new();
-                // PipeWire is preferred when available.
-                backends.push(CaptureBackend::PipeWire);
-                // DRM/KMS is the fallback for headless or Wayland-less setups.
-                backends.push(CaptureBackend::Drm);
-                backends
-            }
+            // DRM/KMS capture is not implemented yet, so it is not advertised.
+            Os::Linux => vec![CaptureBackend::PipeWire],
         }
     }
 
@@ -192,5 +186,18 @@ impl PlatformInfo {
         // Software fallback is always available.
         backends.push(EncoderBackend::Software);
         backends
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_does_not_advertise_unimplemented_drm_capture() {
+        assert_eq!(
+            PlatformInfo::detect_capture_backends(Os::Linux),
+            vec![CaptureBackend::PipeWire]
+        );
     }
 }
