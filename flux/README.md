@@ -6,7 +6,7 @@ Flux is a high-performance remote desktop streaming solution built in Rust, desi
 
 - **GPU-Accelerated Encoding** — NVENC (NVIDIA), AMF (AMD/Windows), VA-API (AMD+Intel/Linux), Vulkan Video (cross-vendor)
 - **Zero-Copy Capture** — DXGI Desktop Duplication (Windows), PipeWire/DRM (Linux) with DMA-BUF passthrough
-- **Low-Latency Transport** — RTP over UDP with Reed-Solomon FEC, QUIC for signaling and reliable control
+- **Low-Latency Transport** — RTP over UDP with FEC (placeholder single XOR parity; Reed-Solomon planned), QUIC for signaling and reliable control
 - **Multi-Codec** — H.264, H.265/HEVC, AV1 (where hardware supports it)
 - **HDR Support** — 10-bit encoding with BT.2020 color space
 - **Full Input Forwarding** — Keyboard, mouse, and gamepad (virtual Xbox 360 via ViGEmBus/uinput)
