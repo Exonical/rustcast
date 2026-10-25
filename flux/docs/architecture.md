@@ -97,12 +97,13 @@ The video capture→encode loop runs on a dedicated OS thread (not a Tokio task)
 
 ### 5. Forward Error Correction (FEC)
 
-Reed-Solomon erasure coding generates parity packets alongside data packets.
-If any packets are lost in transit, the receiver can reconstruct missing data
-without requesting retransmission — critical for maintaining low latency.
+Planned: Reed-Solomon erasure coding generates parity packets alongside data
+packets, so the receiver can reconstruct lost data without requesting
+retransmission — critical for maintaining low latency.
 
-The FEC overhead is configurable (default 20%). For a 10-packet frame, 2
-parity packets are generated, allowing recovery from any 2 lost packets.
+Current status (`flux-transport::fec`): placeholder. Each frame gets a single
+XOR parity packet regardless of the configured overhead (`fec_percentage`,
+default 20%), and there is no decoder yet, so lost packets are not recovered.
 
 ## Session Lifecycle
 

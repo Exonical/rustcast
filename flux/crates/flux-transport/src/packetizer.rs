@@ -1,7 +1,8 @@
 //! Video frame packetizer.
 //!
 //! Splits encoded video frames into MTU-sized RTP packets, adds FEC parity
-//! packets, and prepares them for UDP transmission.
+//! packets (currently a single XOR parity packet, see [`crate::fec`]), and
+//! prepares them for UDP transmission.
 
 use bytes::BytesMut;
 
@@ -47,10 +48,7 @@ impl Packetizer {
         let total_data_packets = chunks.len() as u16;
 
         let data_payloads: Vec<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
-        let parity_packets = self.fec_encoder.encode(&data_payloads).unwrap_or_else(|e| {
-            tracing::warn!("Sending frame {} without FEC: {}", frame_number, e);
-            vec![]
-        });
+        let parity_packets = self.fec_encoder.encode(&data_payloads);
         let fec_count = parity_packets.len();
 
         let mut packets = Vec::with_capacity(chunks.len() + fec_count);
@@ -236,9 +234,10 @@ mod tests {
     }
 
     #[test]
-    fn advertises_no_fec_when_multi_parity_is_unavailable() {
+    fn caps_large_groups_at_single_xor_parity_packet() {
         let packets = packetize(20, &[0xAB; 100]);
-        assert_eq!(packets.len(), 10);
-        assert_eq!(fec_counts(&packets), vec![0; 10]);
+        assert_eq!(packets.len(), 11);
+        assert_eq!(fec_counts(&packets), vec![1; 11]);
+        assert_eq!(RtpHeader::parse(&packets[10]).unwrap().payload_type, payload_types::FEC);
     }
 }
