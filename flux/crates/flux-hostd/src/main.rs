@@ -60,13 +60,9 @@ fn env(name: &str) -> Option<String> {
 }
 
 /// Sync the registration heartbeat's login fields with the session manager.
-fn update_login_status(shared: &Shared, active: bool) {
+fn update_login_status(shared: &Shared) {
     if let Ok(mut s) = shared.status.write() {
         match shared.manager.state() {
-            SessionState::Active { user } if active => {
-                s.login_state = "active".into();
-                s.logged_in_user = Some(user);
-            }
             SessionState::Active { user } => {
                 s.login_state = "active".into();
                 s.logged_in_user = Some(user);
@@ -362,7 +358,7 @@ where
                             .await?;
                             return Ok(());
                         }
-                        update_login_status(&shared, true);
+                        update_login_status(&shared);
                         break Login::Reattach {
                             user: username,
                         };
@@ -446,7 +442,7 @@ where
             shared
                 .manager
                 .open(user, outcome.session.expect("fresh login opens pam session"));
-            update_login_status(&shared, true);
+            update_login_status(&shared);
             spawn_agent_watcher(uid, name.clone(), shared.clone());
             proto::write_login_frame(
                 &mut wr,
@@ -472,7 +468,7 @@ where
     };
     schedule_idle_logout(shared.clone());
     shared.manager.lock();
-    update_login_status(&shared, false);
+    update_login_status(&shared);
     match end {
         // Relay dropped: the OS session stays alive but locked.
         ProxyEnd::Disconnected => return Ok(()),
