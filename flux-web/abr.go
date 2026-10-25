@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"log"
 	"sync"
 	"time"
@@ -9,7 +8,7 @@ import (
 
 // abrState tracks the upstream encoder bitrate target for one machine. Delivery
 // estimates, packet loss, and RTT samples update the target and diagnostics. Targets are sent upstream as
-// command 0x03 [4-byte BE kbps], which flux-server applies live via the
+// cmdBitrate [4-byte BE kbps], which flux-server applies live via the
 // encoder's set_bitrate.
 type abrState struct {
 	mu          sync.Mutex
@@ -214,9 +213,7 @@ func bitrateEstimateIsMaterial(current, next, ceiling uint32) bool {
 }
 
 func (a *abrState) sendBitrateCommand(kbps uint32) {
-	cmd := make([]byte, 5)
-	cmd[0] = 0x03
-	binary.BigEndian.PutUint32(cmd[1:], kbps)
+	cmd := u32Command(cmdBitrate, kbps)
 	select {
 	case a.commandChan <- cmd:
 		if a.metrics != nil {

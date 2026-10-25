@@ -105,11 +105,11 @@ func TestLatestFrameReleasesOnlyDiscardedPayloads(t *testing.T) {
 
 func TestReadPayloadReturnsTruncatedVideoBuffer(t *testing.T) {
 	u := newMachineUpstream("", "", nil, func(string) {})
-	frame, err := u.readPayload(bytes.NewReader([]byte{1, 2}), 0x01, 5)
+	frame, err := u.readPayload(bytes.NewReader([]byte{1, 2}), msgVideo, 5)
 	if !errors.Is(err, io.ErrUnexpectedEOF) || frame.data != nil || u.frameBuffers.count != 1 {
 		t.Fatalf("readPayload = (%+v, %v), cached=%d", frame, err, u.frameBuffers.count)
 	}
-	for _, messageType := range []byte{0x02, 0x03, 0xff} {
+	for _, messageType := range []byte{msgCursor, msgResolutionStatus, 0xff} {
 		frame, err := u.readPayload(bytes.NewReader([]byte("{}")), messageType, 2)
 		if err != nil || frame.buffers != nil || string(frame.data) != "{}" {
 			t.Fatalf("metadata payload pooled or changed: (%+v, %v)", frame, err)
@@ -130,7 +130,7 @@ func TestReadFramesPoolsVideoButRetainsCursor(t *testing.T) {
 		for _, message := range []struct {
 			kind byte
 			data []byte
-		}{{0x02, []byte(`{"visible":true}`)}, {0x01, pFrame(1).data}} {
+		}{{msgCursor, []byte(`{"visible":true}`)}, {msgVideo, pFrame(1).data}} {
 			var header [13]byte
 			header[0] = message.kind
 			binary.BigEndian.PutUint64(header[1:9], 42)
@@ -164,7 +164,7 @@ func TestReadFramesDispatchesAudio(t *testing.T) {
 	go func() {
 		defer writer.Close()
 		var header [13]byte
-		header[0] = 0x04
+		header[0] = msgAudio
 		binary.BigEndian.PutUint64(header[1:9], 4242)
 		binary.BigEndian.PutUint32(header[9:13], uint32(len(payload)))
 		_, _ = writer.Write(append(header[:], payload...))
@@ -405,7 +405,7 @@ func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 	if got := len(u.commandChan); got != 1 {
 		t.Fatalf("burst queued %d IDR requests, want exactly 1", got)
 	}
-	if got := <-u.commandChan; len(got) != 1 || got[0] != 0x01 {
+	if got := <-u.commandChan; len(got) != 1 || got[0] != cmdIDR {
 		t.Fatalf("burst queued command %#v, want IDR command", got)
 	}
 
@@ -416,7 +416,7 @@ func TestIDRRequestGateBoundsBurstAcrossDropPaths(t *testing.T) {
 	if got := len(u.commandChan); got != 1 {
 		t.Fatalf("second gate window queued %d IDR requests, want 1", got)
 	}
-	if got := <-u.commandChan; len(got) != 1 || got[0] != 0x01 {
+	if got := <-u.commandChan; len(got) != 1 || got[0] != cmdIDR {
 		t.Fatalf("next-window queued command %#v, want IDR command", got)
 	}
 }
@@ -505,8 +505,8 @@ func TestReadFramesWarnsAndSkipsInvalidCursorJSON(t *testing.T) {
 	defer reader.Close()
 	go func() {
 		defer writer.Close()
-		_, _ = writer.Write(encodeHostFrame(0x02, 1, []byte("{not json")))
-		_, _ = writer.Write(encodeHostFrame(0x02, 2, []byte(`{"visible":false}`)))
+		_, _ = writer.Write(encodeHostFrame(msgCursor, 1, []byte("{not json")))
+		_, _ = writer.Write(encodeHostFrame(msgCursor, 2, []byte(`{"visible":false}`)))
 	}()
 	if err := u.readFrames(reader); !errors.Is(err, io.EOF) {
 		t.Fatalf("readFrames = %v, want EOF", err)
@@ -523,7 +523,7 @@ func TestReadFramesRejectsInvalidLength(t *testing.T) {
 	go func() {
 		defer writer.Close()
 		var header [13]byte
-		header[0] = 0x01
+		header[0] = msgVideo
 		_, _ = writer.Write(header[:])
 	}()
 	if err := u.readFrames(reader); err == nil || err.Error() != "invalid frame length: 0" {
@@ -535,7 +535,7 @@ func TestReadQUICStreamSkipsOnlyPeerResets(t *testing.T) {
 	u := newMachineUpstream("", "", nil, func(string) {})
 	var frameCount uint64
 	reset := &quic.StreamError{StreamID: 3, Remote: true}
-	video := encodeHostFrame(0x01, 7, pFrame(1).data)
+	video := encodeHostFrame(msgVideo, 7, pFrame(1).data)
 	for name, data := range map[string][]byte{"before header": nil, "mid header": video[:5], "mid payload": video[:15]} {
 		if err := u.readQUICStream(&resetReader{data: data, err: reset}, &frameCount); err != nil {
 			t.Fatalf("%s: reset stream = %v, want skipped", name, err)

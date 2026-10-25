@@ -73,19 +73,19 @@ func TestClientClipboardAllowedEmitsCommand(t *testing.T) {
 	}
 	select {
 	case cmd := <-u.commandChan:
-		if cmd[0] != 0x07 {
-			t.Fatalf("command type = 0x%02x, want 0x07", cmd[0])
+		if cmd[0] != cmdClipboard {
+			t.Fatalf("command type = 0x%02x, want cmdClipboard", cmd[0])
 		}
 		length := binary.BigEndian.Uint32(cmd[1:5])
 		var msg clipboardPayload
 		if err := json.Unmarshal(cmd[5:5+length], &msg); err != nil {
-			t.Fatalf("decode 0x07 payload: %v", err)
+			t.Fatalf("decode cmdClipboard payload: %v", err)
 		}
 		if msg.Mime != clipWireMime || msg.Data != "hello" {
 			t.Fatalf("payload = %+v", msg)
 		}
 	default:
-		t.Fatal("no 0x07 command queued")
+		t.Fatal("no cmdClipboard command queued")
 	}
 
 	rows, _ := st.listAudit("m1", 10, 0)

@@ -316,10 +316,10 @@ func validateResolution(width, height uint32) error {
 	return nil
 }
 
-// resolutionCommand encodes relay→host command 0x06: set the capture
+// resolutionCommand encodes relay→host cmdResolution: set the capture
 // resolution to width×height (each a 16-bit BE value).
 func resolutionCommand(width, height uint32) []byte {
-	return []byte{0x06, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}
+	return []byte{cmdResolution, byte(width >> 8), byte(width), byte(height >> 8), byte(height)}
 }
 
 // transitioningStatus is the resolution status broadcast to viewers while the
@@ -333,7 +333,7 @@ func transitioningStatus(width, height uint32) []byte {
 	return status
 }
 
-// sendResolutionChange queues command 0x06 for the host and, once queued,
+// sendResolutionChange queues cmdResolution for the host and, once queued,
 // tells the viewer the host is transitioning to width×height. It reports
 // false (and sends no status) when the command channel is full.
 func (u *machineUpstream) sendResolutionChange(width, height uint32) bool {
@@ -500,11 +500,7 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 		if machine == nil || !json.Valid(message.Data) {
 			return errors.New("invalid input")
 		}
-		command := make([]byte, 5+len(message.Data))
-		command[0] = 0x02
-		binary.BigEndian.PutUint32(command[1:5], uint32(len(message.Data)))
-		copy(command[5:], message.Data)
-		if !machine.send(command) {
+		if !machine.send(commandFrame(cmdInput, message.Data)) {
 			log.Printf("[control] upstream command channel full, dropped input")
 		}
 	case "quality":
@@ -519,7 +515,7 @@ func (s *Session) handleControlMessage(message controlMessage) error {
 			return errors.New("quality must be 0-10 and FPS must be 0-144")
 		}
 		log.Printf("[control] quality/fps machine=%s level=%d fps=%d", machine.id, quality.Level, quality.FPS)
-		if !machine.send([]byte{0x05, quality.Level, quality.FPS}) {
+		if !machine.send([]byte{cmdQuality, quality.Level, quality.FPS}) {
 			log.Printf("[control] upstream command channel full, dropped quality/FPS control")
 		}
 	case "resolution":
@@ -627,7 +623,7 @@ func forwardCursorUpdates(session *Session) {
 			if latest == nil {
 				continue
 			}
-			if err := session.sendMetadataStream(0x02, latest.data); err != nil {
+			if err := session.sendMetadataStream(streamCursor, latest.data); err != nil {
 				session.releaseNow()
 				_ = session.transport.CloseWithError(sessionErrorCode, err.Error())
 				return
@@ -671,10 +667,10 @@ func (s *Session) sendMetadataStream(kind byte, payload []byte) error {
 	return s.sendUniStream(header, payload)
 }
 
-// Audio stream layout: [0x04][ts u64 BE][seq u32 BE][len u32 BE][opus payload].
+// Audio stream layout: [streamAudio][ts u64 BE][seq u32 BE][len u32 BE][opus payload].
 func (s *Session) sendAudioStream(tsMicros uint64, seq uint32, payload []byte) error {
 	header := make([]byte, 17)
-	header[0] = 0x04
+	header[0] = streamAudio
 	binary.BigEndian.PutUint64(header[1:9], tsMicros)
 	binary.BigEndian.PutUint32(header[9:13], seq)
 	binary.BigEndian.PutUint32(header[13:17], uint32(len(payload)))
