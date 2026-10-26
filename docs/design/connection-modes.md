@@ -30,7 +30,7 @@ flowchart LR
     subgraph Central["Central relay (control plane + relay media)"]
         UI["UI / REST / OIDC<br/>HTTPS :443/TCP"]
         RWT["Relay WebTransport<br/>HTTP/3 :8443/UDP"]
-        Signer["Ticket signer<br/>ML-DSA-65 (FIPS 204)"]
+        Signer["Ticket signer<br/>ML-DSA-87 (FIPS 204)"]
     end
     subgraph Host["Host machine"]
         DWT["Direct endpoint<br/>flux-web --mode=direct<br/>HTTP/3 :8443/UDP"]
@@ -74,7 +74,7 @@ Packaging: a systemd unit next to `flux-hostd` on Linux, a service on Windows (G
 
 Today `/api/webtransport` returns a 60 s single-use ticket that only the issuing relay can verify (`wtTicketTTL` in `flux-web/auth.go`). Direct endpoints need tickets they can verify without calling back:
 
-- The central relay signs a ticket with an **ML-DSA-65** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, oidc_sub, preferred_username, is_admin, path: "direct", exp: now+60s, nonce}`. See [Cryptography](#cryptography-fips-approved-post-quantum).
+- The central relay signs a ticket with an **ML-DSA-87** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, oidc_sub, preferred_username, is_admin, path: "direct", exp: now+60s, nonce}`. See [Cryptography](#cryptography-cnsa-20-fips-approved-post-quantum).
 - Hosts receive the relay's public key at enrollment/registration and verify signature, `machine_id`, and `exp` locally; they keep a short nonce cache for single use.
 - No shared secret leaves the relay; a compromised host can't mint tickets for other hosts.
 
@@ -108,7 +108,7 @@ sequenceDiagram
     C-->>B: candidates [direct, relay] + signed tickets
     B->>D: WebTransport /wt?ticket=… (serverCertificateHashes)
     alt direct ready within ~1.5 s
-        D->>D: verify ML-DSA-65 ticket, machine_id, exp, nonce
+        D->>D: verify ML-DSA-87 ticket, machine_id, exp, nonce
         D-->>B: session (control stream + frame streams)
         D-)C: session/audit events
     else timeout or failure
@@ -126,24 +126,36 @@ WebTransport requires a secure page context. In hybrid deployments:
 
 For standalone direct mode (phase 3), the host serves the page itself, so it needs a browser-trusted certificate: mkcert for development, an internal CA, or ACME when the host has a DNS name.
 
-## Cryptography: FIPS-approved, post-quantum
+## Cryptography: CNSA 2.0 (FIPS-approved, post-quantum)
 
-Requirement: FIPS-approved algorithms, with post-quantum (PQC) protection.
+Requirement: FIPS-approved algorithms at CNSA 2.0 strength (ML-KEM-1024, ML-DSA-87, AES-256, SHA-384) on every leg, including the browser.
 
-| Use | Algorithm | Standard | PQC | Notes |
-| --- | --- | --- | --- | --- |
-| Ticket signatures (relay → direct endpoint) | ML-DSA-65 | FIPS 204 | Yes | Go `crypto/mldsa`. Signature 3,309 B, public key 1,952 B; ticket ≈ 4.6 KB base64url. Use ML-DSA-87 if CNSA 2.0 is the target. |
-| Host ↔ relay QUIC key exchange (both native) | SecP256r1MLKEM768 hybrid | FIPS 203 + SP 800-56A | Yes | Both components approved. Go `crypto/tls` and rustls (`aws-lc-rs` provider) both implement it; pin it as the only group on this leg. |
-| Browser ↔ relay / direct endpoint key exchange | X25519MLKEM768 hybrid | FIPS 203 (ML-KEM component) | Yes | The hybrid browsers offer today; ML-KEM-768 is the approved component. Prefer SecP256r1MLKEM768 if browsers add it. Go `crypto/tls` enables X25519MLKEM768 by default. |
-| TLS certificates / handshake signatures | ECDSA P-256 | FIPS 186-5 | No | Browsers don't accept ML-DSA certificates yet, and `serverCertificateHashes` certs are ECDSA today. Hybrid key exchange still protects recorded traffic ("harvest now, decrypt later"); authentication is only exposed to a live quantum attacker. Move to ML-DSA certs when browsers support them. |
-| Symmetric / hashes | AES-128/256-GCM, SHA-256/384 | FIPS 197, SP 800-38D, FIPS 180-4 | n/a | Restrict TLS 1.3 suites to AES-GCM (no ChaCha20-Poly1305) in FIPS builds. |
+| Use | Algorithm | Standard | Notes |
+| --- | --- | --- | --- |
+| Ticket signatures (relay → direct endpoint) | ML-DSA-87 | FIPS 204 | Go `crypto/mldsa`. Signature 4,627 B, public key 2,592 B; ticket ≈ 6.4 KB base64url. |
+| Host ↔ relay QUIC key exchange | ML-KEM-1024 (`MLKEM1024`, codepoint 0x0202) | FIPS 203 | Go `crypto/tls` `tls.MLKEM1024`; rustls `aws-lc-rs` provider `kx_group::MLKEM1024`. Pin as the only group on this leg. (rustls has no `SecP384r1MLKEM1024`, so the hybrid isn't an option here.) |
+| Browser ↔ relay / direct endpoint key exchange | ML-KEM-1024 (0x0202) | FIPS 203 | Firefox 154+ supports it (`security.tls.enable_mlkem1024`, or enterprise policy `CNSA2KeyAgreementEnabled`), for both TLS and HTTP/3. It isn't on by default, and Firefox ESR doesn't have it. |
+| TLS certificates / handshake signatures | ECDSA P-384 (CNSA 1.0, transitional) | FIPS 186-5 | Browsers don't accept ML-DSA certificates yet. Move to ML-DSA-87 when they do. |
+| TLS 1.3 cipher suite / hashes | `TLS_AES_256_GCM_SHA384`, SHA-384 | FIPS 197, SP 800-38D, FIPS 180-4 | No AES-128 or ChaCha20-Poly1305. |
 
-Implementation consequences:
+### Browser negotiation behaviour
 
-- **Go relay / direct endpoint:** build with the Go FIPS 140-3 module (`GOFIPS140=…`, `GODEBUG=fips140=on`). `crypto/mldsa` is available from module v1.26.0 (unavailable in v1.0.0). Set `tls.Config.CurvePreferences` per leg as above; quic-go uses `crypto/tls`, so this also applies to QUIC/WebTransport. Verify that the chosen module version permits each hybrid group in FIPS mode before release.
-- **Rust host:** switch rustls from the `ring` provider (no ML-KEM, not FIPS-validated) to `aws-lc-rs` with the `fips` feature (AWS-LC FIPS module) and `prefer-post-quantum`. This affects `flux-hostd` (QUIC to the relay), `flux-server`, and registration (`reqwest`).
-- **Browsers:** PQ key exchange depends on the browser offering X25519MLKEM768 (current Chrome, Edge, and Firefox do). The relay can log or label the negotiated group so non-PQ sessions are visible; a `pq-only` policy can reject them.
-- **Self-signed certificate rotation** stays ECDSA P-256 with ≤ 14-day validity (the `serverCertificateHashes` limit), as today.
+Firefox adds ML-KEM-1024 as the **last** supported group and never sends it as an initial key share. A server that requires it answers with a HelloRetryRequest, so CNSA 2.0 sessions take one extra round trip to set up (connection setup only; it doesn't affect frame latency). The relay and direct endpoints therefore set `CurvePreferences = [MLKEM1024]` in `cnsa2` mode.
+
+Per-deployment policy `FLUX_TLS_POLICY`:
+
+- `cnsa2`: only `MLKEM1024`. Browsers without it (Firefox ESR, Firefox with the pref off, and any browser that doesn't offer 0x0202) fail the handshake, and the UI shows a "browser does not support CNSA 2.0" error page with the pref/policy name.
+- `pq` (default): prefer `MLKEM1024`, then `SecP384r1MLKEM1024`, `SecP256r1MLKEM768`, `X25519MLKEM768`. No classical-only groups.
+
+The negotiated group is recorded per session (relay log + a `tls_group` label on a low-cardinality client info metric), so non-CNSA sessions are visible.
+
+### Implementation consequences
+
+- **Go relay / direct endpoint:** build with the Go FIPS 140-3 module (`GOFIPS140=…`, `GODEBUG=fips140=on`); `crypto/mldsa` needs module v1.26.0 or later. In Go 1.27 the FIPS-mode default groups include `SecP384r1MLKEM1024` and `MLKEM1024`. quic-go uses `crypto/tls`, so `CurvePreferences` applies to QUIC/WebTransport too.
+- **Go TLS 1.3 cipher suites aren't configurable** (`tls.Config.CipherSuites` only affects TLS 1.0–1.2), so Go can't be told to refuse AES-128. This must be resolved before claiming CNSA 2.0 compliance, either by confirming the FIPS-mode server picks AES-256 when the client offers it, or by patching/wrapping the suite selection.
+- **Rust host:** switch rustls from `ring` (no ML-KEM, not FIPS-validated) to `aws-lc-rs` with the `fips` feature, restricted to `MLKEM1024` and `TLS13_AES_256_GCM_SHA384`. This affects `flux-hostd` (QUIC to the relay), `flux-server`, and registration (`reqwest`).
+- **Certificates:** the relay's rotating self-signed certificate (`flux-web/certificate.go`, currently ECDSA P-256) and the direct endpoint's certificate move to ECDSA P-384 with ≤ 14-day validity. Whether browsers accept P-384 certificates for `serverCertificateHashes` still needs verifying; if they don't, CNSA deployments use CA-issued P-384 certificates (internal CA) instead of hash pinning.
+- **Fleet setup:** managed Firefox fleets enable `CNSA2KeyAgreementEnabled` through enterprise policy. The deployment docs need a supported-browser matrix (Firefox 154+ with the policy; ESR excluded).
 
 ## Security considerations
 
@@ -155,7 +167,7 @@ Implementation consequences:
 ## Phased plan (one PR each)
 
 1. **Host dial-out** — outbound QUIC from `flux-hostd` to the relay, relay accepts host-initiated connections; keep relay-initiated dialing as an option. Unblocks relay mode for NAT'd hosts.
-2. **Direct endpoint + signed tickets + discovery/fallback** — `FLUX_MODE=direct`, ML-DSA-65 tickets, hybrid ML-KEM key exchange on every leg, heartbeat-reported direct addresses and cert hash, candidate list, browser fallback, `path` metric label, per-machine path policy.
+2. **Direct endpoint + signed tickets + discovery/fallback** — `FLUX_MODE=direct`, ML-DSA-87 tickets, ML-KEM-1024 key exchange on every leg (`FLUX_TLS_POLICY`), heartbeat-reported direct addresses and cert hash, candidate list, browser fallback, `path` metric label, per-machine path policy.
 3. **Standalone direct (optional)** — direct endpoint serves its own UI with local auth for isolated LANs.
 
 ## Open questions
@@ -164,5 +176,5 @@ Implementation consequences:
 - Which addresses should a host advertise for direct mode — all interfaces, an admin-configured list, or only RFC 1918 + configured public address?
 - Should standalone direct (phase 3) use OIDC, or only host PAM login?
 - Windows hosts: ship the direct endpoint as a separate service, or embed it in `flux-server`?
-- FIPS target: ML-DSA-65 / ML-KEM-768 (NIST category 3), or CNSA 2.0 (ML-DSA-87 / ML-KEM-1024 on the host ↔ relay leg; browsers only offer ML-KEM-768)?
-- Reject or allow browser sessions that negotiate a non-PQ group (`pq-only` policy)?
+- Should `cnsa2` be the default `FLUX_TLS_POLICY`, or opt-in per deployment?
+- Which browsers besides Firefox 154+ offer ML-KEM-1024 (0x0202)? (Not yet checked for Chrome, Edge, or Safari.)
