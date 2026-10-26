@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"log"
 	"net"
@@ -23,8 +24,29 @@ const (
 	dscpAF41         = 34 << 2
 )
 
+func webTransportListenAddr() string {
+	listenAddr := strings.TrimSpace(os.Getenv("FLUX_WT_ADDR"))
+	if listenAddr == "" {
+		listenAddr = ":8443"
+	}
+	return listenAddr
+}
+
+func webTransportDiscoveryPort() int {
+	addr, err := net.ResolveUDPAddr("udp", webTransportListenAddr())
+	if err != nil || addr.Port == 0 {
+		return webTransportPort
+	}
+	return addr.Port
+}
+
 func listenWebTransportUDP() (*net.UDPConn, error) {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: webTransportPort})
+	listenAddr := webTransportListenAddr()
+	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +56,7 @@ func listenWebTransportUDP() (*net.UDPConn, error) {
 	if err := ipv6.NewConn(conn).SetTrafficClass(dscpAF41); err != nil {
 		log.Printf("[webtransport] DSCP(IPv6) not set: %v", err)
 	}
-	log.Printf("[webtransport] HTTP/3 UDP listener on :%d (DSCP AF41)", webTransportPort)
+	log.Printf("[webtransport] HTTP/3 UDP listener on %s (DSCP AF41)", udpAddr)
 	return conn, nil
 }
 
@@ -69,6 +91,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load WebTransport TLS certificate: %v", err)
 	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("FLUX_MODE")), "direct") {
+		if err := runDirectMode(registry, sessions, certificates, clipboardStore, frameServerAddr); err != nil {
+			log.Fatalf("direct mode: %v", err)
+		}
+		return
+	}
 	hostLinkAddr := strings.TrimSpace(os.Getenv("FLUX_HOST_LINK_ADDR"))
 	if hostLinkAddr == "" {
 		hostLinkAddr = ":8444"
@@ -96,22 +124,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("OIDC provider init: %v", err)
 	}
-	wtServer := newWebTransportServer(registry, sessions, certificates, authService, clipboardStore)
-	udpConn, err := listenWebTransportUDP()
+	ticketSigner, err := loadTicketSigner(storeDirFromEnv())
+	if err != nil {
+		log.Fatalf("load direct ticket signer: %v", err)
+	}
+	wtServer := newWebTransportServer(registry, sessions, certificates, authService, clipboardStore, nil)
+	_, err = startWebTransport(wtServer)
 	if err != nil {
 		log.Fatalf("listen for WebTransport: %v", err)
 	}
-	go func() {
-		if err := wtServer.Serve(udpConn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[webtransport] HTTP/3 server stopped: %v", err)
-		}
-	}()
 	rotationCtx, stopRotation := context.WithCancel(context.Background())
 	defer stopRotation()
 	go certificates.runRotation(rotationCtx)
 
 	webAddr := ":8080"
-	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"), authService, clipboardStore)
+	r := newWebHandler(registry, sessions, certificates, os.Getenv("FLUX_WT_PUBLIC_HOST"), authService, clipboardStore, ticketSigner)
 	httpHandler := http.Handler(r)
 	httpsAddr := strings.TrimSpace(os.Getenv("FLUX_HTTPS_ADDR"))
 	if httpsAddr == "" {
@@ -144,6 +171,7 @@ func newWebHandler(
 	publicHost string,
 	authService *authService,
 	clipboardStore *store,
+	signer *ticketSigner,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
@@ -151,16 +179,57 @@ func newWebHandler(
 	authService.registerRoutes(r)
 	api := r.Group("/api", authService.requireUser())
 	admin := r.Group("/api", authService.requireUser(), authService.requireAdmin())
-	registerMachineRoutes(api, r.Group("/api", authService.requireMachineToken()), registry)
+	machineAPI := r.Group("/api", authService.requireMachineToken())
+	registerMachineRoutes(api, machineAPI, registry)
+	machineAPI.GET("/relay/ticket-key", func(c *gin.Context) {
+		if signer == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ticket signing key unavailable"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"alg":        "ML-DSA-87",
+			"public_key": base64.StdEncoding.EncodeToString(signer.publicKey()),
+		})
+	})
 	registerSessionRoutes(api, admin, sessions)
 	registerPolicyRoutes(admin, registry, authService)
 	api.GET("/webtransport", func(c *gin.Context) {
 		user := authService.userFrom(c)
+		machineID := c.Query("machine")
+		if machineID == "" {
+			machineID = "default"
+		}
+		clipboardMode := defaultMachinePolicy().Mode
+		if clipboardStore != nil {
+			clipboardMode = clipboardStore.getPolicy(machineID).Mode
+		}
+		relayPort := webTransportDiscoveryPort()
+		candidates := make([]gin.H, 0)
+		if signer != nil {
+			if machine, err := registry.get(machineID); err == nil {
+				for _, direct := range machine.DirectCandidates {
+					ticket, err := signer.sign(user, machineID, clipboardMode)
+					if err != nil {
+						log.Printf("[ticket] sign direct candidate for %s: %v", machineID, err)
+						continue
+					}
+					candidates = append(candidates, gin.H{
+						"path": "direct", "url": direct.URL, "certHashes": direct.CertHashes, "ticket": ticket,
+					})
+				}
+			}
+		}
+		relayTicket := authService.issueTicket(user)
+		candidates = append(candidates, gin.H{
+			"path": "relay", "host": publicHost, "port": relayPort,
+			"certHashes": certificates.certificateHashes(), "ticket": relayTicket,
+		})
 		c.JSON(http.StatusOK, gin.H{
 			"host":       publicHost,
-			"port":       webTransportPort,
+			"port":       relayPort,
 			"certHashes": certificates.certificateHashes(),
-			"ticket":     authService.issueTicket(user),
+			"ticket":     relayTicket,
+			"candidates": candidates,
 		})
 	})
 	api.GET("/me", func(c *gin.Context) {
@@ -212,7 +281,8 @@ func withHTTPSRedirect(handler http.Handler, httpsAddr string) http.Handler {
 
 func webHTTPSTLSConfig(certificates *relayCertificateManager) *tls.Config {
 	return &tls.Config{
-		MinVersion:     tls.VersionTLS13,
-		GetCertificate: certificates.getCertificate,
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: pqCurvePreferences(),
+		GetCertificate:   certificates.getCertificate,
 	}
 }

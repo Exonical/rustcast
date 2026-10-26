@@ -7,6 +7,7 @@ import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readCo
 import { parseAudioHeader } from "./audio-framing";
 import { CLIPBOARD_MIME, type ClipboardPayload, type ClipboardStatus } from "./clipboard";
 import type { HostLoginMessage } from "./login";
+import { connectFirst, orderCandidates, type Candidate, type CandidateTransport, type DiscoveryCandidates } from "./candidates";
 
 export type ConnectionState = "disconnected" | "connecting" | "login" | "connected" | "failed";
 
@@ -82,7 +83,7 @@ interface ControlMessage {
   data?: unknown;
 }
 
-interface DiscoveryResponse {
+interface DiscoveryResponse extends DiscoveryCandidates {
   host: string;
   port: number;
   certHashes: string[];
@@ -108,6 +109,32 @@ export function webtransportURL(discovery: DiscoveryResponse, opts: {
   return url;
 }
 
+function candidateURL(candidate: Candidate, discovery: DiscoveryResponse, opts: {
+  hostname: string;
+  machineId?: string | null;
+  userAgent?: string;
+  resolution?: { width: number; height: number } | null;
+}): URL {
+  if (candidate.path === "relay") {
+    return webtransportURL({
+      host: candidate.host ?? discovery.host,
+      port: candidate.port ?? discovery.port,
+      certHashes: candidate.certHashes ?? discovery.certHashes,
+      ticket: candidate.ticket,
+    }, opts);
+  }
+  if (!candidate.url) throw new Error("Direct candidate has no URL");
+  const url = new URL(candidate.url);
+  if (opts.machineId) url.searchParams.set("machine", opts.machineId);
+  if (opts.userAgent) url.searchParams.set("user_agent", opts.userAgent);
+  if (candidate.ticket) url.searchParams.set("ticket", candidate.ticket);
+  if (opts.resolution) {
+    url.searchParams.set("width", String(opts.resolution.width));
+    url.searchParams.set("height", String(opts.resolution.height));
+  }
+  return url;
+}
+
 interface FrameMetadata {
   receivedAt: number;
   decodeStarted: number;
@@ -118,6 +145,7 @@ interface FrameMetadata {
 
 export class WebTransportClient {
   private transport: WebTransport | null = null;
+  connectionPath: Candidate["path"] | null = null;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private decoder: VideoDecoder | null = null;
   private decoderConfig: VideoDecoderConfig | null = null;
@@ -178,6 +206,7 @@ export class WebTransportClient {
   onClipboard: ((payload: ClipboardPayload) => void) | null = null;
   onClipboardStatus: ((status: ClipboardStatus) => void) | null = null;
   onLogin: ((message: HostLoginMessage) => void) | null = null;
+  onConnectionPathChange: ((path: Candidate["path"] | null) => void) | null = null;
   private clipboardWaiter: {
     resolve: (status: ClipboardStatus | null) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -187,6 +216,39 @@ export class WebTransportClient {
     private readonly machineId?: string,
     private resolution?: { width: number; height: number },
   ) {}
+
+  private directFailedAt(machineId: string): number | undefined {
+    try {
+      const value = sessionStorage.getItem(`flux:direct-failed-at:${machineId}`);
+      if (!value) return undefined;
+      const timestamp = Number(value);
+      return Number.isFinite(timestamp) ? timestamp : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private rememberDirectFailure(machineId: string): void {
+    try {
+      sessionStorage.setItem(`flux:direct-failed-at:${machineId}`, String(Date.now()));
+    } catch {
+      // Storage can be unavailable in private or restricted browsing contexts.
+    }
+  }
+
+  private clearDirectFailure(machineId: string): void {
+    try {
+      sessionStorage.removeItem(`flux:direct-failed-at:${machineId}`);
+    } catch {
+      // Storage can be unavailable in private or restricted browsing contexts.
+    }
+  }
+
+  private setConnectionPath(path: Candidate["path"] | null): void {
+    if (this.connectionPath === path) return;
+    this.connectionPath = path;
+    this.onConnectionPathChange?.(path);
+  }
 
   get requestedResolution(): { width: number; height: number } | undefined {
     return this.resolution ? { ...this.resolution } : undefined;
@@ -202,6 +264,7 @@ export class WebTransportClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.closeCurrent();
+    this.setConnectionPath(null);
     this.attachVisibilityListener();
     this.generation++;
     const generation = this.generation;
@@ -214,7 +277,8 @@ export class WebTransportClient {
     this.waitingForKeyframe = true;
     this.resetStats();
     try {
-      const response = await fetch("/api/webtransport");
+      const machineId = this.machineId || "default";
+      const response = await fetch(`/api/webtransport?machine=${encodeURIComponent(machineId)}`);
       if (response.status === 401) {
         // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- /auth/login is a relay route, not a Next page
         window.location.assign("/auth/login?next=" + encodeURIComponent(location.pathname + location.search));
@@ -222,23 +286,30 @@ export class WebTransportClient {
       }
       if (!response.ok) throw new Error(`WebTransport discovery failed: ${response.status}`);
       const discovery = await response.json() as DiscoveryResponse;
-      const url = webtransportURL(discovery, {
+      const candidates = orderCandidates(discovery, this.directFailedAt(machineId));
+      const { candidate, transport } = await connectFirst(candidates, (next) => {
+        const url = candidateURL(next, discovery, {
         hostname: location.hostname,
-        machineId: this.machineId,
+        machineId,
         userAgent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
         resolution: this.resolution,
       });
-      const hashes = (discovery.certHashes ?? []).map((hash) => ({
-        algorithm: "sha-256",
-        value: Uint8Array.from(atob(hash), (character) => character.charCodeAt(0)),
-      }));
-      const transport = new WebTransport(url, hashes.length ? { serverCertificateHashes: hashes } : undefined);
+        const hashes = (next.certHashes ?? []).map((hash) => ({
+          algorithm: "sha-256",
+          value: Uint8Array.from(atob(hash), (character) => character.charCodeAt(0)),
+        }));
+        const transport = new WebTransport(url, hashes.length ? { serverCertificateHashes: hashes } : undefined);
+        return { transport: transport as CandidateTransport & WebTransport, ready: transport.ready };
+      }, { direct: 1500, relay: 10000 }, (failedCandidate) => {
+        if (failedCandidate.path === "direct") this.rememberDirectFailure(machineId);
+      });
       this.transport = transport;
-      await transport.ready;
+      this.setConnectionPath(candidate.path);
       if (generation !== this.generation) {
         transport.close({ closeCode: 0, reason: "superseded" });
         return;
       }
+      if (candidate.path === "direct") this.clearDirectFailure(machineId);
       const control = await transport.createBidirectionalStream();
       this.controlWriter = control.writable.getWriter();
       if (this.resumeKeyframeRequestPending) {
@@ -258,6 +329,7 @@ export class WebTransportClient {
       if (generation !== this.generation) return;
       console.error("WebTransport connection failed", error);
       this.closeCurrent();
+      this.setConnectionPath(null);
       this.setState("failed");
       this.scheduleReconnect();
     }
@@ -723,6 +795,7 @@ export class WebTransportClient {
       droppedByReason,
       decoder: this.decoderType,
       browser: browserFamily(navigator.userAgent),
+      path: this.connectionPath,
     });
     this.clientWindowFrames = 0;
     this.clientWindowBytes = 0;
@@ -787,6 +860,7 @@ export class WebTransportClient {
     this.frameMetadata.clear();
     this.transport?.close({ closeCode: 0, reason: "client closing" });
     this.transport = null;
+    this.setConnectionPath(null);
   }
 
   private resetStats(): void {

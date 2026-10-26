@@ -35,13 +35,14 @@ const (
 type quicConnContextKey struct{}
 
 type Session struct {
-	transport *webtransport.Session
-	control   *webtransport.Stream
-	quicConn  *quic.Conn
-	id        string
-	user      *identity
-	clientIP  string
-	store     *store
+	transport               *webtransport.Session
+	control                 *webtransport.Stream
+	quicConn                *quic.Conn
+	id                      string
+	user                    *identity
+	clientIP                string
+	store                   *store
+	clipboardPolicyOverride *machinePolicy
 	// writeFn overrides writeControl in tests; nil uses the real stream.
 	writeFn func(controlMessage) error
 
@@ -72,7 +73,13 @@ type controlMessage struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
-func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, auth *authService, store *store) *webtransport.Server {
+type directWebTransportMode struct {
+	machineID  string
+	verifier   *ticketVerifier
+	refreshKey func()
+}
+
+func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, auth *authService, store *store, direct *directWebTransportMode) *webtransport.Server {
 	mux := http.NewServeMux()
 	server := &webtransport.Server{
 		H3: &http3.Server{
@@ -91,12 +98,12 @@ func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry,
 		CheckOrigin: func(*http.Request) bool { return true },
 	}
 	mux.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
-		handleWebTransport(w, r, server, registry, sessions, auth, store)
+		handleWebTransport(w, r, server, registry, sessions, auth, store, direct)
 	})
 	return server
 }
 
-func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry, auth *authService, store *store) {
+func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry, auth *authService, store *store, direct *directWebTransportMode) {
 	// WebTransport doesn't carry the session cookie; redeem a one-time
 	// ticket issued by /api/webtransport when auth is enabled.
 	machineID := r.URL.Query().Get("machine")
@@ -104,7 +111,19 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		machineID = "default"
 	}
 	var user *identity
-	if auth != nil && auth.enabled {
+	if direct != nil {
+		machineID = "default"
+		var err error
+		user, err = direct.verifier.verify(r.URL.Query().Get("ticket"), direct.machineID)
+		if err != nil {
+			if errors.Is(err, errInvalidTicketSignature) && direct.refreshKey != nil {
+				direct.refreshKey()
+			}
+			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
+			http.Error(w, "unauthenticated", http.StatusUnauthorized)
+			return
+		}
+	} else if auth != nil && auth.enabled {
 		user = auth.consumeTicket(r.URL.Query().Get("ticket"))
 		if user == nil {
 			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
@@ -134,6 +153,10 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		sessionDone: make(chan struct{}),
 		user:        user,
 		store:       store,
+	}
+	if direct != nil {
+		policy := machinePolicyForClipboardMode(user.ClipboardPolicy)
+		session.clipboardPolicyOverride = &policy
 	}
 	session.audioEnabled.Store(true)
 	if conn, ok := r.Context().Value(quicConnContextKey{}).(*quic.Conn); ok {
@@ -270,10 +293,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	}
 	// Tell the viewer the current clipboard policy up front (empty direction,
 	// ok result) so the UI can gate its clipboard UI without a first send.
-	policyMode := clipModeBoth
-	if store != nil {
-		policyMode = store.getPolicy(machineID).Mode
-	}
+	policyMode := session.sessionClipboardPolicy(store).Mode
 	if err := session.writeControl(clipStatusMessage("", clipResultOK, policyMode)); err != nil {
 		log.Printf("[webtransport] clipboard-status for session %s failed: %v", id, err)
 	}

@@ -1,6 +1,6 @@
 # Design: Relay and Direct connection modes
 
-Status: **proposal** — nothing here is implemented yet. Current behaviour is documented in [../transport.md](../transport.md).
+Status: **phase 2a implemented**; phase 2b and standalone direct remain planned. Current behaviour is documented in [../transport.md](../transport.md).
 
 ## Goal
 
@@ -9,7 +9,7 @@ Support two media paths for a viewer session, on a LAN or across the internet (W
 - **Relay mode** (today): browser ⇄ central relay ⇄ host.
 - **Direct mode** (new): browser ⇄ host, with no relay hop for media.
 
-The central relay remains the control plane in both modes: machine list, OIDC login, authorization, tickets, audit, and metrics. Only the media/control *path* differs.
+The central relay remains the control plane in both modes: machine list, OIDC login, authorization, ticket issuance, and metrics. Direct-mode login and clipboard audit are stored locally until phase 2b forwards them centrally.
 
 ## When each mode applies
 
@@ -33,7 +33,7 @@ flowchart LR
         Signer["Ticket signer<br/>ML-DSA-87 (FIPS 204)"]
     end
     subgraph Host["Host machine"]
-        DWT["Direct endpoint<br/>flux-web --mode=direct<br/>HTTP/3 :8443/UDP"]
+        DWT["Direct endpoint<br/>flux-direct.service<br/>HTTP/3 :8445/UDP in pod"]
         Hostd["flux-hostd<br/>PAM login, session"]
         Agent["flux-server<br/>capture + encode"]
     end
@@ -68,17 +68,18 @@ Run the existing relay binary on each host in a single-machine mode (`FLUX_MODE=
 
 Why reuse the Go relay instead of WebTransport in Rust: the rate control, login, and clipboard logic would otherwise exist in two languages. The extra process costs only a loopback hop (well under 1 ms). A native Rust endpoint remains a later option if a single host binary becomes a requirement.
 
-Packaging: a systemd unit next to `flux-hostd` on Linux, a service on Windows (Go cross-compiles; on Windows the upstream is standalone `flux-server`'s frame port instead of hostd).
+Packaging: the Linux host image builds `flux-web` without the UI and enables `flux-direct.service` after `flux-hostd`. Its wrapper exits successfully when `FLUX_DIRECT_ADDRS` is unset; otherwise it runs the endpoint with a separate `/var/lib/flux-direct` data directory and loopback upstream to hostd. The pod shares a network namespace with the relay, so it sets `FLUX_DIRECT_PORT=8445` to avoid relay UDP :8443; the wrapper uses that port for its default `FLUX_WT_ADDR`. The listener remains configurable and defaults to :8443 outside this pod setup.
 
 ### 3. Signed tickets
 
 Today `/api/webtransport` returns a 60 s single-use ticket that only the issuing relay can verify (`wtTicketTTL` in `flux-web/auth.go`). Direct endpoints need tickets they can verify without calling back:
 
-- The central relay signs a ticket with an **ML-DSA-87** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, oidc_sub, preferred_username, is_admin, path: "direct", exp: now+60s, nonce}`. See [Cryptography](#cryptography-fips-approved-algorithms-by-default).
-- Hosts receive the relay's public key at enrollment/registration and verify signature, `machine_id`, and `exp` locally; they keep a short nonce cache for single use.
+- The central relay signs a 60-second ticket with an **ML-DSA-87** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, sub, username, email, name, admin, clipboard, path: "direct", exp, nonce}`. The 32-byte signing seed is stored at `$FLUX_DATA_DIR/ticket-mldsa87.seed` with mode `0600`. See [Cryptography](#cryptography-fips-approved-algorithms-by-default).
+- A direct endpoint loads `FLUX_TICKET_PUBLIC_KEY` when pinned, otherwise fetches `GET /api/relay/ticket-key` with `FLUX_RELAY_TOKEN` and caches the key under `$FLUX_DATA_DIR/ticket-key.pub`. It refuses non-HTTPS relay URLs except HTTP loopback. Cached keys permit startup during relay outages. The active key refreshes every five minutes and asynchronously after a signature failure, throttled to once per 30 seconds; failed refreshes preserve the active key. Pinning disables all refresh.
+- Ticket verification checks signature, version, path, machine ID, expiry, and single-use nonce. The nonce cache survives public-key replacement. The signed `clipboard` mode is enforced by the direct session; missing policy fails closed as `off`.
 - No shared secret leaves the relay; a compromised host can't mint tickets for other hosts.
 
-The direct endpoint forwards login results, clipboard audit rows, and session start/end to the central relay (over the host's outbound connection) so audit stays centralized. If the relay is unreachable, events queue locally with a bounded buffer.
+Login and clipboard audit remain in the direct endpoint's local SQLite store for now. Forwarding audit and login events to the central relay is phase 2b.
 
 ### 4. Discovery and fallback
 
@@ -87,14 +88,15 @@ The direct endpoint forwards login results, clipboard audit rows, and session st
 ```json
 {
   "candidates": [
-    {"path": "direct", "url": "https://192.168.1.20:8443/wt", "certHashes": ["…"], "ticket": "<signed>"},
+    {"path": "direct", "url": "https://192.168.1.20:8445/wt", "certHashes": ["…"], "ticket": "<signed>"},
     {"path": "relay",  "url": "https://relay.example.com:8443/wt", "certHashes": [],    "ticket": "<relay ticket>"}
   ]
 }
 ```
 
-- Direct candidates come from the host's heartbeat (its reachable addresses + current certificate hash). Admin policy per machine: `auto` (default), `direct-only`, `relay-only`.
-- The browser tries the first candidate with a short timeout (≈1.5 s to `WebTransport.ready`), then the next. Later reconnects reuse the last path that worked, and retry direct in the background.
+- Direct addresses are admin-configured with `FLUX_DIRECT_ADDRS` (comma-separated); the host reports these candidates and the direct endpoint's certificate hashes in registration and heartbeat updates. In the pod, the direct endpoint is published on UDP :8445.
+- Self-signed certificates are pre-generated before activation, live for 13 days, and rotate every six days. For the ten minutes before rotation, the relay and direct endpoint advertise `[current, next]` hashes, then advertise the new active hash first. Hostd's heartbeat interval is five seconds, so the ten-minute overlap exceeds twice that interval. The 13-day certificate lifetime remains within the browser's 14-day certificate-hash pinning limit.
+- The browser tries the first candidate with a 1.5 s direct setup timeout; on failure it closes that transport and tries the next candidate. Relay gets 10 s. It records `directFailedAt` per machine in `sessionStorage` only after a direct attempt fails and prefers relay first for five minutes; relay success does not renew the timestamp, and direct success clears it. `path` is reported in client stats.
 - The UI shows the active path, and client stats gain a `path` label (`direct`/`relay`) so metrics separate the two.
 
 ```mermaid
@@ -123,6 +125,7 @@ WebTransport requires a secure page context. In hybrid deployments:
 
 - The page is served by the central relay over normally trusted HTTPS.
 - The direct endpoint uses a short-lived self-signed ECDSA P-256 certificate (the same scheme the relay already uses: 13-day lifetime, 6-day rotation in `flux-web/certificate.go`). The host reports the current hash in its heartbeat, and the browser pins it via `serverCertificateHashes`. **Hosts need no publicly trusted certificate.**
+- The relay's rotating self-signed WebTransport certificate is not trusted by the host for host dial-out; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA the host trusts, or provide that CA through `FLUX_RELAY_CA_FILE`.
 
 For standalone direct mode (phase 3), the host serves the page itself, so it needs a browser-trusted certificate: mkcert for development, an internal CA, or ACME when the host has a DNS name.
 
@@ -148,7 +151,7 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
 
 ## Security considerations
 
-- Direct endpoints listen on UDP `:8443` on the host; they accept only valid signed tickets and serve nothing else.
+- Direct endpoints accept only valid signed tickets and serve nothing else. In the pod they listen on UDP `:8445`, separate from the relay's :8443 listener.
 - Hosts never accept plaintext frame traffic from non-loopback peers (unchanged `FLUX_FRAME_ALLOW_PLAINTEXT` rule).
 - PAM login on the host still gates the desktop in every mode.
 - Revocation: tickets live 60 s; disabling a machine or user at the relay stops new tickets, and the relay can push a "disconnect session" message over the host's outbound connection.
@@ -158,13 +161,13 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
 1. **Host dial-out — implemented.** `flux-hostd` opens an authenticated outbound QUIC link; the relay parks it and reuses the existing frame/command streams. Relay-dial mode remains the default.
    - Relay: `FLUX_HOST_LINK_ADDR` (default `:8444`, `off` disables); host: `FLUX_RELAY_QUIC_ADDR` and optional `FLUX_RELAY_CA_FILE`.
    - The relay's rotating self-signed WebTransport certificate is not trusted by the host; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA trusted by the host, or supply the CA via `FLUX_RELAY_CA_FILE`.
-2. **Direct endpoint + signed tickets + discovery/fallback** — `FLUX_MODE=direct`, ML-DSA-87 tickets, FIPS-approved, PQ-preferred TLS groups on every leg, heartbeat-reported direct addresses and cert hash, candidate list, browser fallback, `path` metric label, per-machine path policy.
+2a. **Direct endpoint + signed tickets + discovery/fallback — implemented.** Includes the host-image `flux-direct.service`, ML-DSA-87 tickets with refresh/pinning, ticket-carried clipboard policy, PQ-preferred Go TLS groups, heartbeat-reported direct addresses and overlapping certificate hashes, browser fallback, and connection-path indicator.
+2b. **Remaining direct-mode work.** Add `aws-lc-rs`/ML-KEM on the Rust host, per-machine path policy, a `path` metric label, background direct retry, and audit forwarding to the central relay.
 3. **Standalone direct (optional)** — direct endpoint serves its own UI with local auth for isolated LANs.
 
 ## Open questions
 
 - Per-host credentials instead of the shared `FLUX_RELAY_TOKEN` for host dial-out (enrollment tokens, mTLS)?
-- Which addresses should a host advertise for direct mode — all interfaces, an admin-configured list, or only RFC 1918 + configured public address?
 - Should standalone direct (phase 3) use OIDC, or only host PAM login?
 - Windows hosts: ship the direct endpoint as a separate service, or embed it in `flux-server`?
 - Which browsers besides Firefox 154+ offer ML-KEM-1024 (0x0202)? (Not yet checked for Chrome, Edge, or Safari.)

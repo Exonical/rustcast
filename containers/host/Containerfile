@@ -1,5 +1,6 @@
 # Build context: repository root.
 ARG ROCKY_IMAGE=docker.io/rockylinux/rockylinux:10
+ARG GO_IMAGE=docker.io/library/golang:1.27
 ARG FLUX_FEATURES=capture-mutter,encoder-ffmpeg,encoder-vulkan,audio-pipewire
 # Mesa 25.3.x — 26.x needs libdrm >= 2.4.133 but Rocky 10 ships 2.4.128.
 ARG MESA_VERSION=25.3.6
@@ -35,6 +36,14 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
  && cargo build --release -p flux-hostd \
  && install -D target/release/flux-server /out/flux-server \
  && install -D target/release/flux-hostd /out/flux-hostd
+
+FROM ${GO_IMAGE} AS flux-web
+WORKDIR /src
+COPY flux-web/go.mod flux-web/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY flux-web/*.go ./
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -o /out/flux-web .
 
 # Mesa's Vulkan drivers built with video codecs enabled — Rocky 10 builds mesa
 # without VK_KHR_video_* (patented-codec strip), so RADV hardware encode needs
@@ -119,17 +128,18 @@ RUN dnf -y --setopt=install_weak_deps=False install \
       libpam-authentik-0.72.3 libnss-authentik-0.72.3 \
  && dnf clean all
 RUN chmod 0755 /usr/local/bin/flux-env /usr/local/bin/flux-render-sssd /usr/local/bin/flux-gen-config /usr/local/bin/flux-wait-mutter \
-      /usr/local/bin/flux-ak-join \
+      /usr/local/bin/flux-ak-join /usr/local/bin/flux-direct \
  && groupadd -g 8001 devgroup \
  && useradd --no-create-home --uid 2101 --gid 8001 --groups systemd-journal devuser \
  && dconf update \
  && systemctl --global enable pipewire.socket pipewire.service wireplumber.service \
       pipewire-pulse.socket pipewire-pulse.service \
- && systemctl enable flux-env.service flux-hostd.service flux-ak-join.service ak-sysd.service sssd.service \
+ && systemctl enable flux-env.service flux-hostd.service flux-direct.service flux-ak-join.service ak-sysd.service sssd.service \
  && systemctl mask systemd-resolved.service polkit.service rtkit-daemon.service geoclue.service \
       systemd-networkd.service systemd-firstboot.service getty@tty1.service
 COPY --from=builder /out/flux-server /usr/local/bin/flux-server
 COPY --from=builder /out/flux-hostd /usr/local/bin/flux-hostd
+COPY --from=flux-web /out/flux-web /usr/local/bin/flux-web
 ENV container=podman
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

@@ -12,7 +12,7 @@ mod proto;
 mod rate;
 mod session;
 
-use flux_core::config::FluxConfig;
+use flux_core::config::{FluxConfig, DEFAULT_DIRECT_PORT};
 use flux_core::platform::PlatformInfo;
 use flux_core::registration::{self, RuntimeStatus};
 use osuser::OsUser;
@@ -115,6 +115,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.relay.base_url = env("FLUX_RELAY_URL");
     config.relay.advertise_host = env("FLUX_ADVERTISE_HOST").or(Some("127.0.0.1".into()));
     config.relay.token = env("FLUX_RELAY_TOKEN");
+    config.relay.direct_addrs = env("FLUX_DIRECT_ADDRS")
+        .map(|addrs| {
+            addrs
+                .split(',')
+                .map(str::trim)
+                .filter(|addr| !addr.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    config.relay.direct_default_port = env("FLUX_DIRECT_PORT")
+        .and_then(|port| port.parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_DIRECT_PORT);
+    config.relay.direct_status_file = Some(
+        env("FLUX_DIRECT_STATUS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/run/flux/direct.json")),
+    );
     let relay_quic_addr = env("FLUX_RELAY_QUIC_ADDR");
     config.relay.host_dials_out = relay_quic_addr.is_some();
     if let Some(size) = env("FLUX_DISPLAY_SIZE") {

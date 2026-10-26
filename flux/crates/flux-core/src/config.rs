@@ -47,8 +47,7 @@ impl FluxConfig {
 
     /// Write configuration to a TOML file.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let contents =
-            toml::to_string_pretty(self).map_err(|e| FluxError::Config(format!("serialize error: {e}")))?;
+        let contents = toml::to_string_pretty(self).map_err(|e| FluxError::Config(format!("serialize error: {e}")))?;
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -73,7 +72,7 @@ impl Default for FluxConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
     /// Base URL of the Flux web relay, for example http://relay:8080.
     #[serde(default)]
@@ -92,6 +91,38 @@ pub struct RelayConfig {
     /// Whether the host establishes an outbound QUIC link to the relay.
     #[serde(default)]
     pub host_dials_out: bool,
+
+    /// Public addresses for a direct WebTransport endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addrs: Vec<String>,
+
+    /// Port to append to direct addresses that do not specify one.
+    #[serde(default = "default_direct_port")]
+    pub direct_default_port: u16,
+
+    /// File containing the direct endpoint's current certificate hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_status_file: Option<PathBuf>,
+}
+
+pub const DEFAULT_DIRECT_PORT: u16 = 8443;
+
+fn default_direct_port() -> u16 {
+    DEFAULT_DIRECT_PORT
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            advertise_host: None,
+            token: None,
+            host_dials_out: false,
+            direct_addrs: Vec::new(),
+            direct_default_port: DEFAULT_DIRECT_PORT,
+            direct_status_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

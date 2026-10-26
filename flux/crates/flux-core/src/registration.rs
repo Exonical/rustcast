@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ pub struct RegistrationHandle {
     pub stop: oneshot::Sender<()>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Registration {
     id: String,
     name: String,
@@ -56,6 +57,21 @@ struct Registration {
     quic_cert_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     host_dials_out: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    direct_candidates: Vec<DirectCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct DirectCandidate {
+    url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cert_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectStatus {
+    #[serde(default)]
+    cert_hashes: Vec<String>,
 }
 
 pub fn start(
@@ -128,7 +144,12 @@ pub fn start(
         logged_in_user: None,
         quic_cert_sha256: None,
         host_dials_out: config.relay.host_dials_out,
+        direct_candidates: Vec::new(),
     };
+    let direct_addrs = config.relay.direct_addrs.clone();
+    let direct_default_port = config.relay.direct_default_port;
+    let direct_status_file = config.relay.direct_status_file.clone();
+    let direct_status_warned = Arc::new(AtomicBool::new(false));
     let token = std::env::var("FLUX_RELAY_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
@@ -154,6 +175,21 @@ pub fn start(
         let mut first = true;
         loop {
             let mut current = registration.clone();
+            if !direct_addrs.is_empty() {
+                current.direct_candidates = match build_direct_candidates(
+                    &direct_addrs,
+                    direct_status_file.as_deref(),
+                    direct_default_port,
+                ) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        if !direct_status_warned.swap(true, Ordering::Relaxed) {
+                            tracing::warn!("Direct candidate status unavailable: {error}");
+                        }
+                        Vec::new()
+                    }
+                };
+            }
             if let Ok(snapshot) = status.read() {
                 current.display_name = snapshot.display_name.clone().unwrap_or_default();
                 if let Some(backend) = &snapshot.encoder_backend {
@@ -204,6 +240,69 @@ pub fn start(
     Some(RegistrationHandle { stop: stop_tx })
 }
 
+fn build_direct_candidates(
+    addrs: &[String],
+    status_file: Option<&Path>,
+    default_port: u16,
+) -> Result<Vec<DirectCandidate>, String> {
+    if addrs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let status_file = status_file.ok_or_else(|| "FLUX_DIRECT_STATUS_FILE is not set".to_string())?;
+    let status_json =
+        std::fs::read_to_string(status_file).map_err(|error| format!("read {}: {error}", status_file.display()))?;
+    let status: DirectStatus =
+        serde_json::from_str(&status_json).map_err(|error| format!("parse {}: {error}", status_file.display()))?;
+    let cert_hashes = status.cert_hashes;
+    Ok(addrs
+        .iter()
+        .filter_map(|addr| normalize_direct_addr(addr, default_port))
+        .map(|addr| DirectCandidate {
+            url: format!("https://{addr}/wt"),
+            cert_hashes: cert_hashes.clone(),
+        })
+        .collect())
+}
+
+fn normalize_direct_addr(addr: &str, default_port: u16) -> Option<String> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    let default_port = if default_port == 0 { 8443 } else { default_port };
+    if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
+        return Some(format!("[{ip}]:{default_port}"));
+    }
+    if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+        return Some(format!("{ip}:{default_port}"));
+    }
+    if addr.starts_with('[') {
+        if addr.ends_with(']') {
+            return Some(format!("{addr}:{default_port}"));
+        }
+        if addr
+            .rsplit_once("]:")
+            .is_some_and(|(host, port)| host.starts_with('[') && port.parse::<u16>().is_ok())
+        {
+            return Some(addr.to_string());
+        }
+        return None;
+    }
+    if addr.matches(':').count() == 0 {
+        return Some(format!("{addr}:{default_port}"));
+    }
+    if addr.parse::<std::net::SocketAddr>().is_ok() {
+        return Some(addr.to_string());
+    }
+    if addr
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
+    {
+        return Some(addr.to_string());
+    }
+    None
+}
+
 pub fn load_or_create_id(path: &Path) -> std::io::Result<String> {
     if let Ok(id) = std::fs::read_to_string(path) {
         let id = id.trim();
@@ -217,4 +316,68 @@ pub fn load_or_create_id(path: &Path) -> std::io::Result<String> {
     }
     std::fs::write(path, &id)?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_direct_candidates, Registration};
+    use crate::config::{RelayConfig, DEFAULT_DIRECT_PORT};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir() -> std::path::PathBuf {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("flux-registration-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn direct_default_port_defaults_to_8443() {
+        assert_eq!(RelayConfig::default().direct_default_port, DEFAULT_DIRECT_PORT);
+    }
+
+    #[test]
+    fn direct_candidates_read_status_and_normalize_addresses() {
+        let dir = test_dir();
+        let status_file = dir.join("direct.json");
+        std::fs::write(&status_file, r#"{"cert_hashes":["abc","def"]}"#).unwrap();
+        let addrs = vec![
+            "host.example.test".to_string(),
+            "192.0.2.10:9555".to_string(),
+            "2001:db8::1".to_string(),
+            "[2001:db8::2]".to_string(),
+            "[2001:db8::3]:9444".to_string(),
+        ];
+        let candidates = build_direct_candidates(&addrs, Some(&status_file), 9443).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://host.example.test:9443/wt",
+                "https://192.0.2.10:9555/wt",
+                "https://[2001:db8::1]:9443/wt",
+                "https://[2001:db8::2]:9443/wt",
+                "https://[2001:db8::3]:9444/wt",
+            ]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.cert_hashes == ["abc", "def"]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_direct_status_omits_candidates_from_registration() {
+        let dir = test_dir();
+        let missing = dir.join("missing.json");
+        assert!(
+            build_direct_candidates(&["host.example.test".into()], Some(missing.as_path()), 8443).is_err()
+        );
+        let registration = Registration::default();
+        let value = serde_json::to_value(registration).unwrap();
+        assert!(value.get("direct_candidates").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

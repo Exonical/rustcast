@@ -6,7 +6,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -20,50 +22,57 @@ var errMachineInUse = &machineError{"machine already in use"}
 const machineExpiry = 15 * time.Second
 
 type machineInfo struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	DisplayName     string    `json:"display_name,omitempty"`
-	FrameEndpoint   string    `json:"frame_endpoint"`
-	OS              string    `json:"os,omitempty"`
-	GPUVendor       string    `json:"gpu_vendor,omitempty"`
-	EncoderBackend  string    `json:"encoder_backend,omitempty"`
-	VirtualDisplay  bool      `json:"virtual_display"`
-	Width           uint32    `json:"width,omitempty"`
-	Height          uint32    `json:"height,omitempty"`
-	TargetFPS       uint32    `json:"target_fps,omitempty"`
-	DefaultFPS      uint32    `json:"default_fps,omitempty"`
-	TargetBitrate   uint32    `json:"target_bitrate_kbps,omitempty"`
-	Viewers         int       `json:"viewers"`
-	ClipboardPolicy string    `json:"clipboard_policy"`
-	LoggedInUser    string    `json:"logged_in_user"`
-	LoginState      string    `json:"login_state"`
-	QuicCertSHA256  string    `json:"quic_cert_sha256,omitempty"`
-	HostDialsOut    bool      `json:"host_dials_out,omitempty"`
-	SupportsLogin   bool      `json:"supports_login"`
-	LastSeen        time.Time `json:"last_seen"`
-	Status          string    `json:"status"`
-	UpstreamStatus  string    `json:"upstream_status"`
+	ID               string            `json:"id"`
+	Name             string            `json:"name"`
+	DisplayName      string            `json:"display_name,omitempty"`
+	FrameEndpoint    string            `json:"frame_endpoint"`
+	OS               string            `json:"os,omitempty"`
+	GPUVendor        string            `json:"gpu_vendor,omitempty"`
+	EncoderBackend   string            `json:"encoder_backend,omitempty"`
+	VirtualDisplay   bool              `json:"virtual_display"`
+	Width            uint32            `json:"width,omitempty"`
+	Height           uint32            `json:"height,omitempty"`
+	TargetFPS        uint32            `json:"target_fps,omitempty"`
+	DefaultFPS       uint32            `json:"default_fps,omitempty"`
+	TargetBitrate    uint32            `json:"target_bitrate_kbps,omitempty"`
+	Viewers          int               `json:"viewers"`
+	ClipboardPolicy  string            `json:"clipboard_policy"`
+	LoggedInUser     string            `json:"logged_in_user"`
+	LoginState       string            `json:"login_state"`
+	QuicCertSHA256   string            `json:"quic_cert_sha256,omitempty"`
+	HostDialsOut     bool              `json:"host_dials_out,omitempty"`
+	DirectCandidates []directCandidate `json:"direct_candidates,omitempty"`
+	SupportsLogin    bool              `json:"supports_login"`
+	LastSeen         time.Time         `json:"last_seen"`
+	Status           string            `json:"status"`
+	UpstreamStatus   string            `json:"upstream_status"`
 }
 
 type machineRegistration struct {
-	ID             string `json:"id" binding:"required"`
-	Name           string `json:"name" binding:"required"`
-	DisplayName    string `json:"display_name"`
-	FrameEndpoint  string `json:"frame_endpoint" binding:"required"`
-	OS             string `json:"os"`
-	GPUVendor      string `json:"gpu_vendor"`
-	EncoderBackend string `json:"encoder_backend"`
-	VirtualDisplay bool   `json:"virtual_display"`
-	Width          uint32 `json:"width"`
-	Height         uint32 `json:"height"`
-	TargetFPS      uint32 `json:"target_fps"`
-	DefaultFPS     uint32 `json:"default_fps"`
-	TargetBitrate  uint32 `json:"target_bitrate_kbps"`
-	SupportsLogin  bool   `json:"supports_login"`
-	LoginState     string `json:"login_state"`
-	LoggedInUser   string `json:"logged_in_user"`
-	QuicCertSHA256 string `json:"quic_cert_sha256"`
-	HostDialsOut   bool   `json:"host_dials_out"`
+	ID               string            `json:"id" binding:"required"`
+	Name             string            `json:"name" binding:"required"`
+	DisplayName      string            `json:"display_name"`
+	FrameEndpoint    string            `json:"frame_endpoint" binding:"required"`
+	OS               string            `json:"os"`
+	GPUVendor        string            `json:"gpu_vendor"`
+	EncoderBackend   string            `json:"encoder_backend"`
+	VirtualDisplay   bool              `json:"virtual_display"`
+	Width            uint32            `json:"width"`
+	Height           uint32            `json:"height"`
+	TargetFPS        uint32            `json:"target_fps"`
+	DefaultFPS       uint32            `json:"default_fps"`
+	TargetBitrate    uint32            `json:"target_bitrate_kbps"`
+	SupportsLogin    bool              `json:"supports_login"`
+	LoginState       string            `json:"login_state"`
+	LoggedInUser     string            `json:"logged_in_user"`
+	QuicCertSHA256   string            `json:"quic_cert_sha256"`
+	HostDialsOut     bool              `json:"host_dials_out"`
+	DirectCandidates []directCandidate `json:"direct_candidates,omitempty"`
+}
+
+type directCandidate struct {
+	URL        string   `json:"url"`
+	CertHashes []string `json:"cert_hashes,omitempty"`
 }
 
 type machineRecord struct {
@@ -156,7 +165,8 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		UpstreamStatus: upstreamStatus,
 		SupportsLogin:  input.SupportsLogin, LoginState: input.LoginState,
 		LoggedInUser: input.LoggedInUser, QuicCertSHA256: input.QuicCertSHA256,
-		HostDialsOut: input.HostDialsOut,
+		HostDialsOut:     input.HostDialsOut,
+		DirectCandidates: validateDirectCandidates(input.DirectCandidates),
 	}
 	m.static = static
 	if m.upstream != nil {
@@ -170,6 +180,28 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		_ = removedHostLink.CloseWithError(0, "machine removed")
 	}
 	return m
+}
+
+func validateDirectCandidates(candidates []directCandidate) []directCandidate {
+	valid := make([]directCandidate, 0, min(len(candidates), 8))
+	for _, candidate := range candidates {
+		parsed, err := url.Parse(candidate.URL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || !strings.HasSuffix(candidate.URL, "/wt") {
+			continue
+		}
+		hashes := candidate.CertHashes
+		if len(hashes) > 4 {
+			hashes = hashes[:4]
+		}
+		valid = append(valid, directCandidate{
+			URL:        candidate.URL,
+			CertHashes: append([]string(nil), hashes...),
+		})
+		if len(valid) == 8 {
+			break
+		}
+	}
+	return valid
 }
 
 func (r *machineRegistry) get(id string) (*machineRecord, error) {

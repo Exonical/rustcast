@@ -11,13 +11,14 @@ import { Slider } from "@/components/ui/slider";
 import { targetBitrateKbps } from "@/lib/protocol";
 import { policyLabel } from "@/lib/clipboard";
 
-export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
+export function Toolbar({ machine, stats, connectionPath, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
   qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio,
   clipboardSupported, clipboardPolicy, clipboardFlash, onClipboardSync, onLock,
   onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
   onQualityChange, onFpsChange, onCommit, onResolution }: {
   machine: Machine;
   stats: StreamStats | null;
+  connectionPath: "direct" | "relay" | null;
   visible: boolean;
   showStats: boolean;
   pointerLockEnabled: boolean;
@@ -56,6 +57,7 @@ export function Toolbar({ machine, stats, visible, showStats, pointerLockEnabled
         <div className="hidden items-center gap-2 px-2 sm:flex">
           <span className={`h-2 w-2 rounded-full ${stats ? "bg-emerald-400 shadow-[0_0_9px_rgba(52,211,153,.8)]" : "animate-pulse bg-amber-300"}`} />
           <span className="max-w-40 truncate text-xs font-semibold text-zinc-100">{machine.display_name || machine.name}</span>
+          {connectionPath && <Badge tone="neutral">{connectionPath === "direct" ? "Direct" : "Relay"}</Badge>}
           <span className="font-mono text-[10px] text-zinc-500">{stats?.controlRttMs != null ? `${Math.round(stats.controlRttMs)}ms` : "—"}</span>
         </div>
         <span className="hidden h-5 w-px bg-white/10 sm:block" />

@@ -47,6 +47,9 @@ spec:
         - containerPort: 8443
           hostPort: 8443
           protocol: UDP
+        - containerPort: 8445
+          hostPort: 8445
+          protocol: UDP
     - name: host
       image: localhost/flux-host:latest
       imagePullPolicy: Never
@@ -60,6 +63,10 @@ spec:
           value: "127.0.0.1"
         - name: FLUX_RELAY_TOKEN
           value: "%%FLUX_RELAY_TOKEN%%"
+        - name: FLUX_DIRECT_PORT
+          value: "8445"
+        - name: FLUX_DIRECT_STATUS_FILE
+          value: "/run/flux/direct.json"
         - name: FLUX_DEVUSER_PASSWORD
           value: "%%FLUX_DEVUSER_PASSWORD%%"
         - name: FLUX_AK_ENROLLMENT_TOKEN

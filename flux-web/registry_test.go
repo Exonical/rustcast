@@ -34,6 +34,31 @@ func TestMachineRegistryHeartbeatKeepsOnline(t *testing.T) {
 	}
 }
 
+func TestMachineRegistryValidatesAndCapsDirectCandidates(t *testing.T) {
+	r := newMachineRegistry()
+	registration := testRegistration("machine-1")
+	registration.DirectCandidates = []directCandidate{
+		{URL: "http://host.example.test/wt"},
+		{URL: "https:///wt"},
+		{URL: "https://host.example.test/missing"},
+	}
+	for range 9 {
+		registration.DirectCandidates = append(registration.DirectCandidates, directCandidate{
+			URL:        "https://host.example.test/wt",
+			CertHashes: []string{"one", "two", "three", "four", "five"},
+		})
+	}
+	machine := r.upsert(registration, false)
+	if got := len(machine.DirectCandidates); got != 8 {
+		t.Fatalf("valid direct candidate count = %d, want 8", got)
+	}
+	for _, candidate := range machine.DirectCandidates {
+		if len(candidate.CertHashes) != 4 {
+			t.Fatalf("candidate hash count = %d, want 4", len(candidate.CertHashes))
+		}
+	}
+}
+
 func TestMachineRegistryExpiryAndStaticEntry(t *testing.T) {
 	r := newMachineRegistry()
 	r.seedStatic("default", "Default", "127.0.0.1:1")

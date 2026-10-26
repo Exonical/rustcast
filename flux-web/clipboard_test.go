@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -57,6 +58,24 @@ func statusResult(t *testing.T, msgs []controlMessage) (string, string) {
 func clipboardSend(mime, data string) json.RawMessage {
 	raw, _ := json.Marshal(map[string]string{"mime": mime, "data": data})
 	return raw
+}
+
+func directClipboardIdentity(t *testing.T, mode string) *identity {
+	t.Helper()
+	signer := ticketTestSigner(t, 15)
+	ticket, err := signer.sign(&identity{Sub: "direct-viewer"}, "m1", mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := newTicketVerifier(signer.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := verifier.verify(ticket, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return user
 }
 
 func TestClientClipboardAllowedEmitsCommand(t *testing.T) {
@@ -147,6 +166,60 @@ func TestClientClipboardEnforcement(t *testing.T) {
 	}
 }
 
+func TestDirectSessionUsesTicketClipboardOffPolicy(t *testing.T) {
+	st, _, _, deps := clipboardDeps(t)
+	u := newMachineUpstream("", "m1", deps, func(string) {})
+	var msgs []controlMessage
+	s := fakeViewer(st, u, &msgs)
+	policy := machinePolicyForClipboardMode(directClipboardIdentity(t, clipModeOff).ClipboardPolicy)
+	s.clipboardPolicyOverride = &policy
+
+	if err := s.handleClipboard(clipboardSend(clipWireMime, "blocked"), st); err != nil {
+		t.Fatal(err)
+	}
+	if result, policy := statusResult(t, msgs); result != clipResultBlocked || policy != clipModeOff {
+		t.Fatalf("direct clipboard status = (%q,%q), want (%q,%q)", result, policy, clipResultBlocked, clipModeOff)
+	}
+	select {
+	case <-u.commandChan:
+		t.Fatal("ticket policy off allowed clipboard to reach the host")
+	default:
+	}
+}
+
+func TestDirectSessionMissingTicketClipboardPolicyFailsClosed(t *testing.T) {
+	st, _, _, deps := clipboardDeps(t)
+	signer := ticketTestSigner(t, 16)
+	verifier, err := newTicketVerifier(signer.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := signedTicketForPayload(t, signer, directTicketPayload{
+		Version: 1, MachineID: "m1", Sub: "direct-viewer", Path: "direct",
+		Expires: time.Now().Add(time.Minute).Unix(),
+	})
+	user, err := verifier.verify(ticket, "m1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := newMachineUpstream("", "m1", deps, func(string) {})
+	var msgs []controlMessage
+	s := fakeViewer(st, u, &msgs)
+	policy := machinePolicyForClipboardMode(user.ClipboardPolicy)
+	s.clipboardPolicyOverride = &policy
+	if err := s.handleClipboard(clipboardSend(clipWireMime, "blocked"), st); err != nil {
+		t.Fatal(err)
+	}
+	if result, policy := statusResult(t, msgs); result != clipResultBlocked || policy != clipModeOff {
+		t.Fatalf("missing-policy status = (%q,%q), want blocked/off", result, policy)
+	}
+	select {
+	case <-u.commandChan:
+		t.Fatal("missing ticket policy allowed clipboard to reach the host")
+	default:
+	}
+}
+
 func TestClientClipboardSizeCap(t *testing.T) {
 	st, _, _, deps := clipboardDeps(t)
 	if err := st.putPolicy("m1", machinePolicy{
@@ -230,6 +303,27 @@ func TestUpstreamClipboardBlockedByPolicy(t *testing.T) {
 	rows, _ := st.listAudit("m1", 10, 0)
 	if len(rows) != 1 || rows[0].Result != clipResultBlocked {
 		t.Fatalf("audit rows = %+v", rows)
+	}
+}
+
+func TestDirectSessionHonorsTicketHostToClientPolicy(t *testing.T) {
+	st, _, sessions, deps := clipboardDeps(t)
+	if err := st.putPolicy("m1", machinePolicy{
+		Mode: clipModeOff, MaxBytes: defaultClipboardMaxBytes, CaptureContent: true,
+	}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	u := newMachineUpstream("", "m1", deps, func(string) {})
+	var msgs []controlMessage
+	viewer := fakeViewer(st, u, &msgs)
+	policy := machinePolicyForClipboardMode(directClipboardIdentity(t, clipModeHostToClient).ClipboardPolicy)
+	viewer.clipboardPolicyOverride = &policy
+	sessions.add(sessionInfo{ID: "sess-1", MachineID: "m1"}, viewer, nil)
+
+	payload, _ := json.Marshal(clipboardPayload{Mime: clipWireMime, Data: "from host"})
+	u.handleClipboardFrame(payload)
+	if len(msgs) != 1 || msgs[0].Type != "clipboard" {
+		t.Fatalf("ticket host_to_client policy did not forward clipboard: %+v", msgs)
 	}
 }
 

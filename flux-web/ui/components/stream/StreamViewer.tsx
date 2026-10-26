@@ -93,6 +93,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
   const clientRef = useRef<WebTransportClient | null>(null);
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
+  const [connectionPath, setConnectionPath] = useState<"direct" | "relay" | null>(null);
   const [login, setLogin] = useState<LoginCardState | null>(null);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -316,6 +317,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         client.sendQuality(connectInitialQuality ?? 0, connectInitialFps ?? 0);
       }
     };
+    client.onConnectionPathChange = setConnectionPath;
     client.onStats = (next) => {
       const audio = audioPlayerRef.current?.stats();
       setStats(audio ? { ...next, audioBufferedMs: audio.buffered_ms, audioUnderruns: audio.underruns } : next);
@@ -796,6 +798,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       <Toolbar
         machine={machine}
         stats={stats}
+        connectionPath={connectionPath}
         visible={visibleControls}
         showStats={showStats}
         pointerLockEnabled={pointerLockEnabled}
