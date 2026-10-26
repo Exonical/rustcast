@@ -202,9 +202,10 @@ CREATE TABLE IF NOT EXISTS host_logins (
 CREATE INDEX IF NOT EXISTS host_logins_ts ON host_logins(ts);
 CREATE INDEX IF NOT EXISTS host_logins_machine_ts ON host_logins(machine_id, ts);
 CREATE TABLE IF NOT EXISTS audit_forward_queue (
-    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT NOT NULL UNIQUE,
-    payload  TEXT NOT NULL
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   TEXT NOT NULL UNIQUE,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0
 );
 `
 
@@ -216,16 +217,16 @@ func (s *store) persistAuditForwardEvent(event forwardedAuditEvent) error {
 		return err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO audit_forward_queue (event_id, payload) VALUES (?, ?)`,
-		event.EventID, string(payload))
+		`INSERT INTO audit_forward_queue (event_id, payload, created_at) VALUES (?, ?, ?)`,
+		event.EventID, string(payload), time.Now().Unix())
 	return err
 }
 
-func (s *store) loadAuditForwardQueue(limit int) ([]forwardedAuditEvent, int, error) {
+func (s *store) loadAuditForwardQueue(limit int, retention time.Duration) ([]forwardedAuditEvent, int, error) {
 	if limit <= 0 {
 		limit = auditForwardQueueLimit
 	}
-	rows, err := s.db.Query(`SELECT event_id, payload FROM audit_forward_queue ORDER BY seq`)
+	rows, err := s.db.Query(`SELECT event_id, payload, created_at FROM audit_forward_queue ORDER BY seq`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -235,17 +236,25 @@ func (s *store) loadAuditForwardQueue(limit int) ([]forwardedAuditEvent, int, er
 	}
 	entries := make([]queueEntry, 0)
 	droppedIDs := make([]string, 0)
+	cutoff := time.Now().Add(-retention)
 	for rows.Next() {
 		var eventID, payload string
-		if err := rows.Scan(&eventID, &payload); err != nil {
+		var createdAt int64
+		if err := rows.Scan(&eventID, &payload, &createdAt); err != nil {
 			rows.Close()
 			return nil, 0, err
+		}
+		enqueuedAt := time.Unix(createdAt, 0)
+		if retention > 0 && enqueuedAt.Before(cutoff) {
+			droppedIDs = append(droppedIDs, eventID)
+			continue
 		}
 		var event forwardedAuditEvent
 		if err := json.Unmarshal([]byte(payload), &event); err != nil || event.EventID != eventID {
 			droppedIDs = append(droppedIDs, eventID)
 			continue
 		}
+		event.EnqueuedAt = enqueuedAt
 		entries = append(entries, queueEntry{eventID: eventID, event: event})
 	}
 	if err := rows.Err(); err != nil {
@@ -304,6 +313,15 @@ func (s *store) migrate() error {
 	}
 	if !has {
 		if _, err := s.db.Exec(`ALTER TABLE machine_policy ADD COLUMN connection_path TEXT NOT NULL DEFAULT 'auto'`); err != nil {
+			return err
+		}
+	}
+	has, err = s.hasColumn("audit_forward_queue", "created_at")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE audit_forward_queue ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -522,9 +540,18 @@ func (s *store) purge(olderThan time.Time) (int64, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	if _, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts); err != nil {
+	loginRes, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts)
+	if err != nil {
 		return n, err
 	}
+	loginCount, _ := loginRes.RowsAffected()
+	n += loginCount
+	queueRes, err := s.db.Exec(`DELETE FROM audit_forward_queue WHERE created_at < ?`, olderThan.Unix())
+	if err != nil {
+		return n, err
+	}
+	queueCount, _ := queueRes.RowsAffected()
+	n += queueCount
 	return n, nil
 }
 
@@ -556,7 +583,7 @@ func (s *store) startRetentionPurge(ctx context.Context, days int) {
 				if n, err := s.purge(cutoff); err != nil {
 					log.Printf("[store] audit purge failed: %v", err)
 				} else if n > 0 {
-					log.Printf("[store] purged %d clipboard audit rows older than %d days", n, days)
+					log.Printf("[store] purged %d audit and queue rows older than %d days", n, days)
 				}
 			}
 		}

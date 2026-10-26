@@ -82,20 +82,21 @@ func (s forwardingAuditSink) recordClipboard(ev auditEvent, capture bool) {
 }
 
 type forwardedAuditEvent struct {
-	EventID   string  `json:"event_id"`
-	Kind      string  `json:"kind"`
-	Timestamp string  `json:"ts"`
-	SessionID string  `json:"session_id,omitempty"`
-	UserSub   string  `json:"user_sub,omitempty"`
-	UserName  string  `json:"user_name,omitempty"`
-	ClientIP  string  `json:"client_ip,omitempty"`
-	OSUser    string  `json:"os_user,omitempty"`
-	Direction string  `json:"direction,omitempty"`
-	Mime      string  `json:"mime,omitempty"`
-	Result    string  `json:"result"`
-	Size      int64   `json:"size,omitempty"`
-	SHA256    string  `json:"sha256,omitempty"`
-	Data      *string `json:"data,omitempty"`
+	EventID    string    `json:"event_id"`
+	Kind       string    `json:"kind"`
+	Timestamp  string    `json:"ts"`
+	SessionID  string    `json:"session_id,omitempty"`
+	UserSub    string    `json:"user_sub,omitempty"`
+	UserName   string    `json:"user_name,omitempty"`
+	ClientIP   string    `json:"client_ip,omitempty"`
+	OSUser     string    `json:"os_user,omitempty"`
+	Direction  string    `json:"direction,omitempty"`
+	Mime       string    `json:"mime,omitempty"`
+	Result     string    `json:"result"`
+	Size       int64     `json:"size,omitempty"`
+	SHA256     string    `json:"sha256,omitempty"`
+	Data       *string   `json:"data,omitempty"`
+	EnqueuedAt time.Time `json:"-"`
 }
 
 type forwardedAuditBatch struct {
@@ -224,6 +225,7 @@ type auditForwarder struct {
 	client    *http.Client
 	metrics   *relayMetrics
 	store     *store
+	retention time.Duration
 
 	mu           sync.Mutex
 	queue        []forwardedAuditEvent
@@ -250,17 +252,21 @@ func newAuditForwarder(machineID, relayURL, token string, metrics *relayMetrics,
 		client:       &http.Client{Timeout: 10 * time.Second},
 		metrics:      metrics,
 		store:        store,
+		retention:    time.Duration(auditRetentionDays()) * 24 * time.Hour,
 		wake:         make(chan struct{}, 1),
 		backoffStart: time.Second,
 	}
 	if store != nil {
-		events, dropped, err := store.loadAuditForwardQueue(auditForwardQueueLimit)
+		events, dropped, err := store.loadAuditForwardQueue(auditForwardQueueLimit, forwarder.retention)
 		if err != nil {
 			log.Printf("[audit] load forwarding queue: %v", err)
 		}
 		forwarder.queue = events
-		if dropped > 0 && metrics != nil {
-			metrics.auditForwardDropped.Add(float64(dropped))
+		if dropped > 0 {
+			if metrics != nil {
+				metrics.auditForwardDropped.Add(float64(dropped))
+			}
+			log.Printf("[audit] discarded expired or excess persisted forwarding events=%d", dropped)
 		}
 		forwarder.updateQueueGaugeLocked()
 	}
@@ -327,6 +333,7 @@ func auditTimestamp(timestamp string) string {
 
 func (f *auditForwarder) enqueue(event forwardedAuditEvent) {
 	f.mu.Lock()
+	event.EnqueuedAt = time.Now()
 	if f.store != nil {
 		if err := f.store.persistAuditForwardEvent(event); err != nil {
 			log.Printf("[audit] persist forwarding event %s: %v", event.EventID, err)
@@ -364,7 +371,32 @@ func (f *auditForwarder) updateQueueGaugeLocked() {
 func (f *auditForwarder) nextBatch() []forwardedAuditEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.retention > 0 {
+		cutoff := time.Now().Add(-f.retention)
+		kept := f.queue[:0]
+		expiredIDs := make([]string, 0)
+		for _, event := range f.queue {
+			if !event.EnqueuedAt.IsZero() && event.EnqueuedAt.Before(cutoff) {
+				expiredIDs = append(expiredIDs, event.EventID)
+				continue
+			}
+			kept = append(kept, event)
+		}
+		f.queue = kept
+		if len(expiredIDs) > 0 {
+			if f.store != nil {
+				if err := f.store.deleteAuditForwardEvents(expiredIDs); err != nil {
+					log.Printf("[audit] delete expired forwarding events: %v", err)
+				}
+			}
+			if f.metrics != nil {
+				f.metrics.auditForwardDropped.Add(float64(len(expiredIDs)))
+			}
+			log.Printf("[audit] dropped expired forwarding events=%d", len(expiredIDs))
+		}
+	}
 	if len(f.queue) == 0 {
+		f.updateQueueGaugeLocked()
 		return nil
 	}
 	batch := make([]forwardedAuditEvent, 0, min(len(f.queue), auditForwardBatchLimit))

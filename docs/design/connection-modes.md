@@ -79,7 +79,7 @@ Today `/api/webtransport` returns a 60 s single-use ticket that only the issuing
 - Ticket verification checks signature, version, path, machine ID, expiry, and single-use nonce. The nonce cache survives public-key replacement. The signed clipboard mode, capture setting, and size limit are enforced by the direct session; missing mode fails closed as `off`, capture defaults to false, and a missing size uses the default maximum.
 - No shared secret leaves the relay; a compromised host can't mint tickets for other hosts.
 
-Login and clipboard audit remain in the direct endpoint's local SQLite store; a durable queue forwards them in bounded, deduplicated batches to the central relay's authenticated `POST /api/relay/audit` endpoint. Captured clipboard content over 4 MiB is forwarded as digest and size only. The relay stores content only when its capture policy is enabled and the event is within `MaxBytes`; otherwise it stores digest and size only. The shared `FLUX_RELAY_TOKEN` is the trust boundary for forwarded audit; per-host credentials remain open work.
+Login and clipboard audit remain in the direct endpoint's local SQLite store; a durable queue forwards them in bounded, deduplicated batches to the central relay's authenticated `POST /api/relay/audit` endpoint. Queued events follow `FLUX_AUDIT_RETENTION_DAYS`. Captured clipboard content over 4 MiB is forwarded as digest and size only. The relay stores content only when its capture policy is enabled and the event is within `MaxBytes`; otherwise it stores digest and size only. The shared `FLUX_RELAY_TOKEN` is the trust boundary for forwarded audit; per-host credentials remain open work.
 
 ### 4. Discovery and fallback
 

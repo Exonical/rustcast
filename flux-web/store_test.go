@@ -190,6 +190,39 @@ func TestPurgeRemovesOldHostLogins(t *testing.T) {
 	}
 }
 
+func TestPurgeRemovesExpiredAuditForwardQueueRows(t *testing.T) {
+	st := testStore(t)
+	oldID := "00000000000000000000000000000001"
+	freshID := "00000000000000000000000000000002"
+	for _, eventID := range []string{oldID, freshID} {
+		if err := st.persistAuditForwardEvent(forwardedAuditEvent{
+			EventID: eventID, Kind: "login", Result: "ok",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldCreatedAt := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := st.db.Exec(`UPDATE audit_forward_queue SET created_at = ? WHERE event_id = ?`,
+		oldCreatedAt, oldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.purge(time.Now().Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var oldCount, freshCount int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM audit_forward_queue WHERE event_id = ?`, oldID).
+		Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM audit_forward_queue WHERE event_id = ?`, freshID).
+		Scan(&freshCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 || freshCount != 1 {
+		t.Fatalf("queue counts after purge: old=%d fresh=%d", oldCount, freshCount)
+	}
+}
+
 func TestAuditContentIncludesOSUser(t *testing.T) {
 	st := testStore(t)
 	st.insertAudit(auditEvent{

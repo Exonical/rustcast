@@ -118,6 +118,42 @@ func TestAuditForwarderQueuePersistsUntilAcknowledged(t *testing.T) {
 	}
 }
 
+func TestAuditForwarderDropsExpiredEventsWithoutSending(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	metrics := newRelayMetrics()
+	forwarder := newAuditForwarder("m", server.URL, "token", metrics, nil)
+	forwarder.retention = 10 * time.Millisecond
+	forwarder.enqueue(forwardedAuditEvent{EventID: "expired-event", Kind: "login", Result: "ok"})
+	time.Sleep(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		forwarder.run(ctx)
+		close(done)
+	}()
+	waitForTestCondition(t, time.Second, func() bool {
+		return bytes.Contains([]byte(scrapeMetrics(metrics)),
+			[]byte(`flux_relay_audit_forward_dropped_total{path="relay"} 1`))
+	})
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 0 {
+		t.Fatalf("sent %d expired batches, want none", requests)
+	}
+}
+
 func TestAuditForwarderDropsOldestAtCapacity(t *testing.T) {
 	metrics := newRelayMetrics()
 	st := testStore(t)
@@ -178,6 +214,37 @@ func TestAuditForwarderStartupTrimsPersistedQueue(t *testing.T) {
 	if persisted != auditForwardQueueLimit ||
 		!bytes.Contains([]byte(scrapeMetrics(metrics)), []byte(`flux_relay_audit_forward_dropped_total{path="relay"} 1`)) {
 		t.Fatalf("startup trim persisted=%d metrics=%s", persisted, scrapeMetrics(metrics))
+	}
+}
+
+func TestAuditForwarderStartupDropsExpiredPersistentEvents(t *testing.T) {
+	t.Setenv("FLUX_AUDIT_RETENTION_DAYS", "1")
+	st := testStore(t)
+	oldID := "00000000000000000000000000000001"
+	freshID := "00000000000000000000000000000002"
+	for _, eventID := range []string{oldID, freshID} {
+		if err := st.persistAuditForwardEvent(forwardedAuditEvent{
+			EventID: eventID, Kind: "login", Result: "ok",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.db.Exec(`UPDATE audit_forward_queue SET created_at = ? WHERE event_id = ?`,
+		time.Now().Add(-48*time.Hour).Unix(), oldID); err != nil {
+		t.Fatal(err)
+	}
+	metrics := newRelayMetrics()
+	forwarder := newAuditForwarder("m", "http://127.0.0.1:1", "token", metrics, st)
+	if len(forwarder.queue) != 1 || forwarder.queue[0].EventID != freshID {
+		t.Fatalf("recovered queue = %+v", forwarder.queue)
+	}
+	var persisted int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM audit_forward_queue`).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != 1 || !bytes.Contains([]byte(scrapeMetrics(metrics)),
+		[]byte(`flux_relay_audit_forward_dropped_total{path="relay"} 1`)) {
+		t.Fatalf("persisted=%d metrics=%s", persisted, scrapeMetrics(metrics))
 	}
 }
 
