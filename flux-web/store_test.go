@@ -15,6 +15,49 @@ func testStore(t *testing.T) *store {
 	return st
 }
 
+func TestMigrateBackfillsLegacyAuditForwardQueueTimestamps(t *testing.T) {
+	st := testStore(t)
+	if _, err := st.db.Exec(`DROP TABLE audit_forward_queue`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`CREATE TABLE audit_forward_queue (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id TEXT NOT NULL UNIQUE,
+		payload TEXT NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"event_id":"legacy-event","kind":"login","result":"ok"}`
+	if _, err := st.db.Exec(`INSERT INTO audit_forward_queue (event_id, payload) VALUES (?, ?)`,
+		"legacy-event", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	events, dropped, err := st.loadAuditForwardQueue(auditForwardQueueLimit, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "legacy-event" || dropped != 0 {
+		t.Fatalf("migrated queue = %+v, dropped=%d", events, dropped)
+	}
+	if _, err := st.db.Exec(`UPDATE audit_forward_queue SET created_at = 0 WHERE event_id = ?`,
+		"legacy-event"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	events, dropped, err = st.loadAuditForwardQueue(auditForwardQueueLimit, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "legacy-event" || dropped != 0 {
+		t.Fatalf("backfilled existing queue = %+v, dropped=%d", events, dropped)
+	}
+}
+
 func TestStoreDefaultPolicy(t *testing.T) {
 	st := testStore(t)
 	p := st.getPolicy("never-seen")
@@ -187,6 +230,39 @@ func TestPurgeRemovesOldHostLogins(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].SessionID != "s2" {
 		t.Fatalf("expected only the fresh login row, got %+v", rows)
+	}
+}
+
+func TestPurgeRemovesExpiredAuditForwardQueueRows(t *testing.T) {
+	st := testStore(t)
+	oldID := "00000000000000000000000000000001"
+	freshID := "00000000000000000000000000000002"
+	for _, eventID := range []string{oldID, freshID} {
+		if err := st.persistAuditForwardEvent(forwardedAuditEvent{
+			EventID: eventID, Kind: "login", Result: "ok",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldCreatedAt := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := st.db.Exec(`UPDATE audit_forward_queue SET created_at = ? WHERE event_id = ?`,
+		oldCreatedAt, oldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.purge(time.Now().Add(-24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var oldCount, freshCount int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM audit_forward_queue WHERE event_id = ?`, oldID).
+		Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM audit_forward_queue WHERE event_id = ?`, freshID).
+		Scan(&freshCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 || freshCount != 1 {
+		t.Fatalf("queue counts after purge: old=%d fresh=%d", oldCount, freshCount)
 	}
 }
 

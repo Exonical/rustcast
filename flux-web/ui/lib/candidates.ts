@@ -69,3 +69,44 @@ export async function connectFirst<T extends CandidateTransport>(
   }
   throw lastError ?? new Error("No connection candidates");
 }
+
+export function startDirectProbe<T extends CandidateTransport>(options: {
+  hasDirectCandidates: boolean;
+  fetchCandidates: () => Promise<Candidate[]>;
+  open: (candidate: Candidate) => { transport: T; ready: Promise<void> };
+  isHidden: () => boolean;
+  onAvailable: () => void;
+  timeoutMs?: number;
+  schedule?: (callback: () => void, delayMs: number) => unknown;
+  cancel?: (timer: unknown) => void;
+}): () => void {
+  if (!options.hasDirectCandidates) return () => {};
+  const schedule = options.schedule ?? ((callback, delayMs) => setInterval(callback, delayMs));
+  const cancel = options.cancel ?? ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
+  let active = true;
+  let running = false;
+  const timer = schedule(() => {
+    if (!active || running || options.isHidden()) return;
+    running = true;
+    void (async () => {
+      try {
+        const candidates = (await options.fetchCandidates()).filter((candidate) => candidate.path === "direct");
+        const result = await connectFirst(candidates, options.open, { direct: options.timeoutMs ?? 1500 });
+        result.transport.close({ closeCode: 0, reason: "direct probe" });
+        if (!active) return;
+        active = false;
+        cancel(timer);
+        options.onAvailable();
+      } catch {
+        return;
+      } finally {
+        running = false;
+      }
+    })();
+  }, 60_000);
+  return () => {
+    if (!active) return;
+    active = false;
+    cancel(timer);
+  };
+}

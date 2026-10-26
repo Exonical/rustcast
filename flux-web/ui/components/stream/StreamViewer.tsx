@@ -94,6 +94,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [connectionPath, setConnectionPath] = useState<"direct" | "relay" | null>(null);
+  const [directAvailable, setDirectAvailable] = useState(false);
   const [login, setLogin] = useState<LoginCardState | null>(null);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -318,6 +319,7 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
       }
     };
     client.onConnectionPathChange = setConnectionPath;
+    client.onDirectAvailableChange = setDirectAvailable;
     client.onStats = (next) => {
       const audio = audioPlayerRef.current?.stats();
       setStats(audio ? { ...next, audioBufferedMs: audio.buffered_ms, audioUnderruns: audio.underruns } : next);
@@ -816,6 +818,8 @@ export function StreamViewer({ machine, resolution, initialFps, initialQuality, 
         fpsCap={fpsCap}
         onBack={onBack}
         onReconnect={reconnect}
+        directAvailable={directAvailable}
+        onSwitchToDirect={reconnect}
         onToggleStats={() => setShowStats((value) => !value)}
         onPointerLock={togglePointerLock}
         onFullscreen={toggleFullscreen}

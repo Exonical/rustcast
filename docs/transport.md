@@ -14,7 +14,7 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 | `flux-hostd` ↔ per-user `flux-server` | Framed byte stream | TCP | `127.0.0.1:8557` | Loopback-only agent; session is started after hostd's PAM login. | Hostd proxies agent frames and relay commands for the logged-in desktop. |
 | Browser ↔ relay UI/API and discovery | HTTP; optional HTTPS | TCP | `:8080`; HTTPS defaults to `:8443` when relay TLS certificates are configured (`FLUX_HTTPS_ADDR`) | Relay OIDC session cookie when OIDC is enabled | UI, REST API, and `GET /api/webtransport`; HTTPS responses advertise `Alt-Svc: h3=":8443"`. |
 | Browser ↔ relay media session | WebTransport over HTTP/3/QUIC | UDP | `:8443` | WebTransport TLS; browser pins discovered `certHashes` when the relay uses a self-signed certificate. With OIDC enabled, `/api/webtransport` issues a single-use, 60-second ticket for `/wt`. | One bidirectional JSON control stream and unidirectional video, cursor, resolution-status, and audio streams. DSCP is set to AF41. |
-| Browser ↔ host direct endpoint | WebTransport over HTTP/3/QUIC | UDP | `:8445` in the pod (`FLUX_DIRECT_PORT`; default `:8443`, listener override `FLUX_WT_ADDR`) | Central-relay ML-DSA-87 signed ticket carrying clipboard policy; browser pins the host certificate hash(es) from discovery. | Direct media/control path; falls back to the relay candidate if connection setup fails. |
+| Browser ↔ host direct endpoint | WebTransport over HTTP/3/QUIC | UDP | `:8445` in the pod (`FLUX_DIRECT_PORT`; default `:8443`) | Central-relay ML-DSA-87 signed ticket carrying clipboard policy; browser pins the host certificate hash(es) from discovery. | Direct media/control path; falls back to the relay candidate if connection setup fails. |
 | Browser/relay ↔ Authentik OIDC | HTTP | TCP | `:9000` in the pod | OIDC | Browser login redirects and relay OIDC requests. |
 | Prometheus scrape → relay | HTTP | TCP | `:9101` by default | Deployment/network policy | Relay metrics; pod publishes this port. |
 | Prometheus scrape → standalone host agent | HTTP | TCP | `127.0.0.1:9102` by default | Loopback | Host metrics; not published by the pod. |
@@ -37,6 +37,12 @@ Direct-mode configuration: administrators set `FLUX_DIRECT_ADDRS` (comma-separat
 For self-signed certificates, the next certificate is generated before activation. Both current and next hashes are advertised during the ten-minute overlap before rotation; the direct status file is rewritten at overlap start and rotation. The 13-day certificate lifetime remains below the browser's 14-day certificate-hash pinning limit.
 
 The HTTPS UI/API listener and the WebTransport HTTP/3 listener are separate: the web handler runs on the TCP listeners, while the HTTP/3 mux handles `/wt` on UDP. HTTPS responses advertise `Alt-Svc: h3=":8443"`. When relay TLS files are not configured, WebTransport uses a rotating self-signed certificate and `/api/webtransport` returns its hash; with configured TLS files, the relay uses those for HTTPS and WebTransport and does not return certificate hashes.
+
+Per-machine `connection_path` policy (`auto`, `direct_only`, `relay_only`) controls the normal discovery candidates returned by `GET /api/webtransport?machine=<id>`. `direct_only` omits relay tickets and returns `409` when no direct endpoint is available. `GET /api/webtransport?machine=<id>&probe=1` returns only direct candidates with single-use probe tickets; while using the relay, the browser probes every 60 seconds, skipping hidden tabs. A probe immediately closes after the direct endpoint verifies it and never starts a host session. A successful probe enables the toolbar's “Switch to direct” control.
+
+The direct endpoint persists audit events locally and forwards them in bounded, deduplicated batches to machine-token-authenticated `POST /api/relay/audit`. The relay enforces its own clipboard content-capture policy and deduplicates retries by `event_id`.
+
+Every `flux_relay_*` and `flux_client_*` metric series has the process-wide `path="relay"` or `path="direct"` label. The label is additive, so aggregations such as `sum by (machine)` remain valid.
 
 ## Component flow
 

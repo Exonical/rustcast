@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -53,12 +54,13 @@ type machinePolicy struct {
 	Mode           string `json:"clipboard_mode"`
 	MaxBytes       int64  `json:"max_bytes"`
 	CaptureContent bool   `json:"capture_content"`
+	ConnectionPath string `json:"connection_path"`
 	UpdatedAt      string `json:"updated_at,omitempty"`
 	UpdatedBy      string `json:"updated_by,omitempty"`
 }
 
 func defaultMachinePolicy() machinePolicy {
-	return machinePolicy{Mode: clipModeBoth, MaxBytes: defaultClipboardMaxBytes, CaptureContent: true}
+	return machinePolicy{Mode: clipModeBoth, MaxBytes: defaultClipboardMaxBytes, CaptureContent: true, ConnectionPath: "auto"}
 }
 
 // allows reports whether the policy permits a transfer in direction.
@@ -81,6 +83,8 @@ func (p machinePolicy) allows(direction string) bool {
 type auditEvent struct {
 	MachineID   string
 	MachineName string
+	EventID     string
+	Timestamp   string
 	SessionID   string
 	UserSub     string
 	UserName    string
@@ -88,6 +92,8 @@ type auditEvent struct {
 	Direction   string
 	Mime        string
 	Data        []byte // hashed always, stored only when policy captures content
+	Size        int64
+	SHA256      string
 	Result      string
 	OSUser      string
 }
@@ -157,6 +163,7 @@ CREATE TABLE IF NOT EXISTS machine_policy (
     clipboard_mode  TEXT NOT NULL,
     max_bytes       INTEGER NOT NULL,
     capture_content INTEGER NOT NULL,
+    connection_path TEXT NOT NULL DEFAULT 'auto',
     updated_at      TEXT NOT NULL,
     updated_by      TEXT NOT NULL
 );
@@ -174,7 +181,8 @@ CREATE TABLE IF NOT EXISTS clipboard_events (
     size         INTEGER NOT NULL,
     sha256       TEXT NOT NULL,
     result       TEXT NOT NULL,
-    content      BLOB
+    content      BLOB,
+    event_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS clipboard_events_ts ON clipboard_events(ts);
 CREATE INDEX IF NOT EXISTS clipboard_events_machine_ts ON clipboard_events(machine_id, ts);
@@ -188,17 +196,141 @@ CREATE TABLE IF NOT EXISTS host_logins (
     user_name    TEXT,
     client_ip    TEXT,
     os_user      TEXT,
-    result       TEXT NOT NULL
+    result       TEXT NOT NULL,
+    event_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS host_logins_ts ON host_logins(ts);
 CREATE INDEX IF NOT EXISTS host_logins_machine_ts ON host_logins(machine_id, ts);
+CREATE TABLE IF NOT EXISTS audit_forward_queue (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   TEXT NOT NULL UNIQUE,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0
+);
 `
 
 func (s *store) Close() error { return s.db.Close() }
 
+func (s *store) persistAuditForwardEvent(event forwardedAuditEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO audit_forward_queue (event_id, payload, created_at) VALUES (?, ?, ?)`,
+		event.EventID, string(payload), time.Now().Unix())
+	return err
+}
+
+func (s *store) loadAuditForwardQueue(limit int, retention time.Duration) ([]forwardedAuditEvent, int, error) {
+	if limit <= 0 {
+		limit = auditForwardQueueLimit
+	}
+	rows, err := s.db.Query(`SELECT event_id, payload, created_at FROM audit_forward_queue ORDER BY seq`)
+	if err != nil {
+		return nil, 0, err
+	}
+	type queueEntry struct {
+		eventID string
+		event   forwardedAuditEvent
+	}
+	entries := make([]queueEntry, 0)
+	droppedIDs := make([]string, 0)
+	cutoff := time.Now().Add(-retention)
+	for rows.Next() {
+		var eventID, payload string
+		var createdAt int64
+		if err := rows.Scan(&eventID, &payload, &createdAt); err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		enqueuedAt := time.Unix(createdAt, 0)
+		if retention > 0 && enqueuedAt.Before(cutoff) {
+			droppedIDs = append(droppedIDs, eventID)
+			continue
+		}
+		var event forwardedAuditEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil || event.EventID != eventID {
+			droppedIDs = append(droppedIDs, eventID)
+			continue
+		}
+		event.EnqueuedAt = enqueuedAt
+		entries = append(entries, queueEntry{eventID: eventID, event: event})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, err
+	}
+	if len(entries) > limit {
+		dropCount := len(entries) - limit
+		for _, entry := range entries[:dropCount] {
+			droppedIDs = append(droppedIDs, entry.eventID)
+		}
+		entries = entries[dropCount:]
+	}
+	events := make([]forwardedAuditEvent, len(entries))
+	for i, entry := range entries {
+		events[i] = entry.event
+	}
+	return events, len(droppedIDs), s.deleteAuditForwardEvents(droppedIDs)
+}
+
+func (s *store) deleteAuditForwardEvents(eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	statement, err := tx.Prepare(`DELETE FROM audit_forward_queue WHERE event_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, eventID := range eventIDs {
+		if _, err := statement.Exec(eventID); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := statement.Close(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // migrate applies additive schema changes to existing databases.
 func (s *store) migrate() error {
-	has, err := s.hasColumn("clipboard_events", "os_user")
+	has, err := s.hasColumn("machine_policy", "connection_path")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE machine_policy ADD COLUMN connection_path TEXT NOT NULL DEFAULT 'auto'`); err != nil {
+			return err
+		}
+	}
+	has, err = s.hasColumn("audit_forward_queue", "created_at")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE audit_forward_queue ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE audit_forward_queue
+		SET created_at = CAST(strftime('%s','now') AS INTEGER)
+		WHERE created_at = 0`); err != nil {
+		return err
+	}
+	has, err = s.hasColumn("clipboard_events", "os_user")
 	if err != nil {
 		return err
 	}
@@ -206,6 +338,25 @@ func (s *store) migrate() error {
 		if _, err := s.db.Exec(`ALTER TABLE clipboard_events ADD COLUMN os_user TEXT`); err != nil {
 			return err
 		}
+	}
+	for _, table := range []string{"clipboard_events", "host_logins"} {
+		has, err := s.hasColumn(table, "event_id")
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN event_id TEXT`); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS clipboard_events_event_id
+		ON clipboard_events(event_id)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS host_logins_event_id
+		ON host_logins(event_id)`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -234,9 +385,9 @@ func (s *store) getPolicy(machineID string) machinePolicy {
 	var p machinePolicy
 	var capture int
 	err := s.db.QueryRow(
-		`SELECT clipboard_mode, max_bytes, capture_content, updated_at, updated_by
+		`SELECT clipboard_mode, max_bytes, capture_content, connection_path, updated_at, updated_by
 		 FROM machine_policy WHERE machine_id = ?`, machineID).
-		Scan(&p.Mode, &p.MaxBytes, &capture, &p.UpdatedAt, &p.UpdatedBy)
+		Scan(&p.Mode, &p.MaxBytes, &capture, &p.ConnectionPath, &p.UpdatedAt, &p.UpdatedBy)
 	if err != nil {
 		return defaultMachinePolicy()
 	}
@@ -251,6 +402,14 @@ func (s *store) putPolicy(machineID string, p machinePolicy, updatedBy string) e
 	default:
 		return errInvalidClipMode
 	}
+	if p.ConnectionPath == "" {
+		p.ConnectionPath = "auto"
+	}
+	switch p.ConnectionPath {
+	case "auto", "direct_only", "relay_only":
+	default:
+		return errors.New("connection_path must be one of auto|direct_only|relay_only")
+	}
 	if p.MaxBytes <= 0 || p.MaxBytes > 64<<20 {
 		return errors.New("max_bytes must be between 1 and 67108864")
 	}
@@ -259,37 +418,52 @@ func (s *store) putPolicy(machineID string, p machinePolicy, updatedBy string) e
 		capture = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO machine_policy (machine_id, clipboard_mode, max_bytes, capture_content, updated_at, updated_by)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO machine_policy (machine_id, clipboard_mode, max_bytes, capture_content, connection_path, updated_at, updated_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(machine_id) DO UPDATE SET
 		   clipboard_mode = excluded.clipboard_mode,
 		   max_bytes = excluded.max_bytes,
 		   capture_content = excluded.capture_content,
+		   connection_path = excluded.connection_path,
 		   updated_at = excluded.updated_at,
 		   updated_by = excluded.updated_by`,
-		machineID, p.Mode, p.MaxBytes, capture,
+		machineID, p.Mode, p.MaxBytes, capture, p.ConnectionPath,
 		time.Now().UTC().Format(time.RFC3339Nano), updatedBy)
+	return err
+}
+
+type auditRowExecer interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+func insertAuditRow(execer auditRowExecer, ev auditEvent, capture bool) error {
+	var content []byte
+	if capture && len(ev.Data) > 0 {
+		content = ev.Data
+	}
+	size, sum := ev.Size, ev.SHA256
+	if ev.Data != nil {
+		size, sum = int64(len(ev.Data)), sha256Hex(ev.Data)
+	} else if sum == "" {
+		size, sum = 0, sha256Hex(nil)
+	}
+	_, err := execer.Exec(
+		`INSERT INTO clipboard_events
+		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
+		    client_ip, direction, mime, size, sha256, result, content, os_user, event_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO NOTHING`,
+		auditTimestamp(ev.Timestamp),
+		ev.MachineID, nullIfEmpty(ev.MachineName), nullIfEmpty(ev.SessionID),
+		nullIfEmpty(ev.UserSub), nullIfEmpty(ev.UserName), nullIfEmpty(ev.ClientIP),
+		ev.Direction, nullIfEmpty(ev.Mime), size, sum, ev.Result, content,
+		nullIfEmpty(ev.OSUser), nullIfEmpty(ev.EventID))
 	return err
 }
 
 // insertAudit appends an audit row; content is stored only when capture is on.
 func (s *store) insertAudit(ev auditEvent, capture bool) error {
-	var content []byte
-	if capture && len(ev.Data) > 0 {
-		content = ev.Data
-	}
-	sum := sha256Hex(ev.Data)
-	_, err := s.db.Exec(
-		`INSERT INTO clipboard_events
-		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
-		    client_ip, direction, mime, size, sha256, result, content, os_user)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano),
-		ev.MachineID, nullIfEmpty(ev.MachineName), nullIfEmpty(ev.SessionID),
-		nullIfEmpty(ev.UserSub), nullIfEmpty(ev.UserName), nullIfEmpty(ev.ClientIP),
-		ev.Direction, nullIfEmpty(ev.Mime), int64(len(ev.Data)), sum, ev.Result, content,
-		nullIfEmpty(ev.OSUser))
-	return err
+	return insertAuditRow(s.db, ev, capture)
 }
 
 func nullIfEmpty(v string) any {
@@ -371,9 +545,18 @@ func (s *store) purge(olderThan time.Time) (int64, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	if _, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts); err != nil {
+	loginRes, err := s.db.Exec(`DELETE FROM host_logins WHERE ts < ?`, ts)
+	if err != nil {
 		return n, err
 	}
+	loginCount, _ := loginRes.RowsAffected()
+	n += loginCount
+	queueRes, err := s.db.Exec(`DELETE FROM audit_forward_queue WHERE created_at < ?`, olderThan.Unix())
+	if err != nil {
+		return n, err
+	}
+	queueCount, _ := queueRes.RowsAffected()
+	n += queueCount
 	return n, nil
 }
 
@@ -405,7 +588,7 @@ func (s *store) startRetentionPurge(ctx context.Context, days int) {
 				if n, err := s.purge(cutoff); err != nil {
 					log.Printf("[store] audit purge failed: %v", err)
 				} else if n > 0 {
-					log.Printf("[store] purged %d clipboard audit rows older than %d days", n, days)
+					log.Printf("[store] purged %d audit and queue rows older than %d days", n, days)
 				}
 			}
 		}
@@ -416,6 +599,8 @@ func (s *store) startRetentionPurge(ctx context.Context, days int) {
 type hostLogin struct {
 	MachineID   string
 	MachineName string
+	EventID     string
+	Timestamp   string
 	SessionID   string
 	UserSub     string
 	UserName    string
@@ -438,17 +623,45 @@ type loginRow struct {
 	Result      string `json:"result"`
 }
 
-func (s *store) insertLogin(l hostLogin) error {
-	_, err := s.db.Exec(
+func insertLoginRow(execer auditRowExecer, l hostLogin) error {
+	_, err := execer.Exec(
 		`INSERT INTO host_logins
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
-		    client_ip, os_user, result)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		    client_ip, os_user, result, event_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO NOTHING`,
+		auditTimestamp(l.Timestamp),
 		l.MachineID, nullIfEmpty(l.MachineName), nullIfEmpty(l.SessionID),
 		nullIfEmpty(l.UserSub), nullIfEmpty(l.UserName), nullIfEmpty(l.ClientIP),
-		nullIfEmpty(l.OSUser), l.Result)
+		nullIfEmpty(l.OSUser), l.Result, nullIfEmpty(l.EventID))
 	return err
+}
+
+func (s *store) insertLogin(l hostLogin) error {
+	return insertLoginRow(s.db, l)
+}
+
+func (s *store) insertForwardedAudit(logins []hostLogin, clips []auditEvent) error {
+	if s == nil || s.db == nil {
+		return errors.New("audit store unavailable")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, login := range logins {
+		if err := insertLoginRow(tx, login); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for _, clip := range clips {
+		if err := insertAuditRow(tx, clip, true); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // listLogins returns the newest host login rows (id DESC).

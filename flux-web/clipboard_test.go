@@ -63,7 +63,7 @@ func clipboardSend(mime, data string) json.RawMessage {
 func directClipboardIdentity(t *testing.T, mode string) *identity {
 	t.Helper()
 	signer := ticketTestSigner(t, 15)
-	ticket, err := signer.sign(&identity{Sub: "direct-viewer"}, "m1", mode)
+	ticket, err := signer.sign(&identity{Sub: "direct-viewer"}, "m1", ticketTestPolicy(mode), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,6 +379,30 @@ func TestPolicyRoutesRequireAdmin(t *testing.T) {
 	}
 	if !strings.Contains(got.UpdatedBy, "user-1") {
 		t.Fatalf("updated_by = %q, want user identity", got.UpdatedBy)
+	}
+
+	got.ConnectionPath = "direct_only"
+	if err := st.putPolicy("m1", got, "test"); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPut, "/api/machines/m1/policy",
+		strings.NewReader(`{"clipboard_mode":"off","max_bytes":1024,"capture_content":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionCookieValue(t, a, testIdentity())})
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || st.getPolicy("m1").ConnectionPath != "direct_only" {
+		t.Fatalf("policy PUT without connection_path = %d, stored policy %+v", w.Code, st.getPolicy("m1"))
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/api/machines/m1/policy",
+		strings.NewReader(`{"clipboard_mode":"off","max_bytes":1024,"capture_content":false,"connection_path":"auto"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sessionCookieValue(t, a, testIdentity())})
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || st.getPolicy("m1").ConnectionPath != "auto" {
+		t.Fatalf("policy PUT with explicit auto = %d, stored policy %+v", w.Code, st.getPolicy("m1"))
 	}
 
 	// Invalid mode is rejected.

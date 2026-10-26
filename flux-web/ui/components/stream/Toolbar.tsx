@@ -14,7 +14,7 @@ import { policyLabel } from "@/lib/clipboard";
 export function Toolbar({ machine, stats, connectionPath, visible, showStats, pointerLockEnabled, isPointerLocked, isFullscreen,
   qualityLevel, fpsCap, audioSupported, audioMuted, onToggleAudio,
   clipboardSupported, clipboardPolicy, clipboardFlash, onClipboardSync, onLock,
-  onBack, onReconnect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
+  onBack, onReconnect, directAvailable, onSwitchToDirect, onToggleStats, onPointerLock, onFullscreen, onShortcuts,
   onQualityChange, onFpsChange, onCommit, onResolution }: {
   machine: Machine;
   stats: StreamStats | null;
@@ -36,6 +36,8 @@ export function Toolbar({ machine, stats, connectionPath, visible, showStats, po
   fpsCap: number | null;
   onBack: () => void;
   onReconnect: () => void;
+  directAvailable: boolean;
+  onSwitchToDirect: () => void;
   onToggleStats: () => void;
   onPointerLock: () => void;
   onFullscreen: () => void;
@@ -62,6 +64,9 @@ export function Toolbar({ machine, stats, connectionPath, visible, showStats, po
         </div>
         <span className="hidden h-5 w-px bg-white/10 sm:block" />
         <Button aria-label="Reconnect" title="Reconnect · Ctrl+Alt+Shift+R" onClick={onReconnect} className="h-9 w-9 rounded-xl p-0 text-base">↻</Button>
+        {directAvailable && connectionPath === "relay" && (
+          <Button aria-label="Switch to direct" onClick={onSwitchToDirect} className="h-9 rounded-xl px-2 text-xs">Switch to direct</Button>
+        )}
         <Button aria-label="Toggle stats" aria-pressed={showStats} title="Stats · Ctrl+Alt+Shift+S" onClick={onToggleStats}
           className={`h-9 w-9 rounded-xl p-0 ${showStats ? "bg-blue-400/15 text-blue-200" : ""}`}>⌁</Button>
         <Button aria-label={isPointerLocked ? "Exit pointer lock" : "Lock pointer"} aria-pressed={pointerLockEnabled}

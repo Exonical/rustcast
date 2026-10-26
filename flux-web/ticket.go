@@ -23,17 +23,19 @@ const (
 )
 
 type directTicketPayload struct {
-	Version   int    `json:"v"`
-	MachineID string `json:"machine_id"`
-	Sub       string `json:"sub"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	Name      string `json:"name"`
-	Admin     bool   `json:"admin"`
-	Clipboard string `json:"clipboard,omitempty"`
-	Path      string `json:"path"`
-	Expires   int64  `json:"exp"`
-	Nonce     string `json:"nonce"`
+	Version           int    `json:"v"`
+	MachineID         string `json:"machine_id"`
+	Sub               string `json:"sub"`
+	Username          string `json:"username"`
+	Email             string `json:"email"`
+	Name              string `json:"name"`
+	Admin             bool   `json:"admin"`
+	Clipboard         string `json:"clipboard,omitempty"`
+	ClipboardCapture  bool   `json:"clipboard_capture,omitempty"`
+	ClipboardMaxBytes int64  `json:"clipboard_max_bytes,omitempty"`
+	Path              string `json:"path"`
+	Expires           int64  `json:"exp"`
+	Nonce             string `json:"nonce"`
 }
 
 type ticketSigner struct {
@@ -131,7 +133,7 @@ func (s *ticketSigner) publicKey() []byte {
 	return append([]byte(nil), s.key.PublicKey().Bytes()...)
 }
 
-func (s *ticketSigner) sign(user *identity, machineID, clipboardPolicy string) (string, error) {
+func (s *ticketSigner) sign(user *identity, machineID string, policy machinePolicy, path string) (string, error) {
 	if s == nil || s.key == nil || user == nil || machineID == "" {
 		return "", errors.New("missing ticket signer, identity, or machine ID")
 	}
@@ -140,17 +142,19 @@ func (s *ticketSigner) sign(user *identity, machineID, clipboardPolicy string) (
 		return "", fmt.Errorf("generate ticket nonce: %w", err)
 	}
 	payload := directTicketPayload{
-		Version:   1,
-		MachineID: machineID,
-		Sub:       user.Sub,
-		Username:  user.Username,
-		Email:     user.Email,
-		Name:      user.Name,
-		Admin:     user.Admin,
-		Clipboard: clipboardPolicy,
-		Path:      "direct",
-		Expires:   time.Now().Add(wtTicketTTL).Unix(),
-		Nonce:     base64.RawURLEncoding.EncodeToString(nonce),
+		Version:           1,
+		MachineID:         machineID,
+		Sub:               user.Sub,
+		Username:          user.Username,
+		Email:             user.Email,
+		Name:              user.Name,
+		Admin:             user.Admin,
+		Clipboard:         policy.Mode,
+		ClipboardCapture:  policy.CaptureContent,
+		ClipboardMaxBytes: policy.MaxBytes,
+		Path:              path,
+		Expires:           time.Now().Add(wtTicketTTL).Unix(),
+		Nonce:             base64.RawURLEncoding.EncodeToString(nonce),
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -218,8 +222,8 @@ func (v *ticketVerifier) verify(ticket, machineID string) (*identity, error) {
 	if payload.Version != 1 {
 		return nil, errors.New("unsupported ticket version")
 	}
-	if payload.Path != "direct" {
-		return nil, errors.New("ticket is not for the direct path")
+	if payload.Path != "direct" && payload.Path != "probe" {
+		return nil, errors.New("ticket is not for a direct path")
 	}
 	if payload.MachineID == "" || payload.MachineID != machineID {
 		return nil, errors.New("ticket machine does not match")
@@ -250,15 +254,40 @@ func (v *ticketVerifier) verify(ticket, machineID string) (*identity, error) {
 	v.nonces[nonceKey] = expires
 	v.mu.Unlock()
 	clipboardPolicy := ticketClipboardPolicy(payload.Clipboard)
+	clipboardMaxBytes := payload.ClipboardMaxBytes
+	if clipboardMaxBytes <= 0 {
+		clipboardMaxBytes = defaultClipboardMaxBytes
+	}
 	return &identity{
-		Sub:             payload.Sub,
-		Username:        payload.Username,
-		Email:           payload.Email,
-		Name:            payload.Name,
-		Admin:           payload.Admin,
-		ClipboardPolicy: clipboardPolicy,
-		Expires:         expires,
+		Sub:               payload.Sub,
+		Username:          payload.Username,
+		Email:             payload.Email,
+		Name:              payload.Name,
+		Admin:             payload.Admin,
+		ClipboardPolicy:   clipboardPolicy,
+		ClipboardCapture:  payload.ClipboardCapture,
+		ClipboardMaxBytes: clipboardMaxBytes,
+		TicketPath:        payload.Path,
+		Expires:           expires,
 	}, nil
+}
+
+func ticketPathFromPayload(ticket string) string {
+	parts := strings.Split(ticket, ".")
+	if len(parts) != 2 {
+		return ""
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(payloadBytes, &payload) != nil {
+		return ""
+	}
+	return payload.Path
 }
 
 func ticketClipboardPolicy(mode string) string {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { connectFirst, orderCandidates, type Candidate } from "./candidates.js";
+import { connectFirst, orderCandidates, startDirectProbe, type Candidate } from "./candidates.js";
 
 const direct: Candidate = { path: "direct", url: "https://host.example.test/wt", ticket: "d" };
 const relay: Candidate = { path: "relay", host: "relay.example.test", port: 8443, ticket: "r" };
@@ -97,4 +97,131 @@ test("all candidate failures throw the last error", async () => {
     ),
     (error) => error === lastError,
   );
+});
+
+function fakeInterval() {
+  let callback: (() => void) | null = null;
+  let canceled = false;
+  return {
+    schedule: (next: () => void, delayMs: number) => {
+      assert.equal(delayMs, 60_000);
+      callback = next;
+      return 1;
+    },
+    cancel: () => { canceled = true; },
+    tick: () => callback?.(),
+    get canceled() { return canceled; },
+  };
+}
+
+const flushProbe = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test("direct probing is not scheduled without direct candidates", () => {
+  const timer = fakeInterval();
+  startDirectProbe({
+    hasDirectCandidates: false,
+    fetchCandidates: async () => [],
+    open: () => { throw new Error("must not open"); },
+    isHidden: () => false,
+    onAvailable: () => assert.fail("must not become available"),
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  });
+  assert.equal(timer.canceled, false);
+});
+
+test("direct probe success marks availability and stops the timer", async () => {
+  const timer = fakeInterval();
+  let available = false;
+  let closed = false;
+  startDirectProbe({
+    hasDirectCandidates: true,
+    fetchCandidates: async () => [direct],
+    open: () => ({
+      transport: { close: () => { closed = true; } },
+      ready: Promise.resolve(),
+    }),
+    isHidden: () => false,
+    onAvailable: () => { available = true; },
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  });
+  timer.tick();
+  await flushProbe();
+  assert.equal(available, true);
+  assert.equal(closed, true);
+  assert.equal(timer.canceled, true);
+});
+
+test("direct probe failures retry on the next timer tick", async () => {
+  const timer = fakeInterval();
+  let attempts = 0;
+  startDirectProbe({
+    hasDirectCandidates: true,
+    fetchCandidates: async () => [direct],
+    open: () => {
+      attempts++;
+      return { transport: { close: () => {} }, ready: Promise.reject(new Error("unreachable")) };
+    },
+    isHidden: () => false,
+    onAvailable: () => assert.fail("failed probe became available"),
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  });
+  timer.tick();
+  await flushProbe();
+  timer.tick();
+  await flushProbe();
+  assert.equal(attempts, 2);
+  assert.equal(timer.canceled, false);
+});
+
+test("hidden tabs skip direct probes", async () => {
+  const timer = fakeInterval();
+  let hidden = true;
+  let attempts = 0;
+  startDirectProbe({
+    hasDirectCandidates: true,
+    fetchCandidates: async () => { attempts++; return [direct]; },
+    open: () => ({ transport: { close: () => {} }, ready: Promise.resolve() }),
+    isHidden: () => hidden,
+    onAvailable: () => {},
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  });
+  timer.tick();
+  await flushProbe();
+  assert.equal(attempts, 0);
+  hidden = false;
+  timer.tick();
+  await flushProbe();
+  assert.equal(attempts, 1);
+});
+
+test("late direct-probe rejection after timeout is handled", async () => {
+  const timer = fakeInterval();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    startDirectProbe({
+      hasDirectCandidates: true,
+      fetchCandidates: async () => [direct],
+      open: () => ({
+        transport: { close: () => {} },
+        ready: new Promise<void>((_, reject) => setTimeout(() => reject(new Error("late rejection")), 10)),
+      }),
+      isHidden: () => false,
+      onAvailable: () => assert.fail("timed-out probe became available"),
+      timeoutMs: 1,
+      schedule: timer.schedule,
+      cancel: timer.cancel,
+    });
+    timer.tick();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await flushProbe();
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });

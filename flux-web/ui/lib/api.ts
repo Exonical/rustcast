@@ -29,6 +29,7 @@ export interface ClipboardPolicy {
   clipboard_mode: "both" | "off" | "host_to_client" | "client_to_host";
   max_bytes: number;
   capture_content: boolean;
+  connection_path: "auto" | "direct_only" | "relay_only";
   updated_at?: string;
   updated_by?: string;
 }
@@ -143,7 +144,7 @@ export function fetchPolicy(machineId: string): Promise<ClipboardPolicy> {
   return fetchJSON<ClipboardPolicy>(`/api/machines/${encodeURIComponent(machineId)}/policy`);
 }
 
-export async function updatePolicy(machineId: string, body: Pick<ClipboardPolicy, "clipboard_mode" | "max_bytes" | "capture_content">): Promise<ClipboardPolicy> {
+export async function updatePolicy(machineId: string, body: Pick<ClipboardPolicy, "clipboard_mode" | "max_bytes" | "capture_content" | "connection_path">): Promise<ClipboardPolicy> {
   const response = await fetch(`/api/machines/${encodeURIComponent(machineId)}/policy`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },

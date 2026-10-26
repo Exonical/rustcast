@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +71,9 @@ type relayMetrics struct {
 	sessionsStarted      *prometheus.CounterVec
 	sessionRejections    *prometheus.CounterVec
 	clipboardEvents      *prometheus.CounterVec
+	auditForwardDropped  prometheus.Counter
+	auditForwardQueue    prometheus.Gauge
+	directProbes         prometheus.Counter
 	frameSend            *prometheus.HistogramVec
 	queueWait            *prometheus.HistogramVec
 	timeToFirstFrame     *prometheus.HistogramVec
@@ -135,8 +139,13 @@ type clientStats struct {
 }
 
 func newRelayMetrics() *relayMetrics {
+	path := "relay"
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("FLUX_MODE")), "direct") {
+		path = "direct"
+	}
+	registry := prometheus.NewRegistry()
 	m := &relayMetrics{
-		registry:             prometheus.NewRegistry(),
+		registry:             registry,
 		hostLinks:            prometheus.NewGauge(prometheus.GaugeOpts{Name: "flux_relay_host_links", Help: "Number of parked host-initiated QUIC links."}),
 		viewers:              prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_relay_viewers", Help: "Number of viewers attached to the machine upstream."}, []string{"machine"}),
 		upstreamConnected:    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_relay_upstream_connected", Help: "Whether the relay is connected to the host upstream."}, []string{"machine"}),
@@ -158,6 +167,9 @@ func newRelayMetrics() *relayMetrics {
 		sessionsStarted:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_sessions_started_total", Help: "Viewer sessions accepted for a machine."}, []string{"machine"}),
 		sessionRejections:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_session_rejections_total", Help: "WebTransport sessions rejected by the relay."}, []string{"machine", "reason"}),
 		clipboardEvents:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_relay_clipboard_events_total", Help: "Clipboard events by direction and enforcement result."}, []string{"machine", "direction", "result"}),
+		auditForwardDropped:  prometheus.NewCounter(prometheus.CounterOpts{Name: "flux_relay_audit_forward_dropped_total", Help: "Direct audit events dropped from the forwarding queue."}),
+		auditForwardQueue:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "flux_relay_audit_forward_queue", Help: "Direct audit events waiting for forwarding."}),
+		directProbes:         prometheus.NewCounter(prometheus.CounterOpts{Name: "flux_relay_direct_probes_total", Help: "Direct reachability probes accepted."}),
 		frameSend:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_frame_send_seconds", Help: "Time spent sending a video frame stream.", Buckets: prometheus.ExponentialBuckets(0.001, 2, 12)}, []string{"machine", "type"}),
 		queueWait:            prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_queue_wait_seconds", Help: "Time a video frame waited in the relay queue.", Buckets: prometheus.ExponentialBuckets(0.001, 2, 12)}, []string{"machine"}),
 		timeToFirstFrame:     prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "flux_relay_time_to_first_frame_seconds", Help: "Time from session acceptance until the first frame was written.", Buckets: prometheus.ExponentialBuckets(0.05, 2, 10)}, []string{"machine"}),
@@ -168,13 +180,14 @@ func newRelayMetrics() *relayMetrics {
 		clientFramesDropped:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "flux_client_frames_dropped_total", Help: "Frames dropped by the browser, by reason."}, []string{"machine", "reason"}),
 		clientInfo:           prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_client_info", Help: "Current browser and decoder information."}, []string{"machine", "browser", "decoder"}),
 	}
-	m.registry.MustRegister(
+	prometheus.WrapRegistererWith(prometheus.Labels{"path": path}, m.registry).MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		m.hostLinks, m.viewers, m.upstreamConnected, m.rtt, m.packetLoss, m.queueDelay, m.bweTarget, m.encoderTarget,
 		m.upstreamFrames, m.upstreamBytes, m.upstreamAudioPackets, m.upstreamAudioBytes,
 		m.upstreamReconnects, m.framesSent, m.bytesSent, m.framesReset,
-		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.clipboardEvents, m.frameSend, m.queueWait,
+		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.clipboardEvents,
+		m.auditForwardDropped, m.auditForwardQueue, m.directProbes, m.frameSend, m.queueWait,
 		m.timeToFirstFrame, m.clientFPS, m.clientDecode, m.clientReceivePaint, m.clientBitrate,
 		m.clientFramesDropped, m.clientInfo,
 	)
@@ -227,7 +240,7 @@ func (m *relayMetrics) machine(id string) *machineMetrics {
 		metrics.idrGranted[reason] = m.idrRequests.WithLabelValues(id, string(reason), "granted")
 		metrics.idrSuppressed[reason] = m.idrRequests.WithLabelValues(id, string(reason), "suppressed")
 	}
-	for _, reason := range []string{"machine_in_use", "not_found", "offline", "bad_request", "no_control_stream", "unauthenticated"} {
+	for _, reason := range []string{"machine_in_use", "not_found", "offline", "bad_request", "no_control_stream", "unauthenticated", "path_policy"} {
 		metrics.rejections[reason] = m.sessionRejections.WithLabelValues(id, reason)
 	}
 	return metrics

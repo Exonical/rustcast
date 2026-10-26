@@ -88,12 +88,15 @@ type identity struct {
 	Name  string `json:"name,omitempty"`
 	// Username is the OIDC preferred_username, used to pre-answer the host's
 	// login "Username" prompt.
-	Username        string    `json:"username,omitempty"`
-	ClipboardPolicy string    `json:"clipboard_policy,omitempty"`
-	Groups          []string  `json:"groups,omitempty"`
-	Admin           bool      `json:"admin"`
-	Expires         time.Time `json:"exp"`
-	IDToken         string    `json:"id_token,omitempty"`
+	Username          string    `json:"username,omitempty"`
+	ClipboardPolicy   string    `json:"clipboard_policy,omitempty"`
+	ClipboardCapture  bool      `json:"clipboard_capture,omitempty"`
+	ClipboardMaxBytes int64     `json:"clipboard_max_bytes,omitempty"`
+	TicketPath        string    `json:"-"`
+	Groups            []string  `json:"groups,omitempty"`
+	Admin             bool      `json:"admin"`
+	Expires           time.Time `json:"exp"`
+	IDToken           string    `json:"id_token,omitempty"`
 }
 
 var anonymousAdmin = &identity{Sub: "anonymous", Name: "Anonymous", Admin: true}

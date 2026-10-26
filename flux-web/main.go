@@ -181,6 +181,7 @@ func newWebHandler(
 	admin := r.Group("/api", authService.requireUser(), authService.requireAdmin())
 	machineAPI := r.Group("/api", authService.requireMachineToken())
 	registerMachineRoutes(api, machineAPI, registry)
+	registerRelayAuditRoute(machineAPI, registry, clipboardStore)
 	machineAPI.GET("/relay/ticket-key", func(c *gin.Context) {
 		if signer == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ticket signing key unavailable"})
@@ -199,16 +200,38 @@ func newWebHandler(
 		if machineID == "" {
 			machineID = "default"
 		}
-		clipboardMode := defaultMachinePolicy().Mode
+		clipboardPolicy := defaultMachinePolicy()
 		if clipboardStore != nil {
-			clipboardMode = clipboardStore.getPolicy(machineID).Mode
+			clipboardPolicy = clipboardStore.getPolicy(machineID)
 		}
 		relayPort := webTransportDiscoveryPort()
 		candidates := make([]gin.H, 0)
-		if signer != nil {
-			if machine, err := registry.get(machineID); err == nil {
+		machine, machineErr := registry.get(machineID)
+		pathPolicy := clipboardPolicy.ConnectionPath
+		if pathPolicy == "" {
+			pathPolicy = "auto"
+		}
+		probe := c.Query("probe") == "1"
+		if probe {
+			if signer != nil && pathPolicy != "relay_only" && machineErr == nil {
 				for _, direct := range machine.DirectCandidates {
-					ticket, err := signer.sign(user, machineID, clipboardMode)
+					ticket, err := signer.sign(user, machineID, clipboardPolicy, "probe")
+					if err != nil {
+						log.Printf("[ticket] sign probe candidate for %s: %v", machineID, err)
+						continue
+					}
+					candidates = append(candidates, gin.H{
+						"path": "direct", "url": direct.URL, "certHashes": direct.CertHashes, "ticket": ticket,
+					})
+				}
+			}
+			c.JSON(http.StatusOK, gin.H{"candidates": candidates})
+			return
+		}
+		if signer != nil {
+			if pathPolicy != "relay_only" && machineErr == nil {
+				for _, direct := range machine.DirectCandidates {
+					ticket, err := signer.sign(user, machineID, clipboardPolicy, "direct")
 					if err != nil {
 						log.Printf("[ticket] sign direct candidate for %s: %v", machineID, err)
 						continue
@@ -219,11 +242,18 @@ func newWebHandler(
 				}
 			}
 		}
-		relayTicket := authService.issueTicket(user)
-		candidates = append(candidates, gin.H{
-			"path": "relay", "host": publicHost, "port": relayPort,
-			"certHashes": certificates.certificateHashes(), "ticket": relayTicket,
-		})
+		if pathPolicy == "direct_only" && len(candidates) == 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "no direct endpoint available"})
+			return
+		}
+		relayTicket := ""
+		if pathPolicy != "direct_only" {
+			relayTicket = authService.issueTicket(user)
+			candidates = append(candidates, gin.H{
+				"path": "relay", "host": publicHost, "port": relayPort,
+				"certHashes": certificates.certificateHashes(), "ticket": relayTicket,
+			})
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"host":       publicHost,
 			"port":       relayPort,
