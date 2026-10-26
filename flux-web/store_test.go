@@ -15,6 +15,35 @@ func testStore(t *testing.T) *store {
 	return st
 }
 
+func TestMigrateBackfillsLegacyAuditForwardQueueTimestamps(t *testing.T) {
+	st := testStore(t)
+	if _, err := st.db.Exec(`DROP TABLE audit_forward_queue`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`CREATE TABLE audit_forward_queue (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		event_id TEXT NOT NULL UNIQUE,
+		payload TEXT NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"event_id":"legacy-event","kind":"login","result":"ok"}`
+	if _, err := st.db.Exec(`INSERT INTO audit_forward_queue (event_id, payload) VALUES (?, ?)`,
+		"legacy-event", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	events, dropped, err := st.loadAuditForwardQueue(auditForwardQueueLimit, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "legacy-event" || dropped != 0 {
+		t.Fatalf("migrated queue = %+v, dropped=%d", events, dropped)
+	}
+}
+
 func TestStoreDefaultPolicy(t *testing.T) {
 	st := testStore(t)
 	p := st.getPolicy("never-seen")
