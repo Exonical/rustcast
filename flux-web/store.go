@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -200,9 +201,100 @@ CREATE TABLE IF NOT EXISTS host_logins (
 );
 CREATE INDEX IF NOT EXISTS host_logins_ts ON host_logins(ts);
 CREATE INDEX IF NOT EXISTS host_logins_machine_ts ON host_logins(machine_id, ts);
+CREATE TABLE IF NOT EXISTS audit_forward_queue (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    payload  TEXT NOT NULL
+);
 `
 
 func (s *store) Close() error { return s.db.Close() }
+
+func (s *store) persistAuditForwardEvent(event forwardedAuditEvent) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO audit_forward_queue (event_id, payload) VALUES (?, ?)`,
+		event.EventID, string(payload))
+	return err
+}
+
+func (s *store) loadAuditForwardQueue(limit int) ([]forwardedAuditEvent, int, error) {
+	if limit <= 0 {
+		limit = auditForwardQueueLimit
+	}
+	rows, err := s.db.Query(`SELECT event_id, payload FROM audit_forward_queue ORDER BY seq`)
+	if err != nil {
+		return nil, 0, err
+	}
+	type queueEntry struct {
+		eventID string
+		event   forwardedAuditEvent
+	}
+	entries := make([]queueEntry, 0)
+	droppedIDs := make([]string, 0)
+	for rows.Next() {
+		var eventID, payload string
+		if err := rows.Scan(&eventID, &payload); err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		var event forwardedAuditEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil || event.EventID != eventID {
+			droppedIDs = append(droppedIDs, eventID)
+			continue
+		}
+		entries = append(entries, queueEntry{eventID: eventID, event: event})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, err
+	}
+	if len(entries) > limit {
+		dropCount := len(entries) - limit
+		for _, entry := range entries[:dropCount] {
+			droppedIDs = append(droppedIDs, entry.eventID)
+		}
+		entries = entries[dropCount:]
+	}
+	events := make([]forwardedAuditEvent, len(entries))
+	for i, entry := range entries {
+		events[i] = entry.event
+	}
+	return events, len(droppedIDs), s.deleteAuditForwardEvents(droppedIDs)
+}
+
+func (s *store) deleteAuditForwardEvents(eventIDs []string) error {
+	if len(eventIDs) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	statement, err := tx.Prepare(`DELETE FROM audit_forward_queue WHERE event_id = ?`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, eventID := range eventIDs {
+		if _, err := statement.Exec(eventID); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := statement.Close(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 // migrate applies additive schema changes to existing databases.
 func (s *store) migrate() error {
@@ -317,8 +409,11 @@ func (s *store) putPolicy(machineID string, p machinePolicy, updatedBy string) e
 	return err
 }
 
-// insertAudit appends an audit row; content is stored only when capture is on.
-func (s *store) insertAudit(ev auditEvent, capture bool) error {
+type auditRowExecer interface {
+	Exec(string, ...any) (sql.Result, error)
+}
+
+func insertAuditRow(execer auditRowExecer, ev auditEvent, capture bool) error {
 	var content []byte
 	if capture && len(ev.Data) > 0 {
 		content = ev.Data
@@ -329,7 +424,7 @@ func (s *store) insertAudit(ev auditEvent, capture bool) error {
 	} else if sum == "" {
 		size, sum = 0, sha256Hex(nil)
 	}
-	_, err := s.db.Exec(
+	_, err := execer.Exec(
 		`INSERT INTO clipboard_events
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
 		    client_ip, direction, mime, size, sha256, result, content, os_user, event_id)
@@ -341,6 +436,11 @@ func (s *store) insertAudit(ev auditEvent, capture bool) error {
 		ev.Direction, nullIfEmpty(ev.Mime), size, sum, ev.Result, content,
 		nullIfEmpty(ev.OSUser), nullIfEmpty(ev.EventID))
 	return err
+}
+
+// insertAudit appends an audit row; content is stored only when capture is on.
+func (s *store) insertAudit(ev auditEvent, capture bool) error {
+	return insertAuditRow(s.db, ev, capture)
 }
 
 func nullIfEmpty(v string) any {
@@ -491,8 +591,8 @@ type loginRow struct {
 	Result      string `json:"result"`
 }
 
-func (s *store) insertLogin(l hostLogin) error {
-	_, err := s.db.Exec(
+func insertLoginRow(execer auditRowExecer, l hostLogin) error {
+	_, err := execer.Exec(
 		`INSERT INTO host_logins
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
 		    client_ip, os_user, result, event_id)
@@ -503,6 +603,33 @@ func (s *store) insertLogin(l hostLogin) error {
 		nullIfEmpty(l.UserSub), nullIfEmpty(l.UserName), nullIfEmpty(l.ClientIP),
 		nullIfEmpty(l.OSUser), l.Result, nullIfEmpty(l.EventID))
 	return err
+}
+
+func (s *store) insertLogin(l hostLogin) error {
+	return insertLoginRow(s.db, l)
+}
+
+func (s *store) insertForwardedAudit(logins []hostLogin, clips []auditEvent) error {
+	if s == nil || s.db == nil {
+		return errors.New("audit store unavailable")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, login := range logins {
+		if err := insertLoginRow(tx, login); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	for _, clip := range clips {
+		if err := insertAuditRow(tx, clip, true); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // listLogins returns the newest host login rows (id DESC).

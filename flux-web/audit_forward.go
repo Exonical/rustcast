@@ -21,10 +21,11 @@ import (
 )
 
 const (
-	auditForwardQueueLimit = 1000
-	auditForwardBatchLimit = 50
-	auditForwardBatchBytes = 6 << 20
-	auditForwardBodyLimit  = 8 << 20
+	auditForwardQueueLimit   = 1000
+	auditForwardBatchLimit   = 50
+	auditForwardBatchBytes   = 6 << 20
+	auditForwardBodyLimit    = 8 << 20
+	auditForwardContentLimit = 4 << 20
 )
 
 type auditSink interface {
@@ -146,12 +147,13 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 			return
 		}
 		machineName := registry.displayName(batch.MachineID)
-		captureContent := store != nil && store.getPolicy(batch.MachineID).CaptureContent
-		type stagedAuditRow struct {
-			login     *hostLogin
-			clipboard *auditEvent
+		if store == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit store unavailable"})
+			return
 		}
-		rows := make([]stagedAuditRow, 0, len(batch.Events))
+		policy := store.getPolicy(batch.MachineID)
+		logins := make([]hostLogin, 0, len(batch.Events))
+		clips := make([]auditEvent, 0, len(batch.Events))
 		for _, event := range batch.Events {
 			if len(event.EventID) != 32 {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid audit event ID"})
@@ -163,13 +165,12 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 			}
 			switch event.Kind {
 			case "login":
-				row := hostLogin{
+				logins = append(logins, hostLogin{
 					MachineID: batch.MachineID, MachineName: machineName,
 					EventID: event.EventID, Timestamp: event.Timestamp,
 					SessionID: event.SessionID, UserSub: event.UserSub, UserName: event.UserName,
 					ClientIP: event.ClientIP, OSUser: event.OSUser, Result: event.Result,
-				}
-				rows = append(rows, stagedAuditRow{login: &row})
+				})
 			case "clipboard":
 				if event.Size < 0 || len(event.SHA256) != sha256.Size*2 {
 					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid clipboard audit metadata"})
@@ -192,30 +193,25 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 					}
 					data = decoded
 				}
-				if !captureContent {
+				if !policy.CaptureContent || event.Size > policy.MaxBytes {
 					data = nil
 				}
-				row := auditEvent{
+				clips = append(clips, auditEvent{
 					MachineID: batch.MachineID, MachineName: machineName,
 					EventID: event.EventID, Timestamp: event.Timestamp,
 					SessionID: event.SessionID, UserSub: event.UserSub, UserName: event.UserName,
 					ClientIP: event.ClientIP, OSUser: event.OSUser, Direction: event.Direction,
 					Mime: event.Mime, Result: event.Result, Data: data,
 					Size: event.Size, SHA256: event.SHA256,
-				}
-				rows = append(rows, stagedAuditRow{clipboard: &row})
+				})
 			default:
 				c.JSON(http.StatusBadRequest, gin.H{"error": "unknown audit event kind"})
 				return
 			}
 		}
-		sink := storeAuditSink{store: store}
-		for _, row := range rows {
-			if row.login != nil {
-				sink.recordLogin(*row.login)
-			} else if row.clipboard != nil {
-				sink.recordClipboard(*row.clipboard, captureContent)
-			}
+		if err := store.insertForwardedAudit(logins, clips); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "audit store unavailable"})
+			return
 		}
 		c.JSON(http.StatusOK, gin.H{"accepted": len(batch.Events)})
 	})
@@ -227,6 +223,7 @@ type auditForwarder struct {
 	token     string
 	client    *http.Client
 	metrics   *relayMetrics
+	store     *store
 
 	mu           sync.Mutex
 	queue        []forwardedAuditEvent
@@ -235,26 +232,39 @@ type auditForwarder struct {
 	backoffStart time.Duration
 }
 
-func newDirectAuditForwarder(machineID string, metrics *relayMetrics) *auditForwarder {
+func newDirectAuditForwarder(machineID string, metrics *relayMetrics, store *store) *auditForwarder {
 	relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("FLUX_RELAY_URL")), "/")
 	token := strings.TrimSpace(os.Getenv("FLUX_RELAY_TOKEN"))
 	if relayURL == "" || token == "" || !ticketKeyURLAllowed(relayURL) {
 		log.Printf("[audit] WARN: direct audit forwarding disabled; a safe FLUX_RELAY_URL and FLUX_RELAY_TOKEN are required")
 		return nil
 	}
-	return newAuditForwarder(machineID, relayURL, token, metrics)
+	return newAuditForwarder(machineID, relayURL, token, metrics, store)
 }
 
-func newAuditForwarder(machineID, relayURL, token string, metrics *relayMetrics) *auditForwarder {
-	return &auditForwarder{
+func newAuditForwarder(machineID, relayURL, token string, metrics *relayMetrics, store *store) *auditForwarder {
+	forwarder := &auditForwarder{
 		machineID:    machineID,
 		endpoint:     strings.TrimRight(relayURL, "/") + "/api/relay/audit",
 		token:        token,
 		client:       &http.Client{Timeout: 10 * time.Second},
 		metrics:      metrics,
+		store:        store,
 		wake:         make(chan struct{}, 1),
 		backoffStart: time.Second,
 	}
+	if store != nil {
+		events, dropped, err := store.loadAuditForwardQueue(auditForwardQueueLimit)
+		if err != nil {
+			log.Printf("[audit] load forwarding queue: %v", err)
+		}
+		forwarder.queue = events
+		if dropped > 0 && metrics != nil {
+			metrics.auditForwardDropped.Add(float64(dropped))
+		}
+		forwarder.updateQueueGaugeLocked()
+	}
+	return forwarder
 }
 
 func (f *auditForwarder) enqueueLogin(ev hostLogin) {
@@ -290,7 +300,10 @@ func (f *auditForwarder) enqueueClipboard(ev auditEvent, capture bool) {
 		ClientIP: ev.ClientIP, OSUser: ev.OSUser, Direction: ev.Direction,
 		Mime: ev.Mime, Result: ev.Result, Size: size, SHA256: hash,
 	}
-	if capture {
+	if capture && len(ev.Data) > auditForwardContentLimit {
+		log.Printf("[audit] forwarding clipboard event without content event_id=%s size=%d: exceeds 4 MiB limit",
+			eventID, size)
+	} else if capture {
 		data := base64.StdEncoding.EncodeToString(ev.Data)
 		event.Data = &data
 	}
@@ -314,9 +327,20 @@ func auditTimestamp(timestamp string) string {
 
 func (f *auditForwarder) enqueue(event forwardedAuditEvent) {
 	f.mu.Lock()
+	if f.store != nil {
+		if err := f.store.persistAuditForwardEvent(event); err != nil {
+			log.Printf("[audit] persist forwarding event %s: %v", event.EventID, err)
+		}
+	}
 	if len(f.queue)+f.inflightSize >= auditForwardQueueLimit {
 		if len(f.queue) > 0 {
+			droppedEvent := f.queue[0]
 			f.queue = f.queue[1:]
+			if f.store != nil {
+				if err := f.store.deleteAuditForwardEvents([]string{droppedEvent.EventID}); err != nil {
+					log.Printf("[audit] delete dropped forwarding event %s: %v", droppedEvent.EventID, err)
+				}
+			}
 			if f.metrics != nil {
 				f.metrics.auditForwardDropped.Inc()
 			}
@@ -364,11 +388,20 @@ func (f *auditForwarder) nextBatch() []forwardedAuditEvent {
 	return batch
 }
 
-func (f *auditForwarder) completeBatch(count int) {
+func (f *auditForwarder) completeBatch(events []forwardedAuditEvent) {
 	f.mu.Lock()
-	f.inflightSize -= count
+	f.inflightSize -= len(events)
 	f.updateQueueGaugeLocked()
 	f.mu.Unlock()
+	if f.store != nil {
+		eventIDs := make([]string, len(events))
+		for i, event := range events {
+			eventIDs[i] = event.EventID
+		}
+		if err := f.store.deleteAuditForwardEvents(eventIDs); err != nil {
+			log.Printf("[audit] delete acknowledged forwarding events: %v", err)
+		}
+	}
 }
 
 func (f *auditForwarder) retryBatch(batch []forwardedAuditEvent) {
@@ -431,7 +464,7 @@ func (f *auditForwarder) run(ctx context.Context) {
 		if err := f.postBatch(ctx, batch); err != nil {
 			var permanent *auditForwardPermanentError
 			if errors.As(err, &permanent) {
-				f.completeBatch(len(batch))
+				f.completeBatch(batch)
 				if f.metrics != nil {
 					f.metrics.auditForwardDropped.Add(float64(len(batch)))
 				}
@@ -450,7 +483,7 @@ func (f *auditForwarder) run(ctx context.Context) {
 			backoff = min(backoff*2, 60*time.Second)
 			continue
 		}
-		f.completeBatch(len(batch))
+		f.completeBatch(batch)
 		backoff = f.backoffStart
 	}
 }

@@ -32,6 +32,8 @@ const (
 	viewerKeepAlivePeriod = 2 * time.Second
 )
 
+var directProbeCloseTimeout = 5 * time.Second
+
 type quicConnContextKey struct{}
 
 type Session struct {
@@ -155,6 +157,12 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	defer transport.CloseWithError(0, "")
 	if direct != nil && user.TicketPath == "probe" {
 		registry.metrics.directProbes.Inc()
+		timer := time.NewTimer(directProbeCloseTimeout)
+		defer timer.Stop()
+		select {
+		case <-transport.Context().Done():
+		case <-timer.C:
+		}
 		_ = transport.CloseWithError(0, "probe")
 		return
 	}

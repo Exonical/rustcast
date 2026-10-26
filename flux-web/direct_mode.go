@@ -204,7 +204,7 @@ func runDirectMode(registry *machineRegistry, sessions *sessionRegistry, certifi
 	}
 	keyRefresher := newDirectTicketKeyRefresher(verifier)
 	go keyRefresher.run(ctx)
-	forwarder := newDirectAuditForwarder(machineID, registry.metrics)
+	forwarder := newDirectAuditForwarder(machineID, registry.metrics, store)
 	if forwarder != nil {
 		go forwarder.run(ctx)
 	}

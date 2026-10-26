@@ -494,6 +494,9 @@ func registerPolicyRoutes(admin *gin.RouterGroup, registry *machineRegistry, aut
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy body"})
 			return
 		}
+		if p.ConnectionPath == "" {
+			p.ConnectionPath = st.getPolicy(c.Param("id")).ConnectionPath
+		}
 		updatedBy := "unknown"
 		if user := auth.userFrom(c); user != nil {
 			updatedBy = user.Sub

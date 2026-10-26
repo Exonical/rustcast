@@ -9,7 +9,7 @@ Support two media paths for a viewer session, on a LAN or across the internet (W
 - **Relay mode** (today): browser ⇄ central relay ⇄ host.
 - **Direct mode** (new): browser ⇄ host, with no relay hop for media.
 
-The central relay remains the control plane in both modes: machine list, OIDC login, authorization, ticket issuance, and metrics. Direct-mode login and clipboard audit are stored locally and forwarded to the central relay; forwarding is trusted using the shared `FLUX_RELAY_TOKEN`.
+The central relay remains the control plane in both modes: machine list, OIDC login, authorization, ticket issuance, and metrics. Direct-mode login and clipboard audit are stored locally and forwarded to the central relay; the forwarding queue persists in the host's local SQLite. Forwarding is trusted using the shared `FLUX_RELAY_TOKEN`.
 
 ## When each mode applies
 
@@ -79,7 +79,7 @@ Today `/api/webtransport` returns a 60 s single-use ticket that only the issuing
 - Ticket verification checks signature, version, path, machine ID, expiry, and single-use nonce. The nonce cache survives public-key replacement. The signed clipboard mode, capture setting, and size limit are enforced by the direct session; missing mode fails closed as `off`, capture defaults to false, and a missing size uses the default maximum.
 - No shared secret leaves the relay; a compromised host can't mint tickets for other hosts.
 
-Login and clipboard audit remain in the direct endpoint's local SQLite store and are forwarded in bounded, deduplicated batches to the central relay's authenticated `POST /api/relay/audit` endpoint. The shared `FLUX_RELAY_TOKEN` is the trust boundary for forwarded audit; per-host credentials remain open work.
+Login and clipboard audit remain in the direct endpoint's local SQLite store; a durable queue forwards them in bounded, deduplicated batches to the central relay's authenticated `POST /api/relay/audit` endpoint. Captured clipboard content over 4 MiB is forwarded as digest and size only. The relay stores content only when its capture policy is enabled and the event is within `MaxBytes`; otherwise it stores digest and size only. The shared `FLUX_RELAY_TOKEN` is the trust boundary for forwarded audit; per-host credentials remain open work.
 
 ### 4. Discovery and fallback
 

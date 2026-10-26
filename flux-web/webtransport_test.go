@@ -607,9 +607,13 @@ func waitForUpstreamIDR(t *testing.T, upstream *machineUpstream) {
 
 func TestDirectProbeTicketClosesWithoutStartingSession(t *testing.T) {
 	t.Setenv("FLUX_MODE", "direct")
+	previousProbeCloseTimeout := directProbeCloseTimeout
+	directProbeCloseTimeout = 300 * time.Millisecond
+	defer func() { directProbeCloseTimeout = previousProbeCloseTimeout }()
 	registry := newMachineRegistry()
 	registry.seedStatic("default", "test", "127.0.0.1:0")
 	sessions := newSessionRegistry()
+	st := testStore(t)
 	certificates, err := newRelayCertificateManager("", "", "localhost")
 	if err != nil {
 		t.Fatal(err)
@@ -624,7 +628,7 @@ func TestDirectProbeTicketClosesWithoutStartingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	direct := &directWebTransportMode{machineID: "direct-machine", verifier: verifier}
-	server := newWebTransportServer(registry, sessions, certificates, nil, nil, direct)
+	server := newWebTransportServer(registry, sessions, certificates, nil, st, direct)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -656,6 +660,7 @@ func TestDirectProbeTicketClosesWithoutStartingSession(t *testing.T) {
 		Scheme: "https", Host: packetConn.LocalAddr().String(), Path: "/wt",
 		RawQuery: "machine=default&ticket=" + ticket,
 	}).String()
+	dialStarted := time.Now()
 	_, session, err := transport.Dial(ctx, target, nil)
 	if err != nil {
 		t.Fatalf("dial probe endpoint: %v", err)
@@ -666,6 +671,21 @@ func TestDirectProbeTicketClosesWithoutStartingSession(t *testing.T) {
 	})
 	if len(sessions.list()) != 0 {
 		t.Fatalf("probe created a session: %+v", sessions.list())
+	}
+	select {
+	case <-session.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("probe session did not close after its timeout")
+	}
+	if time.Since(dialStarted) < directProbeCloseTimeout/2 {
+		t.Fatalf("probe session closed too quickly: %v", time.Since(dialStarted))
+	}
+	logins, err := st.listLogins("", 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logins) != 0 {
+		t.Fatalf("probe recorded host logins: %+v", logins)
 	}
 }
 
