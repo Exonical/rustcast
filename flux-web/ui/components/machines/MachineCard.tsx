@@ -18,6 +18,12 @@ const POLICY_MODES: { value: ClipboardPolicy["clipboard_mode"]; label: string }[
   { value: "off", label: "Off" },
 ];
 
+const CONNECTION_PATHS: { value: ClipboardPolicy["connection_path"]; label: string }[] = [
+  { value: "auto", label: "Automatic" },
+  { value: "direct_only", label: "Direct only" },
+  { value: "relay_only", label: "Relay only" },
+];
+
 export function MachineCard({ machine, onConnect }: {
   machine: Machine;
   onConnect: (machine: Machine) => void;
@@ -60,6 +66,7 @@ export function MachineCard({ machine, onConnect }: {
       clipboard_mode: next.clipboard_mode,
       max_bytes: next.max_bytes,
       capture_content: next.capture_content,
+      connection_path: next.connection_path,
     })
       .then((saved) => {
         setPolicy(saved);
@@ -121,6 +128,17 @@ export function MachineCard({ machine, onConnect }: {
             {policyError && <p className="text-[10px] text-red-300">{policyError}</p>}
           </div>
           <div className="flex items-center gap-2">
+            <select
+              aria-label="Connection path"
+              disabled={saving}
+              value={policy.connection_path}
+              onChange={(e) => savePolicy({ connection_path: e.target.value as ClipboardPolicy["connection_path"] })}
+              className="flex-1 rounded-lg border border-white/10 bg-[#0d0f13] px-2 py-1.5 text-xs text-zinc-200 outline-none focus:border-blue-400/40"
+            >
+              {CONNECTION_PATHS.map((path) => (
+                <option key={path.value} value={path.value}>{path.label}</option>
+              ))}
+            </select>
             <select
               aria-label="Clipboard policy"
               disabled={saving}

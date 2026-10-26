@@ -85,6 +85,7 @@ type machineRecord struct {
 // the session registry for viewer fan-out) into lazily created upstreams.
 type relayDeps struct {
 	store    *store
+	audit    auditSink
 	sessions *sessionRegistry
 	name     func(machineID string) string
 }
@@ -100,6 +101,9 @@ type machineRegistry struct {
 // attachDeps wires clipboard persistence/fan-out dependencies; called once
 // from main (and from tests that exercise clipboard paths).
 func (r *machineRegistry) attachDeps(d *relayDeps) {
+	if d != nil && d.audit == nil {
+		d.audit = storeAuditSink{store: d.store}
+	}
 	r.mu.Lock()
 	r.deps = d
 	r.mu.Unlock()
@@ -298,6 +302,16 @@ func (r *machineRegistry) displayName(id string) string {
 		return m.DisplayName
 	}
 	return m.Name
+}
+
+func (r *machineRegistry) registeredMachine(id string) (machineInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	machine := r.machines[id]
+	if machine == nil {
+		return machineInfo{}, false
+	}
+	return machine.machineInfo, true
 }
 
 func (r *machineRegistry) deregister(id string) bool {

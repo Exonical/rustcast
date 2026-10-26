@@ -144,7 +144,7 @@ func parkRegisteredHostLinkForTest(t *testing.T, registry *machineRegistry, mach
 
 func assertHostLinkGauge(t *testing.T, registry *machineRegistry, want string) {
 	t.Helper()
-	if body := scrapeMetrics(registry.metrics); !strings.Contains(body, "flux_relay_host_links "+want) {
+	if body := scrapeMetrics(registry.metrics); !strings.Contains(body, "flux_relay_host_links{path=\"relay\"} "+want) {
 		t.Fatalf("host-link gauge does not contain %s: %s", want, body)
 	}
 }
@@ -296,13 +296,13 @@ func TestHostLinkHubTakeStopsAndPeerCloseUpdatesGauge(t *testing.T) {
 	listener := newHostLinkTestListener(t)
 	client, server := dialHostLinkTestConn(t, listener)
 	hub.park("machine-1", server)
-	if body := scrapeMetrics(metrics); !strings.Contains(body, "flux_relay_host_links 1") {
+	if body := scrapeMetrics(metrics); !strings.Contains(body, "flux_relay_host_links{path=\"relay\"} 1") {
 		t.Fatalf("parked link gauge missing 1: %s", body)
 	}
 	_ = client.CloseWithError(0, "peer closed")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(scrapeMetrics(metrics), "flux_relay_host_links 0") {
+		if strings.Contains(scrapeMetrics(metrics), "flux_relay_host_links{path=\"relay\"} 0") {
 			_ = server.CloseWithError(0, "test done")
 			return
 		}
@@ -458,7 +458,7 @@ func TestAcquireUsesHostDialOutLinkForCommandsAndFrames(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(scrapeMetrics(registry.metrics), `flux_relay_upstream_frames_total{machine="machine-1"} 1`) {
+		if strings.Contains(scrapeMetrics(registry.metrics), `flux_relay_upstream_frames_total{machine="machine-1",path="relay"} 1`) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

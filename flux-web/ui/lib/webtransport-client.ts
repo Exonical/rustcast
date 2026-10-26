@@ -7,7 +7,7 @@ import { BufferedByteReader, encodeControlMessage, parseVideoFrameHeader, readCo
 import { parseAudioHeader } from "./audio-framing";
 import { CLIPBOARD_MIME, type ClipboardPayload, type ClipboardStatus } from "./clipboard";
 import type { HostLoginMessage } from "./login";
-import { connectFirst, orderCandidates, type Candidate, type CandidateTransport, type DiscoveryCandidates } from "./candidates";
+import { connectFirst, orderCandidates, startDirectProbe, type Candidate, type CandidateTransport, type DiscoveryCandidates } from "./candidates";
 
 export type ConnectionState = "disconnected" | "connecting" | "login" | "connected" | "failed";
 
@@ -164,6 +164,9 @@ export class WebTransportClient {
   private generation = 0;
   private intentionalClose = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopDirectProbe: (() => void) | null = null;
+  private lastDiscoveryHadDirectCandidates = false;
+  directAvailable = false;
   private statsInterval: ReturnType<typeof setInterval> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
   private sequenceInterval: ReturnType<typeof setInterval> | null = null;
@@ -207,6 +210,7 @@ export class WebTransportClient {
   onClipboardStatus: ((status: ClipboardStatus) => void) | null = null;
   onLogin: ((message: HostLoginMessage) => void) | null = null;
   onConnectionPathChange: ((path: Candidate["path"] | null) => void) | null = null;
+  onDirectAvailableChange: ((available: boolean) => void) | null = null;
   private clipboardWaiter: {
     resolve: (status: ClipboardStatus | null) => void;
     timer: ReturnType<typeof setTimeout>;
@@ -246,8 +250,50 @@ export class WebTransportClient {
 
   private setConnectionPath(path: Candidate["path"] | null): void {
     if (this.connectionPath === path) return;
+    this.stopDirectProbe?.();
+    this.stopDirectProbe = null;
+    this.setDirectAvailable(false);
     this.connectionPath = path;
     this.onConnectionPathChange?.(path);
+  }
+
+  private setDirectAvailable(available: boolean): void {
+    if (this.directAvailable === available) return;
+    this.directAvailable = available;
+    this.onDirectAvailableChange?.(available);
+  }
+
+  private beginDirectProbe(machineId: string, discovery: DiscoveryResponse): void {
+    this.stopDirectProbe?.();
+    this.stopDirectProbe = startDirectProbe({
+      hasDirectCandidates: this.lastDiscoveryHadDirectCandidates,
+      fetchCandidates: async () => {
+        const response = await fetch(`/api/webtransport?machine=${encodeURIComponent(machineId)}&probe=1`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`Direct probe discovery failed: ${response.status}`);
+        const result = await response.json() as { candidates?: Candidate[] };
+        return result.candidates ?? [];
+      },
+      open: (candidate) => {
+        const url = candidateURL(candidate, discovery, {
+          hostname: location.hostname,
+          machineId,
+          userAgent: navigator.userAgent,
+        });
+        const hashes = (candidate.certHashes ?? []).map((value) => ({
+          algorithm: "sha-256" as const,
+          value: Uint8Array.from(atob(value), (character) => character.charCodeAt(0)),
+        }));
+        const transport = new WebTransport(url, { serverCertificateHashes: hashes });
+        void transport.closed.catch(() => {});
+        return { transport, ready: transport.ready };
+      },
+      isHidden: () => document.hidden,
+      onAvailable: () => {
+        this.stopDirectProbe = null;
+        this.clearDirectFailure(machineId);
+        this.setDirectAvailable(true);
+      },
+    });
   }
 
   get requestedResolution(): { width: number; height: number } | undefined {
@@ -286,6 +332,7 @@ export class WebTransportClient {
       }
       if (!response.ok) throw new Error(`WebTransport discovery failed: ${response.status}`);
       const discovery = await response.json() as DiscoveryResponse;
+      this.lastDiscoveryHadDirectCandidates = Boolean(discovery.candidates?.some((candidate) => candidate.path === "direct"));
       const candidates = orderCandidates(discovery, this.directFailedAt(machineId));
       const { candidate, transport } = await connectFirst(candidates, (next) => {
         const url = candidateURL(next, discovery, {
@@ -321,6 +368,9 @@ export class WebTransportClient {
       void this.readIncomingStreams(transport, generation);
       this.startIntervals(transport, generation);
       this.setState("connected");
+      if (candidate.path === "relay" && this.lastDiscoveryHadDirectCandidates) {
+        this.beginDirectProbe(machineId, discovery);
+      }
       void transport.closed.then(
         () => this.handleClosed(transport, generation),
         () => this.handleClosed(transport, generation),
@@ -398,6 +448,7 @@ export class WebTransportClient {
     this.reconnectTimer = null;
     this.detachVisibilityListener();
     this.dropVisibility.reset();
+    this.lastDiscoveryHadDirectCandidates = false;
     this.resumeKeyframeRequestPending = false;
     this.closeCurrent();
     this.setState("disconnected");

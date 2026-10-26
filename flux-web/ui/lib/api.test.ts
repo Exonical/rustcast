@@ -60,10 +60,10 @@ test("fetchPolicy and updatePolicy hit the machine policy routes", async () => {
   const api = await import("./api.js");
   await withFetch((url, init) => {
     seen.push(`${init?.method ?? "GET"} ${url}`);
-    return okJSON({ clipboard_mode: "both", max_bytes: 1048576, capture_content: true });
+    return okJSON({ clipboard_mode: "both", max_bytes: 1048576, capture_content: true, connection_path: "auto" });
   }, async () => {
     await api.fetchPolicy("host-1");
-    await api.updatePolicy("host-1", { clipboard_mode: "off", max_bytes: 64, capture_content: false });
+    await api.updatePolicy("host-1", { clipboard_mode: "off", max_bytes: 64, capture_content: false, connection_path: "auto" });
   });
   assert.equal(seen[0], "GET /api/machines/host-1/policy");
   assert.equal(seen[1], "PUT /api/machines/host-1/policy");
@@ -74,12 +74,12 @@ test("updatePolicy sends the validated policy body", async () => {
   const api = await import("./api.js");
   await withFetch((_url, init) => {
     body = String(init?.body ?? "");
-    return okJSON({ clipboard_mode: "off", max_bytes: 64, capture_content: false });
+    return okJSON({ clipboard_mode: "off", max_bytes: 64, capture_content: false, connection_path: "direct_only" });
   }, async () => {
-    const policy = await api.updatePolicy("m", { clipboard_mode: "off", max_bytes: 64, capture_content: false });
+    const policy = await api.updatePolicy("m", { clipboard_mode: "off", max_bytes: 64, capture_content: false, connection_path: "direct_only" });
     assert.equal(policy.clipboard_mode, "off");
   });
-  assert.deepEqual(JSON.parse(body), { clipboard_mode: "off", max_bytes: 64, capture_content: false });
+  assert.deepEqual(JSON.parse(body), { clipboard_mode: "off", max_bytes: 64, capture_content: false, connection_path: "direct_only" });
 });
 
 test("fetchClipboardAudit builds the query string", async () => {

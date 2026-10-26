@@ -204,7 +204,16 @@ func runDirectMode(registry *machineRegistry, sessions *sessionRegistry, certifi
 	}
 	keyRefresher := newDirectTicketKeyRefresher(verifier)
 	go keyRefresher.run(ctx)
-	// TODO(phase 2b): forward login and clipboard audit events to the central relay.
+	forwarder := newDirectAuditForwarder(machineID, registry.metrics)
+	if forwarder != nil {
+		go forwarder.run(ctx)
+	}
+	registry.attachDeps(&relayDeps{
+		store: store, audit: forwardingAuditSink{
+			local: storeAuditSink{store: store}, forwarder: forwarder, machineID: machineID,
+		},
+		sessions: sessions, name: registry.displayName,
+	})
 	statusPath := strings.TrimSpace(os.Getenv("FLUX_DIRECT_STATUS_FILE"))
 	if statusPath == "" {
 		statusPath = "/run/flux/direct.json"

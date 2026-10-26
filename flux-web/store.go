@@ -53,12 +53,13 @@ type machinePolicy struct {
 	Mode           string `json:"clipboard_mode"`
 	MaxBytes       int64  `json:"max_bytes"`
 	CaptureContent bool   `json:"capture_content"`
+	ConnectionPath string `json:"connection_path"`
 	UpdatedAt      string `json:"updated_at,omitempty"`
 	UpdatedBy      string `json:"updated_by,omitempty"`
 }
 
 func defaultMachinePolicy() machinePolicy {
-	return machinePolicy{Mode: clipModeBoth, MaxBytes: defaultClipboardMaxBytes, CaptureContent: true}
+	return machinePolicy{Mode: clipModeBoth, MaxBytes: defaultClipboardMaxBytes, CaptureContent: true, ConnectionPath: "auto"}
 }
 
 // allows reports whether the policy permits a transfer in direction.
@@ -81,6 +82,8 @@ func (p machinePolicy) allows(direction string) bool {
 type auditEvent struct {
 	MachineID   string
 	MachineName string
+	EventID     string
+	Timestamp   string
 	SessionID   string
 	UserSub     string
 	UserName    string
@@ -88,6 +91,8 @@ type auditEvent struct {
 	Direction   string
 	Mime        string
 	Data        []byte // hashed always, stored only when policy captures content
+	Size        int64
+	SHA256      string
 	Result      string
 	OSUser      string
 }
@@ -157,6 +162,7 @@ CREATE TABLE IF NOT EXISTS machine_policy (
     clipboard_mode  TEXT NOT NULL,
     max_bytes       INTEGER NOT NULL,
     capture_content INTEGER NOT NULL,
+    connection_path TEXT NOT NULL DEFAULT 'auto',
     updated_at      TEXT NOT NULL,
     updated_by      TEXT NOT NULL
 );
@@ -174,7 +180,8 @@ CREATE TABLE IF NOT EXISTS clipboard_events (
     size         INTEGER NOT NULL,
     sha256       TEXT NOT NULL,
     result       TEXT NOT NULL,
-    content      BLOB
+    content      BLOB,
+    event_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS clipboard_events_ts ON clipboard_events(ts);
 CREATE INDEX IF NOT EXISTS clipboard_events_machine_ts ON clipboard_events(machine_id, ts);
@@ -188,7 +195,8 @@ CREATE TABLE IF NOT EXISTS host_logins (
     user_name    TEXT,
     client_ip    TEXT,
     os_user      TEXT,
-    result       TEXT NOT NULL
+    result       TEXT NOT NULL,
+    event_id     TEXT
 );
 CREATE INDEX IF NOT EXISTS host_logins_ts ON host_logins(ts);
 CREATE INDEX IF NOT EXISTS host_logins_machine_ts ON host_logins(machine_id, ts);
@@ -198,7 +206,16 @@ func (s *store) Close() error { return s.db.Close() }
 
 // migrate applies additive schema changes to existing databases.
 func (s *store) migrate() error {
-	has, err := s.hasColumn("clipboard_events", "os_user")
+	has, err := s.hasColumn("machine_policy", "connection_path")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE machine_policy ADD COLUMN connection_path TEXT NOT NULL DEFAULT 'auto'`); err != nil {
+			return err
+		}
+	}
+	has, err = s.hasColumn("clipboard_events", "os_user")
 	if err != nil {
 		return err
 	}
@@ -206,6 +223,25 @@ func (s *store) migrate() error {
 		if _, err := s.db.Exec(`ALTER TABLE clipboard_events ADD COLUMN os_user TEXT`); err != nil {
 			return err
 		}
+	}
+	for _, table := range []string{"clipboard_events", "host_logins"} {
+		has, err := s.hasColumn(table, "event_id")
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN event_id TEXT`); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS clipboard_events_event_id
+		ON clipboard_events(event_id)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS host_logins_event_id
+		ON host_logins(event_id)`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -234,9 +270,9 @@ func (s *store) getPolicy(machineID string) machinePolicy {
 	var p machinePolicy
 	var capture int
 	err := s.db.QueryRow(
-		`SELECT clipboard_mode, max_bytes, capture_content, updated_at, updated_by
+		`SELECT clipboard_mode, max_bytes, capture_content, connection_path, updated_at, updated_by
 		 FROM machine_policy WHERE machine_id = ?`, machineID).
-		Scan(&p.Mode, &p.MaxBytes, &capture, &p.UpdatedAt, &p.UpdatedBy)
+		Scan(&p.Mode, &p.MaxBytes, &capture, &p.ConnectionPath, &p.UpdatedAt, &p.UpdatedBy)
 	if err != nil {
 		return defaultMachinePolicy()
 	}
@@ -251,6 +287,14 @@ func (s *store) putPolicy(machineID string, p machinePolicy, updatedBy string) e
 	default:
 		return errInvalidClipMode
 	}
+	if p.ConnectionPath == "" {
+		p.ConnectionPath = "auto"
+	}
+	switch p.ConnectionPath {
+	case "auto", "direct_only", "relay_only":
+	default:
+		return errors.New("connection_path must be one of auto|direct_only|relay_only")
+	}
 	if p.MaxBytes <= 0 || p.MaxBytes > 64<<20 {
 		return errors.New("max_bytes must be between 1 and 67108864")
 	}
@@ -259,15 +303,16 @@ func (s *store) putPolicy(machineID string, p machinePolicy, updatedBy string) e
 		capture = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO machine_policy (machine_id, clipboard_mode, max_bytes, capture_content, updated_at, updated_by)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO machine_policy (machine_id, clipboard_mode, max_bytes, capture_content, connection_path, updated_at, updated_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(machine_id) DO UPDATE SET
 		   clipboard_mode = excluded.clipboard_mode,
 		   max_bytes = excluded.max_bytes,
 		   capture_content = excluded.capture_content,
+		   connection_path = excluded.connection_path,
 		   updated_at = excluded.updated_at,
 		   updated_by = excluded.updated_by`,
-		machineID, p.Mode, p.MaxBytes, capture,
+		machineID, p.Mode, p.MaxBytes, capture, p.ConnectionPath,
 		time.Now().UTC().Format(time.RFC3339Nano), updatedBy)
 	return err
 }
@@ -278,17 +323,23 @@ func (s *store) insertAudit(ev auditEvent, capture bool) error {
 	if capture && len(ev.Data) > 0 {
 		content = ev.Data
 	}
-	sum := sha256Hex(ev.Data)
+	size, sum := ev.Size, ev.SHA256
+	if ev.Data != nil {
+		size, sum = int64(len(ev.Data)), sha256Hex(ev.Data)
+	} else if sum == "" {
+		size, sum = 0, sha256Hex(nil)
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO clipboard_events
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
-		    client_ip, direction, mime, size, sha256, result, content, os_user)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		    client_ip, direction, mime, size, sha256, result, content, os_user, event_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO NOTHING`,
+		auditTimestamp(ev.Timestamp),
 		ev.MachineID, nullIfEmpty(ev.MachineName), nullIfEmpty(ev.SessionID),
 		nullIfEmpty(ev.UserSub), nullIfEmpty(ev.UserName), nullIfEmpty(ev.ClientIP),
-		ev.Direction, nullIfEmpty(ev.Mime), int64(len(ev.Data)), sum, ev.Result, content,
-		nullIfEmpty(ev.OSUser))
+		ev.Direction, nullIfEmpty(ev.Mime), size, sum, ev.Result, content,
+		nullIfEmpty(ev.OSUser), nullIfEmpty(ev.EventID))
 	return err
 }
 
@@ -416,6 +467,8 @@ func (s *store) startRetentionPurge(ctx context.Context, days int) {
 type hostLogin struct {
 	MachineID   string
 	MachineName string
+	EventID     string
+	Timestamp   string
 	SessionID   string
 	UserSub     string
 	UserName    string
@@ -442,12 +495,13 @@ func (s *store) insertLogin(l hostLogin) error {
 	_, err := s.db.Exec(
 		`INSERT INTO host_logins
 		   (ts, machine_id, machine_name, session_id, user_sub, user_name,
-		    client_ip, os_user, result)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		    client_ip, os_user, result, event_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(event_id) DO NOTHING`,
+		auditTimestamp(l.Timestamp),
 		l.MachineID, nullIfEmpty(l.MachineName), nullIfEmpty(l.SessionID),
 		nullIfEmpty(l.UserSub), nullIfEmpty(l.UserName), nullIfEmpty(l.ClientIP),
-		nullIfEmpty(l.OSUser), l.Result)
+		nullIfEmpty(l.OSUser), l.Result, nullIfEmpty(l.EventID))
 	return err
 }
 

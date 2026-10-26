@@ -63,7 +63,7 @@ func clipboardSend(mime, data string) json.RawMessage {
 func directClipboardIdentity(t *testing.T, mode string) *identity {
 	t.Helper()
 	signer := ticketTestSigner(t, 15)
-	ticket, err := signer.sign(&identity{Sub: "direct-viewer"}, "m1", mode)
+	ticket, err := signer.sign(&identity{Sub: "direct-viewer"}, "m1", ticketTestPolicy(mode), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}

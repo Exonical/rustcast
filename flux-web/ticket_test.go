@@ -26,6 +26,12 @@ func ticketTestSigner(t *testing.T, byteValue byte) *ticketSigner {
 	return signer
 }
 
+func ticketTestPolicy(mode string) machinePolicy {
+	policy := defaultMachinePolicy()
+	policy.Mode = mode
+	return policy
+}
+
 func signedTicketForPayload(t *testing.T, signer *ticketSigner, payload directTicketPayload) string {
 	t.Helper()
 	if payload.Nonce == "" {
@@ -45,7 +51,7 @@ func signedTicketForPayload(t *testing.T, signer *ticketSigner, payload directTi
 func TestTicketSignerRoundTripAndRejectsInvalidTickets(t *testing.T) {
 	signer := ticketTestSigner(t, 1)
 	user := &identity{Sub: "sub-1", Username: "viewer", Email: "viewer@example.test", Name: "Viewer", Admin: true}
-	validTicket, err := signer.sign(user, "machine-1", clipModeBoth)
+	validTicket, err := signer.sign(user, "machine-1", ticketTestPolicy(clipModeBoth), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,14 +240,14 @@ func TestDirectTicketKeyRefreshSwapsKeyAndPreservesVerifierState(t *testing.T) {
 		t.Fatal(err)
 	}
 	user := &identity{Sub: "subject"}
-	oldTicket, err := oldSigner.sign(user, "machine-1", clipModeBoth)
+	oldTicket, err := oldSigner.sign(user, "machine-1", ticketTestPolicy(clipModeBoth), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := verifier.verify(oldTicket, "machine-1"); err != nil {
 		t.Fatal(err)
 	}
-	newTicket, err := newSigner.sign(user, "machine-1", clipModeBoth)
+	newTicket, err := newSigner.sign(user, "machine-1", ticketTestPolicy(clipModeBoth), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,11 +280,11 @@ func TestFailedDirectTicketKeyRefreshKeepsCurrentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	user := &identity{Sub: "subject"}
-	oldTicket, err := oldSigner.sign(user, "machine-1", clipModeBoth)
+	oldTicket, err := oldSigner.sign(user, "machine-1", ticketTestPolicy(clipModeBoth), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
-	newTicket, err := newSigner.sign(user, "machine-1", clipModeBoth)
+	newTicket, err := newSigner.sign(user, "machine-1", ticketTestPolicy(clipModeBoth), "direct")
 	if err != nil {
 		t.Fatal(err)
 	}

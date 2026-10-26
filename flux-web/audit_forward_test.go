@@ -1,0 +1,243 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func TestAuditForwarderBatchesAndAuthenticates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var mu sync.Mutex
+	var sizes []int
+	var authHeaders []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch forwardedAuditBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		sizes = append(sizes, len(batch.Events))
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	forwarder := newAuditForwarder("machine-1", server.URL, "relay-token", nil)
+	for i := 0; i < 55; i++ {
+		forwarder.enqueue(forwardedAuditEvent{EventID: fmt.Sprintf("%032x", i+1), Kind: "login", Result: "ok"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		forwarder.run(ctx)
+		close(done)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		complete := len(sizes) == 2
+		mu.Unlock()
+		if complete {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sizes) != 2 || sizes[0] != 50 || sizes[1] != 5 {
+		t.Fatalf("batch sizes = %v, want [50 5]", sizes)
+	}
+	if len(authHeaders) != 2 || authHeaders[0] != "Bearer relay-token" || authHeaders[1] != "Bearer relay-token" {
+		t.Fatalf("authorization headers = %v", authHeaders)
+	}
+}
+
+func TestAuditForwarderDropsOldestAtCapacity(t *testing.T) {
+	metrics := newRelayMetrics()
+	forwarder := newAuditForwarder("m", "http://127.0.0.1:1", "token", metrics)
+	for i := 0; i <= auditForwardQueueLimit; i++ {
+		forwarder.enqueue(forwardedAuditEvent{EventID: fmt.Sprintf("%032x", i+1), Kind: "login", Result: "ok"})
+	}
+	if got := len(forwarder.queue); got != auditForwardQueueLimit {
+		t.Fatalf("queue length = %d, want %d", got, auditForwardQueueLimit)
+	}
+	if forwarder.queue[0].EventID != fmt.Sprintf("%032x", 2) {
+		t.Fatalf("oldest queued event = %s, want second event", forwarder.queue[0].EventID)
+	}
+	body := scrapeMetrics(metrics)
+	if !bytes.Contains([]byte(body), []byte("flux_relay_audit_forward_queue{path=\"relay\"} 1000")) ||
+		!bytes.Contains([]byte(body), []byte("flux_relay_audit_forward_dropped_total{path=\"relay\"} 1")) {
+		t.Fatalf("queue metrics missing drop/gauge values: %s", body)
+	}
+}
+
+func TestAuditForwarderRetriesFailedBatch(t *testing.T) {
+	var mu sync.Mutex
+	var attempts int
+	var eventIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch forwardedAuditBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		attempts++
+		eventIDs = append(eventIDs, batch.Events[0].EventID)
+		current := attempts
+		mu.Unlock()
+		if current == 1 {
+			http.Error(w, "retry", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	forwarder := newAuditForwarder("m", server.URL, "token", nil)
+	forwarder.backoffStart = time.Millisecond
+	forwarder.enqueue(forwardedAuditEvent{EventID: "event-one", Kind: "login", Result: "ok"})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		forwarder.run(ctx)
+		close(done)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		complete := attempts >= 2
+		mu.Unlock()
+		if complete {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 2 || len(eventIDs) != 2 || eventIDs[0] != eventIDs[1] {
+		t.Fatalf("attempts=%d event IDs=%v; failed batch was not retried", attempts, eventIDs)
+	}
+}
+
+func TestDirectAuditForwarderDisablesUnsafeOrIncompleteConfiguration(t *testing.T) {
+	t.Setenv("FLUX_RELAY_URL", "http://example.test")
+	t.Setenv("FLUX_RELAY_TOKEN", "token")
+	if forwarder := newDirectAuditForwarder("m", nil); forwarder != nil {
+		t.Fatal("unsafe relay URL enabled forwarding")
+	}
+	t.Setenv("FLUX_RELAY_URL", "https://relay.example.test")
+	t.Setenv("FLUX_RELAY_TOKEN", "")
+	if forwarder := newDirectAuditForwarder("m", nil); forwarder != nil {
+		t.Fatal("missing token enabled forwarding")
+	}
+	local := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer local.Close()
+	t.Setenv("FLUX_RELAY_URL", local.URL)
+	t.Setenv("FLUX_RELAY_TOKEN", "token")
+	if forwarder := newDirectAuditForwarder("m", nil); forwarder == nil {
+		t.Fatal("loopback relay URL was refused")
+	}
+}
+
+func TestRelayAuditEndpointAuthMachineDedupAndCapturePolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st := testStore(t)
+	registry := newMachineRegistry()
+	registry.seedStatic("machine-1", "Test Machine", "127.0.0.1:8556")
+	router := gin.New()
+	api := router.Group("/api", (&authService{cfg: authConfig{relayToken: "relay-token"}}).requireMachineToken())
+	registerRelayAuditRoute(api, registry, st)
+
+	request := func(token, machineID, eventID string) *httptest.ResponseRecorder {
+		content := "aGVsbG8="
+		body, _ := json.Marshal(forwardedAuditBatch{
+			MachineID: machineID,
+			Events: []forwardedAuditEvent{{
+				EventID: eventID, Kind: "clipboard", Timestamp: "2025-01-02T03:04:05Z",
+				SessionID: "session-1", UserSub: "sub-1", UserName: "Viewer", ClientIP: "192.0.2.1",
+				OSUser: "alice", Direction: clipDirClientToHost, Mime: clipWireMime, Result: clipResultOK,
+				Size: 5, SHA256: sha256Hex([]byte("hello")), Data: &content,
+			}},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/relay/audit", bytes.NewReader(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	if response := request("", "machine-1", "00000000000000000000000000000001"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401", response.Code)
+	}
+	if response := request("relay-token", "unknown", "00000000000000000000000000000002"); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown machine status = %d, want 404", response.Code)
+	}
+
+	policy := defaultMachinePolicy()
+	policy.CaptureContent = false
+	if err := st.putPolicy("machine-1", policy, "test"); err != nil {
+		t.Fatal(err)
+	}
+	eventID := "00000000000000000000000000000003"
+	for i := 0; i < 2; i++ {
+		response := request("relay-token", "machine-1", eventID)
+		if response.Code != http.StatusOK {
+			t.Fatalf("audit status = %d: %s", response.Code, response.Body)
+		}
+	}
+	var rows int
+	var size int64
+	var hash string
+	var content []byte
+	if err := st.db.QueryRow(`SELECT COUNT(*), MAX(size), MAX(sha256), MAX(content) FROM clipboard_events WHERE event_id = ?`, eventID).
+		Scan(&rows, &size, &hash, &content); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || size != 5 || hash != sha256Hex([]byte("hello")) || len(content) != 0 {
+		t.Fatalf("digest-only deduplicated row: count=%d size=%d hash=%q content=%q", rows, size, hash, content)
+	}
+
+	policy.CaptureContent = true
+	if err := st.putPolicy("machine-1", policy, "test"); err != nil {
+		t.Fatal(err)
+	}
+	response := request("relay-token", "machine-1", "00000000000000000000000000000004")
+	if response.Code != http.StatusOK {
+		t.Fatalf("captured audit status = %d: %s", response.Code, response.Body)
+	}
+	if err := st.db.QueryRow(`SELECT content FROM clipboard_events WHERE event_id = ?`, "00000000000000000000000000000004").Scan(&content); err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "hello" {
+		t.Fatalf("captured content = %q, want hello", content)
+	}
+}
+
+func TestRelayAuditEndpointRejectsOversizedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	registry := newMachineRegistry()
+	router := gin.New()
+	api := router.Group("/api", (&authService{cfg: authConfig{relayToken: "token"}}).requireMachineToken())
+	registerRelayAuditRoute(api, registry, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/relay/audit", bytes.NewReader(bytes.Repeat([]byte("x"), auditForwardBodyLimit+1)))
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status = %d, want 413", response.Code)
+	}
+}

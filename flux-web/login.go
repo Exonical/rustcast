@@ -209,7 +209,7 @@ func (u *machineUpstream) onUpstreamDisconnected() {
 // insertHostLogin writes a host_logins audit row for the authenticating
 // viewer (or an empty viewer context when none).
 func (u *machineUpstream) insertHostLogin(sess *Session, osUser, result string) {
-	if u.deps == nil || u.deps.store == nil {
+	if u.deps == nil {
 		return
 	}
 	ev := hostLogin{
@@ -223,9 +223,11 @@ func (u *machineUpstream) insertHostLogin(sess *Session, osUser, result string) 
 	if sess != nil {
 		ev.SessionID, ev.UserSub, ev.UserName, ev.ClientIP = sess.auditFields()
 	}
-	if err := u.deps.store.insertLogin(ev); err != nil {
-		log.Printf("[login] audit insert failed machine=%s: %v", u.id, err)
+	audit := u.deps.audit
+	if audit == nil {
+		audit = storeAuditSink{store: u.deps.store}
 	}
+	audit.recordLogin(ev)
 }
 
 // handleLoginFrame processes a hostd msgLogin frame.

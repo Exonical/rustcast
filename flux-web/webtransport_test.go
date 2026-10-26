@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,6 +602,70 @@ func waitForUpstreamIDR(t *testing.T, upstream *machineUpstream) {
 		case <-deadline:
 			t.Fatal("initial IDR request did not reach upstream")
 		}
+	}
+}
+
+func TestDirectProbeTicketClosesWithoutStartingSession(t *testing.T) {
+	t.Setenv("FLUX_MODE", "direct")
+	registry := newMachineRegistry()
+	registry.seedStatic("default", "test", "127.0.0.1:0")
+	sessions := newSessionRegistry()
+	certificates, err := newRelayCertificateManager("", "", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := ticketTestSigner(t, 42)
+	verifier, err := newTicketVerifier(signer.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := signer.sign(&identity{Sub: "probe-viewer"}, "direct-machine", defaultMachinePolicy(), "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &directWebTransportMode{machineID: "direct-machine", verifier: verifier}
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil, direct)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		_ = server.Serve(packetConn)
+	}()
+	defer func() {
+		_ = server.Close()
+		_ = packetConn.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Error("WebTransport server did not stop")
+		}
+	}()
+	time.Sleep(25 * time.Millisecond)
+
+	transport := &webtransport.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}},
+		QUICConfig:      &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+	}
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	target := (&url.URL{
+		Scheme: "https", Host: packetConn.LocalAddr().String(), Path: "/wt",
+		RawQuery: "machine=default&ticket=" + ticket,
+	}).String()
+	_, session, err := transport.Dial(ctx, target, nil)
+	if err != nil {
+		t.Fatalf("dial probe endpoint: %v", err)
+	}
+	defer session.CloseWithError(0, "probe test complete")
+	waitForTestCondition(t, time.Second, func() bool {
+		return strings.Contains(scrapeMetrics(registry.metrics), `flux_relay_direct_probes_total{path="direct"} 1`)
+	})
+	if len(sessions.list()) != 0 {
+		t.Fatalf("probe created a session: %+v", sessions.list())
 	}
 }
 

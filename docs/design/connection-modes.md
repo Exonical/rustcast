@@ -1,6 +1,6 @@
 # Design: Relay and Direct connection modes
 
-Status: **phase 2a implemented**; phase 2b and standalone direct remain planned. Current behaviour is documented in [../transport.md](../transport.md).
+Status: **phase 2b implemented**; standalone direct remains planned. Current behaviour is documented in [../transport.md](../transport.md).
 
 ## Goal
 
@@ -9,7 +9,7 @@ Support two media paths for a viewer session, on a LAN or across the internet (W
 - **Relay mode** (today): browser ⇄ central relay ⇄ host.
 - **Direct mode** (new): browser ⇄ host, with no relay hop for media.
 
-The central relay remains the control plane in both modes: machine list, OIDC login, authorization, ticket issuance, and metrics. Direct-mode login and clipboard audit are stored locally until phase 2b forwards them centrally.
+The central relay remains the control plane in both modes: machine list, OIDC login, authorization, ticket issuance, and metrics. Direct-mode login and clipboard audit are stored locally and forwarded to the central relay; forwarding is trusted using the shared `FLUX_RELAY_TOKEN`.
 
 ## When each mode applies
 
@@ -74,12 +74,12 @@ Packaging: the Linux host image builds `flux-web` without the UI and enables `fl
 
 Today `/api/webtransport` returns a 60 s single-use ticket that only the issuing relay can verify (`wtTicketTTL` in `flux-web/auth.go`). Direct endpoints need tickets they can verify without calling back:
 
-- The central relay signs a 60-second ticket with an **ML-DSA-87** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, sub, username, email, name, admin, clipboard, path: "direct", exp, nonce}`. The 32-byte signing seed is stored at `$FLUX_DATA_DIR/ticket-mldsa87.seed` with mode `0600`. See [Cryptography](#cryptography-fips-approved-algorithms-by-default).
+- The central relay signs a 60-second ticket with an **ML-DSA-87** key (FIPS 204, Go `crypto/mldsa`): `{machine_id, sub, username, email, name, admin, clipboard, clipboard_capture, clipboard_max_bytes, path: "direct", exp, nonce}`. The 32-byte signing seed is stored at `$FLUX_DATA_DIR/ticket-mldsa87.seed` with mode `0600`. See [Cryptography](#cryptography-fips-approved-algorithms-by-default).
 - A direct endpoint loads `FLUX_TICKET_PUBLIC_KEY` when pinned, otherwise fetches `GET /api/relay/ticket-key` with `FLUX_RELAY_TOKEN` and caches the key under `$FLUX_DATA_DIR/ticket-key.pub`. It refuses non-HTTPS relay URLs except HTTP loopback. Cached keys permit startup during relay outages. The active key refreshes every five minutes and asynchronously after a signature failure, throttled to once per 30 seconds; failed refreshes preserve the active key. Pinning disables all refresh.
-- Ticket verification checks signature, version, path, machine ID, expiry, and single-use nonce. The nonce cache survives public-key replacement. The signed `clipboard` mode is enforced by the direct session; missing policy fails closed as `off`.
+- Ticket verification checks signature, version, path, machine ID, expiry, and single-use nonce. The nonce cache survives public-key replacement. The signed clipboard mode, capture setting, and size limit are enforced by the direct session; missing mode fails closed as `off`, capture defaults to false, and a missing size uses the default maximum.
 - No shared secret leaves the relay; a compromised host can't mint tickets for other hosts.
 
-Login and clipboard audit remain in the direct endpoint's local SQLite store for now. Forwarding audit and login events to the central relay is phase 2b.
+Login and clipboard audit remain in the direct endpoint's local SQLite store and are forwarded in bounded, deduplicated batches to the central relay's authenticated `POST /api/relay/audit` endpoint. The shared `FLUX_RELAY_TOKEN` is the trust boundary for forwarded audit; per-host credentials remain open work.
 
 ### 4. Discovery and fallback
 
@@ -136,7 +136,7 @@ Goal: **FIPS-compatible, not FIPS-validated.** By default every leg uses FIPS-ap
 | Use | Default (FIPS-approved) | Standard | Notes |
 | --- | --- | --- | --- |
 | Ticket signatures (relay → direct endpoint) | ML-DSA-87 | FIPS 204 | Go `crypto/mldsa`. Signature 4,627 B, public key 2,592 B; ticket ≈ 6.4 KB base64url. |
-| Host ↔ relay QUIC key exchange | `MLKEM1024` (0x0202), then `SecP256r1MLKEM768` | FIPS 203 (+ SP 800-56A for P-256) | Both ends are ours: Go `crypto/tls` and rustls `aws-lc-rs` provider (`kx_group::MLKEM1024`, `SECP256R1MLKEM768`). |
+| Host ↔ relay QUIC key exchange | `MLKEM1024`, `SECP256R1MLKEM768`, `X25519MLKEM768`, `SECP384R1`, `SECP256R1`, `X25519` | FIPS 203 for ML-KEM; SP 800-56A for P-256/P-384 | Rust `aws-lc-rs` provider order; Go `crypto/tls` uses its own supported ordering. |
 | Browser ↔ relay / direct endpoint key exchange | Server preference: `MLKEM1024`, `SecP384r1MLKEM1024`, `SecP256r1MLKEM768`, `X25519MLKEM768`, `CurveP256`, `CurveP384` | FIPS 203; SP 800-56A | The browser gets the first group it supports. Firefox 154+ can do `MLKEM1024` when `security.tls.enable_mlkem1024` / enterprise policy `CNSA2KeyAgreementEnabled` is on (it's sent last and only after a HelloRetryRequest, so it costs one extra setup round trip). Current browsers otherwise use `X25519MLKEM768`, whose ML-KEM component is approved. X25519 alone is left out of the server preference. |
 | TLS certificates / handshake signatures | ECDSA P-256 (relay's rotating self-signed cert, as today) or P-384 | FIPS 186-5 | Browsers don't accept ML-DSA certificates yet. |
 | Symmetric / hashes | AES-128/256-GCM, SHA-256/384 | FIPS 197, SP 800-38D, FIPS 180-4 | Prefer AES-GCM over ChaCha20-Poly1305 where the stack allows ordering. |
@@ -162,7 +162,7 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
    - Relay: `FLUX_HOST_LINK_ADDR` (default `:8444`, `off` disables); host: `FLUX_RELAY_QUIC_ADDR` and optional `FLUX_RELAY_CA_FILE`.
    - The relay's rotating self-signed WebTransport certificate is not trusted by the host; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA trusted by the host, or supply the CA via `FLUX_RELAY_CA_FILE`.
 2a. **Direct endpoint + signed tickets + discovery/fallback — implemented.** Includes the host-image `flux-direct.service`, ML-DSA-87 tickets with refresh/pinning, ticket-carried clipboard policy, PQ-preferred Go TLS groups, heartbeat-reported direct addresses and overlapping certificate hashes, browser fallback, and connection-path indicator.
-2b. **Remaining direct-mode work.** Add `aws-lc-rs`/ML-KEM on the Rust host, per-machine path policy, a `path` metric label, background direct retry, and audit forwarding to the central relay.
+2b. **Implemented.** Rust uses `aws-lc-rs` and prefers ML-KEM; per-machine `auto`/`direct_only`/`relay_only` path policy is enforced; metrics carry a process-wide `path` label; relay-connected browsers probe direct reachability in the background; direct audit is forwarded centrally.
 3. **Standalone direct (optional)** — direct endpoint serves its own UI with local auth for isolated LANs.
 
 ## Open questions

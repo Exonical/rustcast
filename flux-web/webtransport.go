@@ -110,11 +110,27 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 	if machineID == "" {
 		machineID = "default"
 	}
+	ticket := r.URL.Query().Get("ticket")
+	if direct == nil {
+		if ticketPath := ticketPathFromPayload(ticket); ticketPath == "probe" || ticketPath == "direct" {
+			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
+			http.Error(w, "direct ticket is not valid on the relay", http.StatusUnauthorized)
+			return
+		}
+		if store != nil {
+			policy := store.getPolicy(machineID)
+			if policy.ConnectionPath == "direct_only" {
+				registry.metrics.reject(registry.metricMachineID(machineID), "path_policy")
+				http.Error(w, `{"error":"path_policy"}`, http.StatusForbidden)
+				return
+			}
+		}
+	}
 	var user *identity
 	if direct != nil {
 		machineID = "default"
 		var err error
-		user, err = direct.verifier.verify(r.URL.Query().Get("ticket"), direct.machineID)
+		user, err = direct.verifier.verify(ticket, direct.machineID)
 		if err != nil {
 			if errors.Is(err, errInvalidTicketSignature) && direct.refreshKey != nil {
 				direct.refreshKey()
@@ -124,7 +140,7 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 			return
 		}
 	} else if auth != nil && auth.enabled {
-		user = auth.consumeTicket(r.URL.Query().Get("ticket"))
+		user = auth.consumeTicket(ticket)
 		if user == nil {
 			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
@@ -137,6 +153,11 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		return
 	}
 	defer transport.CloseWithError(0, "")
+	if direct != nil && user.TicketPath == "probe" {
+		registry.metrics.directProbes.Inc()
+		_ = transport.CloseWithError(0, "probe")
+		return
+	}
 
 	controlCtx, cancel := context.WithTimeout(transport.Context(), controlAcceptTimeout)
 	control, err := transport.AcceptStream(controlCtx)
@@ -155,7 +176,13 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		store:       store,
 	}
 	if direct != nil {
-		policy := machinePolicyForClipboardMode(user.ClipboardPolicy)
+		policy := machinePolicy{
+			Mode: ticketClipboardPolicy(user.ClipboardPolicy), MaxBytes: user.ClipboardMaxBytes,
+			CaptureContent: user.ClipboardCapture,
+		}
+		if policy.MaxBytes <= 0 {
+			policy.MaxBytes = defaultClipboardMaxBytes
+		}
 		session.clipboardPolicyOverride = &policy
 	}
 	session.audioEnabled.Store(true)

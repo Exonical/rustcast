@@ -99,10 +99,7 @@ func (s *Session) auditFields() (sessionID, userSub, userName, clientIP string) 
 	return
 }
 
-func (s *Session) auditClipboard(store *store, direction, mime string, data []byte, result string, capture bool) {
-	if store == nil {
-		return
-	}
+func (s *Session) auditClipboard(direction, mime string, data []byte, result string, capture bool) {
 	sessionID, userSub, userName, clientIP := s.auditFields()
 	machine := s.getMachine()
 	machineID, machineName := "", ""
@@ -114,13 +111,16 @@ func (s *Session) auditClipboard(store *store, direction, mime string, data []by
 	if machine != nil {
 		osUser = machine.loginOSUser()
 	}
-	if err := store.insertAudit(auditEvent{
+	ev := auditEvent{
 		MachineID: machineID, MachineName: machineName,
 		SessionID: sessionID, UserSub: userSub, UserName: userName,
 		ClientIP: clientIP, Direction: direction,
 		Mime: mime, Data: data, Result: result, OSUser: osUser,
-	}, capture); err != nil {
-		log.Printf("[clipboard] audit insert failed machine=%s: %v", machineID, err)
+	}
+	if machine != nil && machine.deps != nil && machine.deps.audit != nil {
+		machine.deps.audit.recordClipboard(ev, capture)
+	} else {
+		storeAuditSink{store: s.store}.recordClipboard(ev, capture)
 	}
 	if machine != nil && machine.metrics != nil && machine.metrics.owner != nil {
 		machine.metrics.owner.clipboardEvents.WithLabelValues(machineID, direction, result).Inc()
@@ -160,16 +160,16 @@ func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
 
 	var msg clipboardPayload
 	if err := json.Unmarshal(raw, &msg); err != nil || msg.Mime != clipWireMime || !utf8.ValidString(msg.Data) {
-		s.auditClipboard(store, clipDirClientToHost, "", nil, clipResultInvalid, policy.CaptureContent)
+		s.auditClipboard(clipDirClientToHost, "", nil, clipResultInvalid, policy.CaptureContent)
 		return status(clipResultInvalid)
 	}
 	data := []byte(msg.Data)
 	if int64(len(data)) > policy.MaxBytes {
-		s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultTooLarge, policy.CaptureContent)
+		s.auditClipboard(clipDirClientToHost, msg.Mime, data, clipResultTooLarge, policy.CaptureContent)
 		return status(clipResultTooLarge)
 	}
 	if !policy.allows(clipDirClientToHost) {
-		s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultBlocked, policy.CaptureContent)
+		s.auditClipboard(clipDirClientToHost, msg.Mime, data, clipResultBlocked, policy.CaptureContent)
 		return status(clipResultBlocked)
 	}
 	payload, err := json.Marshal(msg)
@@ -179,7 +179,7 @@ func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
 	if !machine.send(commandFrame(cmdClipboard, payload)) {
 		log.Printf("[control] upstream command channel full, dropped clipboard set")
 	}
-	s.auditClipboard(store, clipDirClientToHost, msg.Mime, data, clipResultOK, policy.CaptureContent)
+	s.auditClipboard(clipDirClientToHost, msg.Mime, data, clipResultOK, policy.CaptureContent)
 	return status(clipResultOK)
 }
 
@@ -206,9 +206,6 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 	// row per listed viewer (or a single viewer-less row when empty).
 	record := func(direction, result, mime string, payload []byte, viewers []auditEvent) {
 		u.metrics.owner.clipboardEvents.WithLabelValues(u.id, direction, result).Inc()
-		if store == nil {
-			return
-		}
 		if len(viewers) == 0 {
 			viewers = []auditEvent{{}}
 		}
@@ -217,8 +214,8 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 			ev.MachineID, ev.MachineName = u.id, machineName
 			ev.OSUser = osUser
 			ev.Direction, ev.Mime, ev.Data, ev.Result = direction, mime, payload, result
-			if err := store.insertAudit(ev, policy.CaptureContent); err != nil {
-				log.Printf("[clipboard] audit insert failed machine=%s: %v", u.id, err)
+			if u.deps.audit != nil {
+				u.deps.audit.recordClipboard(ev, policy.CaptureContent)
 			}
 		}
 	}
@@ -259,16 +256,14 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 			}
 		}
 		u.metrics.owner.clipboardEvents.WithLabelValues(u.id, clipDirHostToClient, result).Inc()
-		if store != nil {
-			ev := auditEvent{
-				MachineID: u.id, MachineName: machineName, OSUser: osUser,
-				SessionID: viewer.info.ID, UserSub: viewer.info.UserSub,
-				UserName: viewer.info.User, ClientIP: viewer.info.ClientIP,
-				Direction: clipDirHostToClient, Mime: msg.Mime, Data: payload, Result: result,
-			}
-			if err := store.insertAudit(ev, sessionPolicy.CaptureContent); err != nil {
-				log.Printf("[clipboard] audit insert failed machine=%s: %v", u.id, err)
-			}
+		ev := auditEvent{
+			MachineID: u.id, MachineName: machineName, OSUser: osUser,
+			SessionID: viewer.info.ID, UserSub: viewer.info.UserSub,
+			UserName: viewer.info.User, ClientIP: viewer.info.ClientIP,
+			Direction: clipDirHostToClient, Mime: msg.Mime, Data: payload, Result: result,
+		}
+		if u.deps.audit != nil {
+			u.deps.audit.recordClipboard(ev, sessionPolicy.CaptureContent)
 		}
 	}
 }
