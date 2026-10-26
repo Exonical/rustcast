@@ -85,8 +85,7 @@ fn update_login_status(shared: &Shared) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // reqwest is built with `rustls-no-provider`; install ring like flux-server.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    flux_crypto::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

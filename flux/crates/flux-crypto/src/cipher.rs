@@ -4,8 +4,7 @@
 //! Video/audio RTP packets may optionally be encrypted depending on the
 //! security configuration.
 
-use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use aws_lc_rs::aead::{self, Aad, LessSafeKey, UnboundKey};
 
 use flux_core::error::{FluxError, Result};
 
@@ -16,8 +15,8 @@ pub struct AesGcmCipher {
 }
 
 enum CipherInner {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+    Aes128(LessSafeKey),
+    Aes256(LessSafeKey),
 }
 
 /// Key size selection.
@@ -34,14 +33,14 @@ impl AesGcmCipher {
     pub fn new(key: &[u8]) -> Result<Self> {
         let inner = match key.len() {
             16 => {
-                let cipher = Aes128Gcm::new_from_slice(key)
-                    .map_err(|e| FluxError::Crypto(format!("AES-128 key error: {e}")))?;
-                CipherInner::Aes128(cipher)
+                let cipher = UnboundKey::new(&aead::AES_128_GCM, key)
+                    .map_err(|_| FluxError::Crypto("AES-128 key error".into()))?;
+                CipherInner::Aes128(LessSafeKey::new(cipher))
             }
             32 => {
-                let cipher = Aes256Gcm::new_from_slice(key)
-                    .map_err(|e| FluxError::Crypto(format!("AES-256 key error: {e}")))?;
-                CipherInner::Aes256(cipher)
+                let cipher = UnboundKey::new(&aead::AES_256_GCM, key)
+                    .map_err(|_| FluxError::Crypto("AES-256 key error".into()))?;
+                CipherInner::Aes256(LessSafeKey::new(cipher))
             }
             n => {
                 return Err(FluxError::Crypto(format!(
@@ -65,50 +64,46 @@ impl AesGcmCipher {
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&nonce_val.to_be_bytes());
-        let nonce = Nonce::from(nonce_bytes);
 
-        let ciphertext = match &self.inner {
-            CipherInner::Aes128(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| FluxError::Crypto(format!("AES-128 encrypt error: {e}")))?,
-            CipherInner::Aes256(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| FluxError::Crypto(format!("AES-256 encrypt error: {e}")))?,
-        };
+        let ciphertext = self.encrypt_with_nonce(&nonce_bytes, plaintext)?;
 
         Ok((nonce_bytes.to_vec(), ciphertext))
     }
 
     /// Encrypt with an explicit nonce (12 bytes).
     pub fn encrypt_with_nonce(&self, nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::from(*nonce);
+        let nonce = aead::Nonce::assume_unique_for_key(*nonce);
+        let mut ciphertext = plaintext.to_vec();
         match &self.inner {
             CipherInner::Aes128(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| FluxError::Crypto(format!("encrypt error: {e}"))),
+                .seal_in_place_append_tag(nonce, Aad::empty(), &mut ciphertext)
+                .map_err(|_| FluxError::Crypto("AES-128 encrypt error".into()))?,
             CipherInner::Aes256(cipher) => cipher
-                .encrypt(&nonce, plaintext)
-                .map_err(|e| FluxError::Crypto(format!("encrypt error: {e}"))),
-        }
+                .seal_in_place_append_tag(nonce, Aad::empty(), &mut ciphertext)
+                .map_err(|_| FluxError::Crypto("AES-256 encrypt error".into()))?,
+        };
+        Ok(ciphertext)
     }
 
     /// Decrypt ciphertext with the given nonce (12 bytes).
     pub fn decrypt(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = Nonce::from(*nonce);
-        match &self.inner {
+        let nonce = aead::Nonce::assume_unique_for_key(*nonce);
+        let mut in_out = ciphertext.to_vec();
+        let plaintext = match &self.inner {
             CipherInner::Aes128(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| FluxError::Crypto(format!("decrypt error: {e}"))),
+                .open_in_place(nonce, Aad::empty(), &mut in_out)
+                .map_err(|_| FluxError::Crypto("AES-128 decrypt error".into()))?,
             CipherInner::Aes256(cipher) => cipher
-                .decrypt(&nonce, ciphertext)
-                .map_err(|e| FluxError::Crypto(format!("decrypt error: {e}"))),
-        }
+                .open_in_place(nonce, Aad::empty(), &mut in_out)
+                .map_err(|_| FluxError::Crypto("AES-256 decrypt error".into()))?,
+        };
+        Ok(plaintext.to_vec())
     }
 }
 
 /// Generate a cryptographically secure random key.
 pub fn generate_key(size: KeySize) -> Vec<u8> {
-    use ring::rand::{SecureRandom, SystemRandom};
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     let rng = SystemRandom::new();
     let len = match size {
         KeySize::Aes128 => 16,
