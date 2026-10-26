@@ -131,13 +131,13 @@ func (r *machineRegistry) seedStatic(id, name, endpoint string) {
 
 func (r *machineRegistry) upsert(input machineRegistration, static bool) *machineRecord {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
 	m := r.machines[input.ID]
 	if m == nil {
 		m = &machineRecord{}
 		r.machines[input.ID] = m
 	}
+	dropHostLink := m.HostDialsOut && !input.HostDialsOut
 	upstreamStatus := m.UpstreamStatus
 	if upstreamStatus == "" {
 		upstreamStatus = "idle"
@@ -160,6 +160,10 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 	if m.upstream != nil && input.TargetBitrate != 0 {
 		m.upstream.abr.setSenderTarget(input.TargetBitrate)
 	}
+	r.mu.Unlock()
+	if dropHostLink && r.hostLinks != nil {
+		r.hostLinks.drop(input.ID)
+	}
 	return m
 }
 
@@ -170,8 +174,9 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 		r.mu.Unlock()
 		return nil, errMachineNotFound
 	}
+	expired := !m.static && time.Since(m.LastSeen) > machineExpiry
 	var stale *machineUpstream
-	if !m.static && time.Since(m.LastSeen) > machineExpiry {
+	if expired {
 		m.Status = "offline"
 		stale = m.upstream
 		if stale != nil {
@@ -183,6 +188,9 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 		if stale != nil {
 			stale.stop()
 		}
+		if expired && r.hostLinks != nil {
+			r.hostLinks.drop(id)
+		}
 		return nil, errMachineOffline
 	}
 	r.mu.Unlock()
@@ -193,8 +201,10 @@ func (r *machineRegistry) list() []machineInfo {
 	r.mu.Lock()
 	result := make([]machineInfo, 0, len(r.machines))
 	var stale []*machineUpstream
+	var expiredIDs []string
 	for _, m := range r.machines {
 		if !m.static && time.Since(m.LastSeen) > machineExpiry {
+			expiredIDs = append(expiredIDs, m.ID)
 			m.Status = "offline"
 			if m.upstream != nil {
 				stale = append(stale, m.upstream)
@@ -226,6 +236,11 @@ func (r *machineRegistry) list() []machineInfo {
 	for _, upstream := range stale {
 		upstream.stop()
 	}
+	if r.hostLinks != nil {
+		for _, id := range expiredIDs {
+			r.hostLinks.drop(id)
+		}
+	}
 	return result
 }
 
@@ -252,6 +267,9 @@ func (r *machineRegistry) deregister(id string) bool {
 	upstream := m.upstream
 	delete(r.machines, id)
 	r.mu.Unlock()
+	if r.hostLinks != nil {
+		r.hostLinks.drop(id)
+	}
 	if upstream != nil {
 		upstream.stop()
 	} else {

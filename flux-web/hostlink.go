@@ -63,6 +63,22 @@ func (h *hostLinkHub) park(id string, conn *quic.Conn) {
 	}()
 }
 
+func (h *hostLinkHub) drop(id string) {
+	h.mu.Lock()
+	conn := h.links[id]
+	if conn != nil {
+		delete(h.links, id)
+		if h.parked != nil {
+			h.parked.Dec()
+		}
+		h.signalLocked(id)
+	}
+	h.mu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, "machine removed")
+	}
+}
+
 func (h *hostLinkHub) take(id string, stop <-chan struct{}) (*quic.Conn, bool) {
 	for {
 		select {

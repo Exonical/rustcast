@@ -103,6 +103,52 @@ func waitForApplicationError(t *testing.T, conn *quic.Conn, want quic.Applicatio
 	}
 }
 
+func parkRegisteredHostLinkForTest(t *testing.T, registry *machineRegistry, machineID string) *quic.Conn {
+	t.Helper()
+	listener := startHostLinkTestServer(t, registry, "secret")
+	client, err := quic.DialAddr(context.Background(), listener.Addr().String(), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"flux-frames"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.CloseWithError(0, "test cleanup") })
+
+	stream, err := sendHostLinkHello(t, client, machineID, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ack [1]byte
+	if _, err := io.ReadFull(stream, ack[:]); err != nil {
+		t.Fatal(err)
+	}
+	if ack[0] != 0 {
+		t.Fatalf("host-link acknowledgement = 0x%02x, want 0x00", ack[0])
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		registry.hostLinks.mu.Lock()
+		parked := registry.hostLinks.links[machineID] != nil
+		registry.hostLinks.mu.Unlock()
+		if parked {
+			return client
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("valid host link was not parked")
+	return nil
+}
+
+func assertHostLinkGauge(t *testing.T, registry *machineRegistry, want string) {
+	t.Helper()
+	if body := scrapeMetrics(registry.metrics); !strings.Contains(body, "flux_relay_host_links "+want) {
+		t.Fatalf("host-link gauge does not contain %s: %s", want, body)
+	}
+}
+
 func TestHostLinkHubParkAndTake(t *testing.T) {
 	listener := newHostLinkTestListener(t)
 	client, server := dialHostLinkTestConn(t, listener)
@@ -356,6 +402,57 @@ func TestAcquireUsesHostDialOutLinkForCommandsAndFrames(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("relay did not dispatch the host video frame")
+}
+
+func TestMachineRegistryDeregisterDropsParkedHostLink(t *testing.T) {
+	registry := newMachineRegistry()
+	registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+	client := parkRegisteredHostLinkForTest(t, registry, "machine-1")
+	assertHostLinkGauge(t, registry, "1")
+
+	if !registry.deregister("machine-1") {
+		t.Fatal("machine was not deregistered")
+	}
+	waitForApplicationError(t, client, 0)
+	assertHostLinkGauge(t, registry, "0")
+}
+
+func TestMachineRegistryExpiryDropsParkedHostLink(t *testing.T) {
+	for _, expireViaList := range []bool{false, true} {
+		name := "get"
+		if expireViaList {
+			name = "list"
+		}
+		t.Run(name, func(t *testing.T) {
+			registry := newMachineRegistry()
+			registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+			client := parkRegisteredHostLinkForTest(t, registry, "machine-1")
+			registry.machines["machine-1"].LastSeen = time.Now().Add(-machineExpiry - time.Second)
+
+			if expireViaList {
+				registry.list()
+			} else if _, err := registry.get("machine-1"); err != errMachineOffline {
+				t.Fatalf("get expired machine error = %v, want %v", err, errMachineOffline)
+			}
+			waitForApplicationError(t, client, 0)
+			assertHostLinkGauge(t, registry, "0")
+		})
+	}
+}
+
+func TestMachineRegistryOptOutDropsParkedHostLink(t *testing.T) {
+	registry := newMachineRegistry()
+	registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+	client := parkRegisteredHostLinkForTest(t, registry, "machine-1")
+	assertHostLinkGauge(t, registry, "1")
+
+	registration := testRegistration("machine-1")
+	registry.upsert(registration, false)
+	if registry.machines["machine-1"].HostDialsOut {
+		t.Fatal("re-registration did not clear host_dials_out")
+	}
+	waitForApplicationError(t, client, 0)
+	assertHostLinkGauge(t, registry, "0")
 }
 
 func TestEncodeHostLinkHelloUsesLengthPrefixedJSON(t *testing.T) {
