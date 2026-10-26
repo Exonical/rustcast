@@ -44,6 +44,7 @@ func TestRelayMetricsExposeSessionAndFrameMetrics(t *testing.T) {
 
 	body := scrapeMetrics(metrics)
 	for _, name := range []string{
+		"flux_relay_host_links",
 		"flux_relay_viewers",
 		"flux_relay_upstream_connected",
 		"flux_relay_rtt_seconds",

@@ -58,6 +58,7 @@ type machineUpstream struct {
 	loginSpoken    bool
 	supportsLogin  bool
 	quicCertSHA256 string
+	hostLinks      *hostLinkHub
 }
 
 const (
@@ -547,6 +548,26 @@ func (u *machineUpstream) sendResolutionStatus(data []byte) {
 }
 
 func (u *machineUpstream) connectFrameServer() {
+	if u.hostLinks != nil {
+		for {
+			select {
+			case <-u.stopChan:
+				return
+			default:
+			}
+			u.status("waiting for host")
+			conn, ok := u.hostLinks.take(u.id, u.stopChan)
+			if !ok {
+				return
+			}
+			if err := u.serveQUIC(conn); err != nil {
+				log.Printf("[frame:%s] host link ended: %v", u.id, err)
+			}
+			if !u.wait(time.Second) {
+				return
+			}
+		}
+	}
 	for {
 		select {
 		case <-u.stopChan:
@@ -772,6 +793,10 @@ func (u *machineUpstream) connectQUIC() error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	return u.serveQUIC(conn)
+}
+
+func (u *machineUpstream) serveQUIC(conn *quic.Conn) error {
 	log.Printf("[frame:%s] connected to quic %s", u.id, u.addr)
 	u.status("connected")
 	ctx, connCancel := context.WithCancel(context.Background())

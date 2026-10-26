@@ -37,6 +37,7 @@ type machineInfo struct {
 	LoggedInUser    string    `json:"logged_in_user"`
 	LoginState      string    `json:"login_state"`
 	QuicCertSHA256  string    `json:"quic_cert_sha256,omitempty"`
+	HostDialsOut    bool      `json:"host_dials_out,omitempty"`
 	SupportsLogin   bool      `json:"supports_login"`
 	LastSeen        time.Time `json:"last_seen"`
 	Status          string    `json:"status"`
@@ -61,6 +62,7 @@ type machineRegistration struct {
 	LoginState     string `json:"login_state"`
 	LoggedInUser   string `json:"logged_in_user"`
 	QuicCertSHA256 string `json:"quic_cert_sha256"`
+	HostDialsOut   bool   `json:"host_dials_out"`
 }
 
 type machineRecord struct {
@@ -78,10 +80,11 @@ type relayDeps struct {
 }
 
 type machineRegistry struct {
-	mu       sync.Mutex
-	machines map[string]*machineRecord
-	metrics  *relayMetrics
-	deps     *relayDeps
+	mu        sync.Mutex
+	machines  map[string]*machineRecord
+	metrics   *relayMetrics
+	deps      *relayDeps
+	hostLinks *hostLinkHub
 }
 
 // attachDeps wires clipboard persistence/fan-out dependencies; called once
@@ -93,7 +96,12 @@ func (r *machineRegistry) attachDeps(d *relayDeps) {
 }
 
 func newMachineRegistry() *machineRegistry {
-	return &machineRegistry{machines: make(map[string]*machineRecord), metrics: newRelayMetrics()}
+	metrics := newRelayMetrics()
+	return &machineRegistry{
+		machines:  make(map[string]*machineRecord),
+		metrics:   metrics,
+		hostLinks: newHostLinkHub(metrics.hostLinks),
+	}
 }
 
 func (r *machineRegistry) metricMachineID(id string) string {
@@ -143,6 +151,7 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		UpstreamStatus: upstreamStatus,
 		SupportsLogin:  input.SupportsLogin, LoginState: input.LoginState,
 		LoggedInUser: input.LoggedInUser, QuicCertSHA256: input.QuicCertSHA256,
+		HostDialsOut: input.HostDialsOut,
 	}
 	m.static = static
 	if m.upstream != nil {
@@ -268,6 +277,9 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		}, machineMetrics)
 		m.upstream.supportsLogin = m.SupportsLogin
 		m.upstream.quicCertSHA256 = m.QuicCertSHA256
+		if m.HostDialsOut {
+			m.upstream.hostLinks = r.hostLinks
+		}
 		if m.TargetBitrate != 0 {
 			m.upstream.abr.setSenderTarget(m.TargetBitrate)
 		}

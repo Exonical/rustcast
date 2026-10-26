@@ -115,6 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.relay.base_url = env("FLUX_RELAY_URL");
     config.relay.advertise_host = env("FLUX_ADVERTISE_HOST").or(Some("127.0.0.1".into()));
     config.relay.token = env("FLUX_RELAY_TOKEN");
+    let relay_quic_addr = env("FLUX_RELAY_QUIC_ADDR");
+    config.relay.host_dials_out = relay_quic_addr.is_some();
     if let Some(size) = env("FLUX_DISPLAY_SIZE") {
         if let Some((w, h)) = size.split_once('x') {
             config.video.max_width = w.parse().unwrap_or(config.video.max_width);
@@ -138,6 +140,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_port
     );
     let _registration = registration::start(&config, &platform, advertised, status.clone(), &id_path);
+    let relay_dial_out = match (relay_quic_addr, config.relay.token.clone()) {
+        (Some(addr), Some(token)) => {
+            let machine_id = registration::load_or_create_id(&id_path)?;
+            Some((addr, machine_id, token))
+        }
+        (Some(_), None) => {
+            tracing::error!("FLUX_RELAY_QUIC_ADDR is set but FLUX_RELAY_TOKEN is unset; host dial-out disabled");
+            None
+        }
+        (None, _) => None,
+    };
 
     let listener = TcpListener::bind(cfg.frame_addr).await?;
     tracing::info!("flux-hostd listening on tcp://{}", cfg.frame_addr);
@@ -165,6 +178,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         status,
         relay_token: config.relay.token.clone(),
     });
+    if let Some((addr, machine_id, token)) = relay_dial_out {
+        tokio::spawn(quic::dial_out(addr, machine_id, token, shared.clone()));
+    }
 
     // SIGTERM → log out the OS session (pam_close_session + stop target).
     let shutdown = {

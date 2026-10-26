@@ -49,6 +49,7 @@ var (
 type relayMetrics struct {
 	registry *prometheus.Registry
 
+	hostLinks            prometheus.Gauge
 	viewers              *prometheus.GaugeVec
 	upstreamConnected    *prometheus.GaugeVec
 	rtt                  *prometheus.GaugeVec
@@ -136,6 +137,7 @@ type clientStats struct {
 func newRelayMetrics() *relayMetrics {
 	m := &relayMetrics{
 		registry:             prometheus.NewRegistry(),
+		hostLinks:            prometheus.NewGauge(prometheus.GaugeOpts{Name: "flux_relay_host_links", Help: "Number of parked host-initiated QUIC links."}),
 		viewers:              prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_relay_viewers", Help: "Number of viewers attached to the machine upstream."}, []string{"machine"}),
 		upstreamConnected:    prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_relay_upstream_connected", Help: "Whether the relay is connected to the host upstream."}, []string{"machine"}),
 		rtt:                  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "flux_relay_rtt_seconds", Help: "Upstream WebTransport round-trip time."}, []string{"machine", "kind"}),
@@ -169,7 +171,7 @@ func newRelayMetrics() *relayMetrics {
 	m.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		m.viewers, m.upstreamConnected, m.rtt, m.packetLoss, m.queueDelay, m.bweTarget, m.encoderTarget,
+		m.hostLinks, m.viewers, m.upstreamConnected, m.rtt, m.packetLoss, m.queueDelay, m.bweTarget, m.encoderTarget,
 		m.upstreamFrames, m.upstreamBytes, m.upstreamAudioPackets, m.upstreamAudioBytes,
 		m.upstreamReconnects, m.framesSent, m.bytesSent, m.framesReset,
 		m.framesDropped, m.idrRequests, m.sessionsStarted, m.sessionRejections, m.clipboardEvents, m.frameSend, m.queueWait,
