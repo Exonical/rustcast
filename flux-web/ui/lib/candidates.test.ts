@@ -5,9 +5,28 @@ import { connectFirst, orderCandidates, type Candidate } from "./candidates.js";
 const direct: Candidate = { path: "direct", url: "https://host.example.test/wt", ticket: "d" };
 const relay: Candidate = { path: "relay", host: "relay.example.test", port: 8443, ticket: "r" };
 
-test("candidate ordering preserves direct-first discovery and prefers recent relay", () => {
-  assert.deepEqual(orderCandidates({ candidates: [direct, relay] }), [direct, relay]);
-  assert.deepEqual(orderCandidates({ candidates: [direct, relay] }, "relay"), [relay, direct]);
+test("candidate ordering preserves direct-first discovery and prefers relay after a recent direct failure", () => {
+  const now = 10_000_000;
+  assert.deepEqual(orderCandidates({ candidates: [direct, relay] }, undefined, now), [direct, relay]);
+  assert.deepEqual(orderCandidates({ candidates: [direct, relay] }, now - 1000, now), [relay, direct]);
+  assert.deepEqual(orderCandidates({ candidates: [direct, relay] }, now - 5 * 60 * 1000, now), [direct, relay]);
+});
+
+test("a relay success does not renew the direct-failure preference", async () => {
+  const now = 20_000_000;
+  const savedAt = now - 1000;
+  let directFailedAt = savedAt;
+  await connectFirst(
+    orderCandidates({ candidates: [direct, relay] }, directFailedAt, now),
+    () => ({ transport: { close: () => {} }, ready: Promise.resolve() }),
+    { direct: 5, relay: 50 },
+    (candidate) => {
+      if (candidate.path === "direct") directFailedAt = now;
+    },
+  );
+  assert.equal(directFailedAt, savedAt);
+  assert.equal(orderCandidates({ candidates: [direct, relay] }, directFailedAt, now + 4 * 60 * 1000)[0].path, "relay");
+  assert.equal(orderCandidates({ candidates: [direct, relay] }, directFailedAt, now + 6 * 60 * 1000)[0].path, "direct");
 });
 
 test("old discovery shape becomes one relay candidate", () => {

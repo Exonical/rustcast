@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type directTicketPayload struct {
 	Email     string `json:"email"`
 	Name      string `json:"name"`
 	Admin     bool   `json:"admin"`
+	Clipboard string `json:"clipboard,omitempty"`
 	Path      string `json:"path"`
 	Expires   int64  `json:"exp"`
 	Nonce     string `json:"nonce"`
@@ -37,6 +39,8 @@ type directTicketPayload struct {
 type ticketSigner struct {
 	key *mldsa.PrivateKey
 }
+
+var errInvalidTicketSignature = errors.New("invalid ticket signature")
 
 func newTicketSigner(seed []byte) (*ticketSigner, error) {
 	if len(seed) != ticketSeedSize {
@@ -68,29 +72,56 @@ func loadTicketSigner(dataDir string) (*ticketSigner, error) {
 	if _, err := rand.Read(seed); err != nil {
 		return nil, fmt.Errorf("generate ticket signing seed: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		seed, err = os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read concurrently created ticket signing seed: %w", err)
-		}
-		return newTicketSigner(seed)
-	}
+	file, err := os.CreateTemp(dataDir, ".ticket-mldsa87-seed-*")
 	if err != nil {
-		return nil, fmt.Errorf("create ticket signing seed: %w", err)
+		return nil, fmt.Errorf("create temporary ticket signing seed: %w", err)
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("protect temporary ticket signing seed: %w", err)
 	}
 	if _, err := file.Write(seed); err != nil {
 		_ = file.Close()
-		_ = os.Remove(path)
 		return nil, fmt.Errorf("write ticket signing seed: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("sync ticket signing seed: %w", err)
 	}
 	if err := file.Close(); err != nil {
 		return nil, fmt.Errorf("close ticket signing seed: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return nil, fmt.Errorf("protect ticket signing seed: %w", err)
+	if err := os.Link(tempPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			seed, readErr := readTicketSeed(path)
+			if readErr != nil {
+				return nil, fmt.Errorf("read concurrently created ticket signing seed: %w", readErr)
+			}
+			return newTicketSigner(seed)
+		}
+		return nil, fmt.Errorf("publish ticket signing seed: %w", err)
 	}
 	return newTicketSigner(seed)
+}
+
+func readTicketSeed(path string) ([]byte, error) {
+	var seed []byte
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		seed, err = os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if len(seed) >= ticketSeedSize {
+			return seed, nil
+		}
+		if attempt < 4 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil, fmt.Errorf("ticket signing seed has length %d, want at least %d", len(seed), ticketSeedSize)
 }
 
 func (s *ticketSigner) publicKey() []byte {
@@ -100,7 +131,7 @@ func (s *ticketSigner) publicKey() []byte {
 	return append([]byte(nil), s.key.PublicKey().Bytes()...)
 }
 
-func (s *ticketSigner) sign(user *identity, machineID string) (string, error) {
+func (s *ticketSigner) sign(user *identity, machineID, clipboardPolicy string) (string, error) {
 	if s == nil || s.key == nil || user == nil || machineID == "" {
 		return "", errors.New("missing ticket signer, identity, or machine ID")
 	}
@@ -116,6 +147,7 @@ func (s *ticketSigner) sign(user *identity, machineID string) (string, error) {
 		Email:     user.Email,
 		Name:      user.Name,
 		Admin:     user.Admin,
+		Clipboard: clipboardPolicy,
 		Path:      "direct",
 		Expires:   time.Now().Add(wtTicketTTL).Unix(),
 		Nonce:     base64.RawURLEncoding.EncodeToString(nonce),
@@ -132,7 +164,7 @@ func (s *ticketSigner) sign(user *identity, machineID string) (string, error) {
 }
 
 type ticketVerifier struct {
-	key    *mldsa.PublicKey
+	key    atomic.Pointer[mldsa.PublicKey]
 	mu     sync.Mutex
 	nonces map[string]time.Time
 }
@@ -142,11 +174,26 @@ func newTicketVerifier(publicKey []byte) (*ticketVerifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load ML-DSA-87 public key: %w", err)
 	}
-	return &ticketVerifier{key: key, nonces: make(map[string]time.Time)}, nil
+	verifier := &ticketVerifier{nonces: make(map[string]time.Time)}
+	verifier.key.Store(key)
+	return verifier, nil
+}
+
+func (v *ticketVerifier) replacePublicKey(publicKey []byte) error {
+	key, err := mldsa.NewPublicKey(mldsa.MLDSA87(), publicKey)
+	if err != nil {
+		return fmt.Errorf("load ML-DSA-87 public key: %w", err)
+	}
+	v.key.Store(key)
+	return nil
 }
 
 func (v *ticketVerifier) verify(ticket, machineID string) (*identity, error) {
-	if v == nil || v.key == nil {
+	if v == nil {
+		return nil, errors.New("ticket verifier is unavailable")
+	}
+	key := v.key.Load()
+	if key == nil {
 		return nil, errors.New("ticket verifier is unavailable")
 	}
 	parts := strings.Split(ticket, ".")
@@ -161,8 +208,8 @@ func (v *ticketVerifier) verify(ticket, machineID string) (*identity, error) {
 	if err != nil {
 		return nil, errors.New("malformed ticket signature")
 	}
-	if err := mldsa.Verify(v.key, payloadBytes, signature, &mldsa.Options{Context: ticketSigningContext}); err != nil {
-		return nil, errors.New("invalid ticket signature")
+	if err := mldsa.Verify(key, payloadBytes, signature, &mldsa.Options{Context: ticketSigningContext}); err != nil {
+		return nil, errInvalidTicketSignature
 	}
 	var payload directTicketPayload
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
@@ -202,12 +249,23 @@ func (v *ticketVerifier) verify(ticket, machineID string) (*identity, error) {
 	}
 	v.nonces[nonceKey] = expires
 	v.mu.Unlock()
+	clipboardPolicy := ticketClipboardPolicy(payload.Clipboard)
 	return &identity{
-		Sub:      payload.Sub,
-		Username: payload.Username,
-		Email:    payload.Email,
-		Name:     payload.Name,
-		Admin:    payload.Admin,
-		Expires:  expires,
+		Sub:             payload.Sub,
+		Username:        payload.Username,
+		Email:           payload.Email,
+		Name:            payload.Name,
+		Admin:           payload.Admin,
+		ClipboardPolicy: clipboardPolicy,
+		Expires:         expires,
 	}, nil
+}
+
+func ticketClipboardPolicy(mode string) string {
+	switch mode {
+	case clipModeBoth, clipModeOff, clipModeHostToClient, clipModeClientToHost:
+		return mode
+	default:
+		return clipModeOff
+	}
 }

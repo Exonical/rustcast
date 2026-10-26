@@ -118,6 +118,46 @@ func TestRelayCertificatePropertiesAndHash(t *testing.T) {
 	}
 }
 
+func TestRelayCertificateHashOverlapAndRotation(t *testing.T) {
+	manager, err := newRelayCertificateManager("", "", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := manager.certificate.Load()
+	manager.mu.Lock()
+	next := manager.next
+	manager.nextRotation = time.Now().Add(selfSignedCertificateOverlap / 2)
+	manager.mu.Unlock()
+	currentHash := sha256.Sum256(current.Certificate[0])
+	nextHash := sha256.Sum256(next.Certificate[0])
+	hashes := manager.certificateHashes()
+	if len(hashes) != 2 ||
+		hashes[0] != base64.StdEncoding.EncodeToString(currentHash[:]) ||
+		hashes[1] != base64.StdEncoding.EncodeToString(nextHash[:]) {
+		t.Fatalf("overlap hashes = %v, want current then pre-generated next", hashes)
+	}
+
+	changes := 0
+	manager.setOnHashesChanged(func() { changes++ })
+	manager.notifyHashesChanged()
+	if err := manager.rotate(); err != nil {
+		t.Fatalf("rotate certificate: %v", err)
+	}
+	served, err := manager.getCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servedHash := sha256.Sum256(served.Certificate[0])
+	hashes = manager.certificateHashes()
+	if len(hashes) != 1 || hashes[0] != base64.StdEncoding.EncodeToString(servedHash[:]) ||
+		servedHash != nextHash {
+		t.Fatalf("post-rotation hashes = %v, served certificate hash = %x", hashes, servedHash)
+	}
+	if changes != 2 {
+		t.Fatalf("hash-change callbacks = %d, want 2", changes)
+	}
+}
+
 func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	registry := newMachineRegistry()
 	sessions := newSessionRegistry()

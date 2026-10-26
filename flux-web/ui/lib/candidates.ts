@@ -19,7 +19,9 @@ export type CandidateTransport = {
   close(info?: { closeCode?: number; reason?: string }): void;
 };
 
-export function orderCandidates(discovery: DiscoveryCandidates, lastPath?: string): Candidate[] {
+const directFailurePreferenceMs = 5 * 60 * 1000;
+
+export function orderCandidates(discovery: DiscoveryCandidates, directFailedAt?: number, now = Date.now()): Candidate[] {
   const candidates = discovery.candidates?.length
     ? [...discovery.candidates]
     : [{
@@ -29,7 +31,8 @@ export function orderCandidates(discovery: DiscoveryCandidates, lastPath?: strin
         certHashes: discovery.certHashes,
         ticket: discovery.ticket,
       }];
-  if (lastPath === "relay") {
+  if (directFailedAt !== undefined && now >= directFailedAt &&
+      now - directFailedAt < directFailurePreferenceMs) {
     const relayIndex = candidates.findIndex((candidate) => candidate.path === "relay");
     if (relayIndex > 0) candidates.unshift(...candidates.splice(relayIndex, 1));
   }
@@ -40,6 +43,7 @@ export async function connectFirst<T extends CandidateTransport>(
   candidates: Candidate[],
   open: (candidate: Candidate) => { transport: T; ready: Promise<void> },
   timeoutMs: Partial<Record<Candidate["path"], number>> = { direct: 1500, relay: 10000 },
+  onFailure?: (candidate: Candidate, error: unknown) => void,
 ): Promise<{ candidate: Candidate; transport: T }> {
   let lastError: unknown;
   for (const candidate of candidates) {
@@ -58,6 +62,7 @@ export async function connectFirst<T extends CandidateTransport>(
     } catch (error) {
       lastError = error;
       opened?.transport.close({ closeCode: 0, reason: "candidate failed" });
+      onFailure?.(candidate, error);
     } finally {
       if (timer) clearTimeout(timer);
     }

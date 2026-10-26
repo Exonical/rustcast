@@ -10,10 +10,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"errors"
 	"log"
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -21,12 +23,17 @@ import (
 const (
 	selfSignedCertificateLifetime = 13 * 24 * time.Hour
 	selfSignedCertificateRotation = 6 * 24 * time.Hour
+	selfSignedCertificateOverlap  = 10 * time.Minute
 )
 
 type relayCertificateManager struct {
-	configured  bool
-	publicHost  string
-	certificate atomic.Pointer[tls.Certificate]
+	configured      bool
+	publicHost      string
+	certificate     atomic.Pointer[tls.Certificate]
+	mu              sync.Mutex
+	next            *tls.Certificate
+	nextRotation    time.Time
+	onHashesChanged func()
 }
 
 func newRelayCertificateManager(certFile, keyFile, publicHost string) (*relayCertificateManager, error) {
@@ -52,6 +59,12 @@ func newRelayCertificateManager(certFile, keyFile, publicHost string) (*relayCer
 		if err != nil {
 			return nil, err
 		}
+		next, nextErr := generateRelayCertificate(time.Now(), manager.publicHost)
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		manager.next = &next
+		manager.nextRotation = time.Now().Add(selfSignedCertificateRotation)
 	}
 	manager.certificate.Store(&certificate)
 	return manager, nil
@@ -104,12 +117,21 @@ func (m *relayCertificateManager) certificateHashes() []string {
 	if m.configured {
 		return []string{}
 	}
+	m.mu.Lock()
 	certificate := m.certificate.Load()
+	next := m.next
+	overlap := next != nil && time.Until(m.nextRotation) <= selfSignedCertificateOverlap
+	m.mu.Unlock()
 	if certificate == nil || len(certificate.Certificate) == 0 {
 		return []string{}
 	}
 	hash := sha256.Sum256(certificate.Certificate[0])
-	return []string{base64.StdEncoding.EncodeToString(hash[:])}
+	hashes := []string{base64.StdEncoding.EncodeToString(hash[:])}
+	if overlap && len(next.Certificate) != 0 {
+		nextHash := sha256.Sum256(next.Certificate[0])
+		hashes = append(hashes, base64.StdEncoding.EncodeToString(nextHash[:]))
+	}
+	return hashes
 }
 
 func (m *relayCertificateManager) tlsConfig() *tls.Config {
@@ -138,28 +160,91 @@ func (m *relayCertificateManager) rotate() error {
 	if m.configured {
 		return nil
 	}
-	certificate, err := generateRelayCertificate(time.Now(), m.publicHost)
+	following, err := generateRelayCertificate(time.Now(), m.publicHost)
 	if err != nil {
 		return err
 	}
-	m.certificate.Store(&certificate)
+	m.mu.Lock()
+	next := m.next
+	if next == nil {
+		m.mu.Unlock()
+		return errors.New("next self-signed certificate is unavailable")
+	}
+	m.certificate.Store(next)
+	m.next = &following
+	m.nextRotation = time.Now().Add(selfSignedCertificateRotation)
+	onHashesChanged := m.onHashesChanged
+	m.mu.Unlock()
+	if onHashesChanged != nil {
+		onHashesChanged()
+	}
 	return nil
+}
+
+func (m *relayCertificateManager) setOnHashesChanged(callback func()) {
+	m.mu.Lock()
+	m.onHashesChanged = callback
+	m.mu.Unlock()
+}
+
+func (m *relayCertificateManager) notifyHashesChanged() {
+	m.mu.Lock()
+	callback := m.onHashesChanged
+	m.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 func (m *relayCertificateManager) runRotation(ctx context.Context) {
 	if m.configured {
 		return
 	}
-	ticker := time.NewTicker(selfSignedCertificateRotation)
-	defer ticker.Stop()
 	for {
+		m.mu.Lock()
+		rotationAt := m.nextRotation
+		m.mu.Unlock()
+		overlapStart := rotationAt.Add(-selfSignedCertificateOverlap)
+		if !waitUntil(ctx, overlapStart) {
+			return
+		}
+		m.notifyHashesChanged()
+		if !waitUntil(ctx, rotationAt) {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		default:
+		}
+		for {
 			if err := m.rotate(); err != nil {
 				log.Printf("[tls] certificate rotation failed: %v", err)
+				timer := time.NewTimer(time.Minute)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
 			}
+			break
 		}
+	}
+}
+
+func waitUntil(ctx context.Context, at time.Time) bool {
+	delay := time.Until(at)
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }

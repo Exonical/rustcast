@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/webtransport-go"
@@ -20,6 +22,162 @@ import (
 
 type directStatus struct {
 	CertHashes []string `json:"cert_hashes"`
+}
+
+const (
+	directTicketKeyRefreshInterval = 5 * time.Minute
+	directTicketKeyFailureCooldown = 30 * time.Second
+)
+
+var errTicketKeyURLDisallowed = errors.New("ticket-key relay URL is not allowed")
+
+type directTicketKeyRefresher struct {
+	verifier  *ticketVerifier
+	pinned    bool
+	cachePath string
+	fetch     func(context.Context) ([]byte, error)
+	mu        sync.Mutex
+	lastAsked atomic.Int64
+}
+
+func newDirectTicketKeyRefresher(verifier *ticketVerifier) *directTicketKeyRefresher {
+	cachePath := filepath.Join(storeDirFromEnv(), "ticket-key.pub")
+	relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("FLUX_RELAY_URL")), "/")
+	token := strings.TrimSpace(os.Getenv("FLUX_RELAY_TOKEN"))
+	return &directTicketKeyRefresher{
+		verifier:  verifier,
+		pinned:    strings.TrimSpace(os.Getenv("FLUX_TICKET_PUBLIC_KEY")) != "",
+		cachePath: cachePath,
+		fetch: func(ctx context.Context) ([]byte, error) {
+			if !ticketKeyURLAllowed(relayURL) {
+				return nil, errTicketKeyURLDisallowed
+			}
+			if token == "" {
+				return nil, errors.New("FLUX_RELAY_TOKEN is required to fetch the ticket key")
+			}
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, relayURL+"/api/relay/ticket-key", nil)
+			if err != nil {
+				return nil, err
+			}
+			request.Header.Set("Authorization", "Bearer "+token)
+			response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+			if err != nil {
+				return nil, err
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("ticket-key endpoint returned %s", response.Status)
+			}
+			var body struct {
+				Algorithm string `json:"alg"`
+				PublicKey string `json:"public_key"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			if body.Algorithm != "ML-DSA-87" {
+				return nil, fmt.Errorf("unsupported ticket-key algorithm %q", body.Algorithm)
+			}
+			publicKey, err := base64.StdEncoding.DecodeString(body.PublicKey)
+			if err != nil {
+				return nil, fmt.Errorf("decode ticket public key: %w", err)
+			}
+			return publicKey, nil
+		},
+	}
+}
+
+func (r *directTicketKeyRefresher) refresh(ctx context.Context) error {
+	if r == nil || r.pinned {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	publicKey, err := r.fetch(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := newTicketVerifier(publicKey); err != nil {
+		return err
+	}
+	if err := writeTicketKeyCache(r.cachePath, publicKey); err != nil {
+		return err
+	}
+	if err := r.verifier.replacePublicKey(publicKey); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeTicketKeyCache(path string, publicKey []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create ticket key cache directory: %w", err)
+	}
+	file, err := os.CreateTemp(dir, ".ticket-key-*")
+	if err != nil {
+		return fmt.Errorf("create temporary ticket key cache: %w", err)
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if err := file.Chmod(0o644); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("set ticket key cache permissions: %w", err)
+	}
+	if _, err := file.Write([]byte(base64.StdEncoding.EncodeToString(publicKey))); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write ticket key cache: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync ticket key cache: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close ticket key cache: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace ticket key cache: %w", err)
+	}
+	return nil
+}
+
+func (r *directTicketKeyRefresher) requestAfterVerificationFailure(ctx context.Context) {
+	if r == nil || r.pinned {
+		return
+	}
+	now := time.Now().UnixNano()
+	for {
+		last := r.lastAsked.Load()
+		if last != 0 && time.Duration(now-last) < directTicketKeyFailureCooldown {
+			return
+		}
+		if r.lastAsked.CompareAndSwap(last, now) {
+			break
+		}
+	}
+	go func() {
+		if err := r.refresh(ctx); err != nil && !errors.Is(err, errTicketKeyURLDisallowed) {
+			log.Printf("[direct] ticket key refresh after signature failure failed: %v", err)
+		}
+	}()
+}
+
+func (r *directTicketKeyRefresher) run(ctx context.Context) {
+	if r == nil || r.pinned {
+		return
+	}
+	ticker := time.NewTicker(directTicketKeyRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.refresh(ctx); err != nil && !errors.Is(err, errTicketKeyURLDisallowed) {
+				log.Printf("[direct] periodic ticket key refresh failed: %v", err)
+			}
+		}
+	}
 }
 
 func runDirectMode(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, store *store, frameAddr string) error {
@@ -44,25 +202,32 @@ func runDirectMode(registry *machineRegistry, sessions *sessionRegistry, certifi
 	if err != nil {
 		return err
 	}
+	keyRefresher := newDirectTicketKeyRefresher(verifier)
+	go keyRefresher.run(ctx)
 	// TODO(phase 2b): forward login and clipboard audit events to the central relay.
 	statusPath := strings.TrimSpace(os.Getenv("FLUX_DIRECT_STATUS_FILE"))
 	if statusPath == "" {
 		statusPath = "/run/flux/direct.json"
 	}
+	certificates.setOnHashesChanged(func() {
+		if err := writeDirectStatus(statusPath, certificates.certificateHashes()); err != nil {
+			log.Printf("[direct] update endpoint status: %v", err)
+		}
+	})
 	if err := writeDirectStatus(statusPath, certificates.certificateHashes()); err != nil {
 		return fmt.Errorf("write direct endpoint status: %w", err)
 	}
-	go refreshDirectStatus(ctx, statusPath, certificates)
 	go certificates.runRotation(ctx)
 	server := newWebTransportServer(registry, sessions, certificates, nil, store, &directWebTransportMode{
-		machineID: machineID,
-		verifier:  verifier,
+		machineID:  machineID,
+		verifier:   verifier,
+		refreshKey: func() { keyRefresher.requestAfterVerificationFailure(ctx) },
 	})
 	done, err := startWebTransport(server)
 	if err != nil {
 		return err
 	}
-	log.Printf("[direct] serving machine %s on WebTransport UDP :%d", machineID, webTransportPort)
+	log.Printf("[direct] serving machine %s on WebTransport UDP %s", machineID, webTransportListenAddr())
 	return <-done
 }
 
@@ -212,28 +377,6 @@ func writeDirectStatus(path string, hashes []string) error {
 		return err
 	}
 	return os.Rename(tempPath, path)
-}
-
-func refreshDirectStatus(ctx context.Context, path string, certificates *relayCertificateManager) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	var previous string
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			hashes := certificates.certificateHashes()
-			data, _ := json.Marshal(directStatus{CertHashes: hashes})
-			if string(data) != previous {
-				if err := writeDirectStatus(path, hashes); err != nil {
-					log.Printf("[direct] update endpoint status: %v", err)
-				} else {
-					previous = string(data)
-				}
-			}
-		}
-	}
 }
 
 func startWebTransport(server *webtransport.Server) (<-chan error, error) {

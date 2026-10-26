@@ -127,6 +127,24 @@ func (s *Session) auditClipboard(store *store, direction, mime string, data []by
 	}
 }
 
+func machinePolicyForClipboardMode(mode string) machinePolicy {
+	policy := defaultMachinePolicy()
+	policy.Mode = ticketClipboardPolicy(mode)
+	return policy
+}
+
+func (s *Session) sessionClipboardPolicy(store *store) machinePolicy {
+	if s != nil && s.clipboardPolicyOverride != nil {
+		return *s.clipboardPolicyOverride
+	}
+	if s != nil && store != nil {
+		if machine := s.getMachine(); machine != nil {
+			return store.getPolicy(machine.id)
+		}
+	}
+	return defaultMachinePolicy()
+}
+
 // handleClipboard processes a viewer `{"type":"clipboard"}` control message:
 // validate, enforce per-machine policy, audit, forward cmdClipboard upstream, and
 // always answer with `clipboard-status`.
@@ -135,10 +153,7 @@ func (s *Session) handleClipboard(raw json.RawMessage, store *store) error {
 	if machine == nil {
 		return errors.New("no active machine session")
 	}
-	policy := defaultMachinePolicy()
-	if store != nil {
-		policy = store.getPolicy(machine.id)
-	}
+	policy := s.sessionClipboardPolicy(store)
 	status := func(result string) error {
 		return s.writeControl(clipStatusMessage(clipDirClientToHost, result, policy.Mode))
 	}
@@ -214,32 +229,46 @@ func (u *machineUpstream) handleClipboardFrame(data []byte) {
 		return
 	}
 	payload := []byte(msg.Data)
-	result := clipResultOK
-	switch {
-	case int64(len(payload)) > policy.MaxBytes:
-		result = clipResultTooLarge
-	case !policy.allows(clipDirHostToClient):
-		result = clipResultBlocked
-	}
-	if result != clipResultOK {
+	viewers := u.deps.sessions.sessionsFor(u.id)
+	if len(viewers) == 0 {
+		result := clipResultOK
+		switch {
+		case int64(len(payload)) > policy.MaxBytes:
+			result = clipResultTooLarge
+		case !policy.allows(clipDirHostToClient):
+			result = clipResultBlocked
+		}
 		record(clipDirHostToClient, result, msg.Mime, payload, nil)
 		return
 	}
 
-	viewers := u.deps.sessions.sessionsFor(u.id)
 	control := clipboardPayloadMessage(msg)
-	delivered := make([]auditEvent, 0, len(viewers))
 	for _, viewer := range viewers {
-		if err := viewer.sess.writeControl(control); err != nil {
-			log.Printf("[clipboard] forward to session %s failed: %v", viewer.info.ID, err)
-			continue
+		sessionPolicy := viewer.sess.sessionClipboardPolicy(store)
+		result := clipResultOK
+		switch {
+		case int64(len(payload)) > sessionPolicy.MaxBytes:
+			result = clipResultTooLarge
+		case !sessionPolicy.allows(clipDirHostToClient):
+			result = clipResultBlocked
 		}
-		delivered = append(delivered, auditEvent{
-			SessionID: viewer.info.ID,
-			UserSub:   viewer.info.UserSub,
-			UserName:  viewer.info.User,
-			ClientIP:  viewer.info.ClientIP,
-		})
+		if result == clipResultOK {
+			if err := viewer.sess.writeControl(control); err != nil {
+				log.Printf("[clipboard] forward to session %s failed: %v", viewer.info.ID, err)
+				continue
+			}
+		}
+		u.metrics.owner.clipboardEvents.WithLabelValues(u.id, clipDirHostToClient, result).Inc()
+		if store != nil {
+			ev := auditEvent{
+				MachineID: u.id, MachineName: machineName, OSUser: osUser,
+				SessionID: viewer.info.ID, UserSub: viewer.info.UserSub,
+				UserName: viewer.info.User, ClientIP: viewer.info.ClientIP,
+				Direction: clipDirHostToClient, Mime: msg.Mime, Data: payload, Result: result,
+			}
+			if err := store.insertAudit(ev, sessionPolicy.CaptureContent); err != nil {
+				log.Printf("[clipboard] audit insert failed machine=%s: %v", u.id, err)
+			}
+		}
 	}
-	record(clipDirHostToClient, clipResultOK, msg.Mime, payload, delivered)
 }

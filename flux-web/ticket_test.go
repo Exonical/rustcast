@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/mldsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,7 +45,7 @@ func signedTicketForPayload(t *testing.T, signer *ticketSigner, payload directTi
 func TestTicketSignerRoundTripAndRejectsInvalidTickets(t *testing.T) {
 	signer := ticketTestSigner(t, 1)
 	user := &identity{Sub: "sub-1", Username: "viewer", Email: "viewer@example.test", Name: "Viewer", Admin: true}
-	validTicket, err := signer.sign(user, "machine-1")
+	validTicket, err := signer.sign(user, "machine-1", clipModeBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +60,8 @@ func TestTicketSignerRoundTripAndRejectsInvalidTickets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("verify valid ticket: %v", err)
 	}
-	if got.Sub != user.Sub || got.Username != user.Username || got.Email != user.Email || got.Name != user.Name || got.Admin != user.Admin {
+	if got.Sub != user.Sub || got.Username != user.Username || got.Email != user.Email || got.Name != user.Name ||
+		got.Admin != user.Admin || got.ClipboardPolicy != clipModeBoth {
 		t.Fatalf("verified identity = %+v, want %+v", got, user)
 	}
 
@@ -139,6 +142,28 @@ func TestTicketSignerRoundTripAndRejectsInvalidTickets(t *testing.T) {
 	}
 }
 
+func TestTicketWithoutClipboardPolicyFailsClosed(t *testing.T) {
+	signer := ticketTestSigner(t, 14)
+	verifier, err := newTicketVerifier(signer.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket := signedTicketForPayload(t, signer, directTicketPayload{
+		Version:   1,
+		MachineID: "machine-1",
+		Sub:       "subject",
+		Path:      "direct",
+		Expires:   time.Now().Add(time.Minute).Unix(),
+	})
+	user, err := verifier.verify(ticket, "machine-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.ClipboardPolicy != clipModeOff {
+		t.Fatalf("missing clipboard policy = %q, want %q", user.ClipboardPolicy, clipModeOff)
+	}
+}
+
 func TestTicketSignerSeedPersistence(t *testing.T) {
 	dataDir := t.TempDir()
 	first, err := loadTicketSigner(dataDir)
@@ -158,6 +183,119 @@ func TestTicketSignerSeedPersistence(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("seed permissions = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestTicketSignerConcurrentSeedCreation(t *testing.T) {
+	dataDir := t.TempDir()
+	const workers = 12
+	start := make(chan struct{})
+	results := make(chan struct {
+		publicKey []byte
+		err       error
+	}, workers)
+	for range workers {
+		go func() {
+			<-start
+			signer, err := loadTicketSigner(dataDir)
+			if err != nil {
+				results <- struct {
+					publicKey []byte
+					err       error
+				}{err: err}
+				return
+			}
+			results <- struct {
+				publicKey []byte
+				err       error
+			}{publicKey: signer.publicKey()}
+		}()
+	}
+	close(start)
+	var first []byte
+	for range workers {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if first == nil {
+			first = result.publicKey
+		} else if !bytes.Equal(first, result.publicKey) {
+			t.Fatal("concurrent ticket signers loaded different public keys")
+		}
+	}
+}
+
+func TestDirectTicketKeyRefreshSwapsKeyAndPreservesVerifierState(t *testing.T) {
+	oldSigner := ticketTestSigner(t, 10)
+	newSigner := ticketTestSigner(t, 11)
+	verifier, err := newTicketVerifier(oldSigner.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := &identity{Sub: "subject"}
+	oldTicket, err := oldSigner.sign(user, "machine-1", clipModeBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.verify(oldTicket, "machine-1"); err != nil {
+		t.Fatal(err)
+	}
+	newTicket, err := newSigner.sign(user, "machine-1", clipModeBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresher := &directTicketKeyRefresher{
+		verifier:  verifier,
+		cachePath: filepath.Join(t.TempDir(), "ticket-key.pub"),
+		fetch: func(context.Context) ([]byte, error) {
+			return newSigner.publicKey(), nil
+		},
+	}
+	if err := refresher.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh ticket key: %v", err)
+	}
+	if len(verifier.nonces) != 1 {
+		t.Fatalf("nonce cache size after key swap = %d, want 1", len(verifier.nonces))
+	}
+	if _, err := verifier.verify(newTicket, "machine-1"); err != nil {
+		t.Fatalf("ticket from new signer failed after key swap: %v", err)
+	}
+	if _, err := verifier.verify(oldTicket, "machine-1"); !errors.Is(err, errInvalidTicketSignature) {
+		t.Fatalf("ticket from old signer error = %v, want invalid signature", err)
+	}
+}
+
+func TestFailedDirectTicketKeyRefreshKeepsCurrentKey(t *testing.T) {
+	oldSigner := ticketTestSigner(t, 12)
+	newSigner := ticketTestSigner(t, 13)
+	verifier, err := newTicketVerifier(oldSigner.publicKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := &identity{Sub: "subject"}
+	oldTicket, err := oldSigner.sign(user, "machine-1", clipModeBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTicket, err := newSigner.sign(user, "machine-1", clipModeBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresher := &directTicketKeyRefresher{
+		verifier: verifier,
+		fetch: func(context.Context) ([]byte, error) {
+			return nil, errors.New("relay unavailable")
+		},
+	}
+	if err := refresher.refresh(context.Background()); err == nil {
+		t.Fatal("failed fetch returned nil")
+	}
+	if _, err := verifier.verify(oldTicket, "machine-1"); err != nil {
+		t.Fatalf("current key stopped verifying after failed refresh: %v", err)
+	}
+	if _, err := verifier.verify(newTicket, "machine-1"); !errors.Is(err, errInvalidTicketSignature) {
+		t.Fatalf("new key ticket error = %v, want invalid signature", err)
 	}
 }
 

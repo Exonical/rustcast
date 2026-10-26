@@ -1,0 +1,14 @@
+#!/bin/bash
+set -eu
+
+if [ -z "${FLUX_DIRECT_ADDRS:-}" ]; then
+  exit 0
+fi
+
+export FLUX_MODE=direct
+export FLUX_SERVER_ADDR="127.0.0.1:${FLUX_FRAME_PORT:-8556}"
+export FLUX_MACHINE_ID_FILE=/var/lib/flux/machine-id
+export FLUX_DIRECT_STATUS_FILE="${FLUX_DIRECT_STATUS_FILE:-/run/flux/direct.json}"
+export FLUX_DATA_DIR=/var/lib/flux-direct
+export FLUX_WT_ADDR="${FLUX_WT_ADDR:-:8445}"
+exec /usr/local/bin/flux-web

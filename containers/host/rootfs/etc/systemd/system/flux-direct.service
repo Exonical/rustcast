@@ -1,0 +1,17 @@
+[Unit]
+Description=Flux direct WebTransport endpoint
+After=flux-env.service flux-hostd.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/flux/env
+RuntimeDirectory=flux
+RuntimeDirectoryMode=0755
+StateDirectory=flux-direct
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/flux-direct
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

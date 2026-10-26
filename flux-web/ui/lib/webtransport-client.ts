@@ -217,22 +217,28 @@ export class WebTransportClient {
     private resolution?: { width: number; height: number },
   ) {}
 
-  private recentPath(machineId: string): string | undefined {
+  private directFailedAt(machineId: string): number | undefined {
     try {
-      const value = sessionStorage.getItem(`flux:last-path:${machineId}`);
+      const value = sessionStorage.getItem(`flux:direct-failed-at:${machineId}`);
       if (!value) return undefined;
-      const saved = JSON.parse(value) as { path?: unknown; at?: unknown };
-      if (typeof saved.path !== "string" || typeof saved.at !== "number" ||
-          !["direct", "relay"].includes(saved.path) || Date.now() - saved.at >= 5 * 60 * 1000) return undefined;
-      return saved.path;
+      const timestamp = Number(value);
+      return Number.isFinite(timestamp) ? timestamp : undefined;
     } catch {
       return undefined;
     }
   }
 
-  private rememberPath(machineId: string, path: Candidate["path"]): void {
+  private rememberDirectFailure(machineId: string): void {
     try {
-      sessionStorage.setItem(`flux:last-path:${machineId}`, JSON.stringify({ path, at: Date.now() }));
+      sessionStorage.setItem(`flux:direct-failed-at:${machineId}`, String(Date.now()));
+    } catch {
+      // Storage can be unavailable in private or restricted browsing contexts.
+    }
+  }
+
+  private clearDirectFailure(machineId: string): void {
+    try {
+      sessionStorage.removeItem(`flux:direct-failed-at:${machineId}`);
     } catch {
       // Storage can be unavailable in private or restricted browsing contexts.
     }
@@ -280,8 +286,7 @@ export class WebTransportClient {
       }
       if (!response.ok) throw new Error(`WebTransport discovery failed: ${response.status}`);
       const discovery = await response.json() as DiscoveryResponse;
-      const lastPath = this.recentPath(machineId);
-      const candidates = orderCandidates(discovery, lastPath);
+      const candidates = orderCandidates(discovery, this.directFailedAt(machineId));
       const { candidate, transport } = await connectFirst(candidates, (next) => {
         const url = candidateURL(next, discovery, {
         hostname: location.hostname,
@@ -295,14 +300,16 @@ export class WebTransportClient {
         }));
         const transport = new WebTransport(url, hashes.length ? { serverCertificateHashes: hashes } : undefined);
         return { transport: transport as CandidateTransport & WebTransport, ready: transport.ready };
+      }, { direct: 1500, relay: 10000 }, (failedCandidate) => {
+        if (failedCandidate.path === "direct") this.rememberDirectFailure(machineId);
       });
       this.transport = transport;
       this.setConnectionPath(candidate.path);
-      this.rememberPath(machineId, candidate.path);
       if (generation !== this.generation) {
         transport.close({ closeCode: 0, reason: "superseded" });
         return;
       }
+      if (candidate.path === "direct") this.clearDirectFailure(machineId);
       const control = await transport.createBidirectionalStream();
       this.controlWriter = control.writable.getWriter();
       if (this.resumeKeyframeRequestPending) {

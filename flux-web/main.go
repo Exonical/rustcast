@@ -24,8 +24,21 @@ const (
 	dscpAF41         = 34 << 2
 )
 
+func webTransportListenAddr() string {
+	listenAddr := strings.TrimSpace(os.Getenv("FLUX_WT_ADDR"))
+	if listenAddr == "" {
+		listenAddr = ":8443"
+	}
+	return listenAddr
+}
+
 func listenWebTransportUDP() (*net.UDPConn, error) {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: webTransportPort})
+	listenAddr := webTransportListenAddr()
+	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +48,7 @@ func listenWebTransportUDP() (*net.UDPConn, error) {
 	if err := ipv6.NewConn(conn).SetTrafficClass(dscpAF41); err != nil {
 		log.Printf("[webtransport] DSCP(IPv6) not set: %v", err)
 	}
-	log.Printf("[webtransport] HTTP/3 UDP listener on :%d (DSCP AF41)", webTransportPort)
+	log.Printf("[webtransport] HTTP/3 UDP listener on %s (DSCP AF41)", udpAddr)
 	return conn, nil
 }
 
@@ -182,7 +195,7 @@ func newWebHandler(
 		if signer != nil {
 			if machine, err := registry.get(machineID); err == nil {
 				for _, direct := range machine.DirectCandidates {
-					ticket, err := signer.sign(user, machineID)
+					ticket, err := signer.sign(user, machineID, machine.ClipboardPolicy)
 					if err != nil {
 						log.Printf("[ticket] sign direct candidate for %s: %v", machineID, err)
 						continue
