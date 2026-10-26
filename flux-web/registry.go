@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/quic-go/quic-go"
 )
 
 var errMachineInUse = &machineError{"machine already in use"}
@@ -138,6 +139,10 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		r.machines[input.ID] = m
 	}
 	dropHostLink := m.HostDialsOut && !input.HostDialsOut
+	var hostLink *quic.Conn
+	if dropHostLink && r.hostLinks != nil {
+		hostLink = r.hostLinks.peek(input.ID)
+	}
 	upstreamStatus := m.UpstreamStatus
 	if upstreamStatus == "" {
 		upstreamStatus = "idle"
@@ -162,7 +167,7 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 	}
 	r.mu.Unlock()
 	if dropHostLink && r.hostLinks != nil {
-		r.hostLinks.drop(input.ID)
+		r.hostLinks.dropIf(input.ID, hostLink)
 	}
 	return m
 }
@@ -176,11 +181,15 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 	}
 	expired := !m.static && time.Since(m.LastSeen) > machineExpiry
 	var stale *machineUpstream
+	var hostLink *quic.Conn
 	if expired {
 		m.Status = "offline"
 		stale = m.upstream
 		if stale != nil {
 			m.upstream = nil
+		}
+		if r.hostLinks != nil {
+			hostLink = r.hostLinks.peek(id)
 		}
 	}
 	if m.Status != "online" {
@@ -189,7 +198,7 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 			stale.stop()
 		}
 		if expired && r.hostLinks != nil {
-			r.hostLinks.drop(id)
+			r.hostLinks.dropIf(id, hostLink)
 		}
 		return nil, errMachineOffline
 	}
@@ -201,14 +210,16 @@ func (r *machineRegistry) list() []machineInfo {
 	r.mu.Lock()
 	result := make([]machineInfo, 0, len(r.machines))
 	var stale []*machineUpstream
-	var expiredIDs []string
+	expiredHostLinks := make(map[string]*quic.Conn)
 	for _, m := range r.machines {
 		if !m.static && time.Since(m.LastSeen) > machineExpiry {
-			expiredIDs = append(expiredIDs, m.ID)
 			m.Status = "offline"
 			if m.upstream != nil {
 				stale = append(stale, m.upstream)
 				m.upstream = nil
+			}
+			if r.hostLinks != nil {
+				expiredHostLinks[m.ID] = r.hostLinks.peek(m.ID)
 			}
 		}
 		info := m.machineInfo
@@ -237,8 +248,8 @@ func (r *machineRegistry) list() []machineInfo {
 		upstream.stop()
 	}
 	if r.hostLinks != nil {
-		for _, id := range expiredIDs {
-			r.hostLinks.drop(id)
+		for id, conn := range expiredHostLinks {
+			r.hostLinks.dropIf(id, conn)
 		}
 	}
 	return result
@@ -265,10 +276,14 @@ func (r *machineRegistry) deregister(id string) bool {
 		return false
 	}
 	upstream := m.upstream
+	var hostLink *quic.Conn
+	if r.hostLinks != nil {
+		hostLink = r.hostLinks.peek(id)
+	}
 	delete(r.machines, id)
 	r.mu.Unlock()
 	if r.hostLinks != nil {
-		r.hostLinks.drop(id)
+		r.hostLinks.dropIf(id, hostLink)
 	}
 	if upstream != nil {
 		upstream.stop()

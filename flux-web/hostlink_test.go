@@ -185,6 +185,36 @@ func TestHostLinkHubReplaceClosesOlderLink(t *testing.T) {
 	}
 }
 
+func TestHostLinkHubDropIfDoesNotDropReplacement(t *testing.T) {
+	registry := newMachineRegistry()
+	listener := newHostLinkTestListener(t)
+	oldClient, oldServer := dialHostLinkTestConn(t, listener)
+	newClient, newServer := dialHostLinkTestConn(t, listener)
+	defer oldClient.CloseWithError(0, "test done")
+	defer newClient.CloseWithError(0, "test done")
+	defer newServer.CloseWithError(0, "test done")
+
+	hub := registry.hostLinks
+	hub.park("machine-1", oldServer)
+	snapshot := hub.peek("machine-1")
+	if snapshot != oldServer {
+		t.Fatalf("peek = %p, want old link %p", snapshot, oldServer)
+	}
+	hub.park("machine-1", newServer)
+	waitForApplicationError(t, oldServer, 0)
+
+	hub.dropIf("machine-1", snapshot)
+	if conn := hub.peek("machine-1"); conn != newServer {
+		t.Fatalf("replacement link = %p, want %p", conn, newServer)
+	}
+	select {
+	case <-newServer.Context().Done():
+		t.Fatalf("replacement link was closed: %v", context.Cause(newServer.Context()))
+	default:
+	}
+	assertHostLinkGauge(t, registry, "1")
+}
+
 func TestHostLinkHubSkipsClosedLinkAndWaitsForNext(t *testing.T) {
 	listener := newHostLinkTestListener(t)
 	firstClient, firstServer := dialHostLinkTestConn(t, listener)

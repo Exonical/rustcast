@@ -63,15 +63,25 @@ func (h *hostLinkHub) park(id string, conn *quic.Conn) {
 	}()
 }
 
-func (h *hostLinkHub) drop(id string) {
+func (h *hostLinkHub) peek(id string) *quic.Conn {
 	h.mu.Lock()
-	conn := h.links[id]
-	if conn != nil {
+	defer h.mu.Unlock()
+	return h.links[id]
+}
+
+func (h *hostLinkHub) dropIf(id string, conn *quic.Conn) {
+	if conn == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.links[id] == conn {
 		delete(h.links, id)
 		if h.parked != nil {
 			h.parked.Dec()
 		}
 		h.signalLocked(id)
+	} else {
+		conn = nil
 	}
 	h.mu.Unlock()
 	if conn != nil {
