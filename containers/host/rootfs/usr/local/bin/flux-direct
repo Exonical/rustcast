@@ -10,5 +10,6 @@ export FLUX_SERVER_ADDR="127.0.0.1:${FLUX_FRAME_PORT:-8556}"
 export FLUX_MACHINE_ID_FILE=/var/lib/flux/machine-id
 export FLUX_DIRECT_STATUS_FILE="${FLUX_DIRECT_STATUS_FILE:-/run/flux/direct.json}"
 export FLUX_DATA_DIR=/var/lib/flux-direct
-export FLUX_WT_ADDR="${FLUX_WT_ADDR:-:8445}"
+export FLUX_METRICS_ADDR="${FLUX_DIRECT_METRICS_ADDR:-127.0.0.1:9103}"
+export FLUX_WT_ADDR="${FLUX_WT_ADDR:-:${FLUX_DIRECT_PORT:-8443}}"
 exec /usr/local/bin/flux-web

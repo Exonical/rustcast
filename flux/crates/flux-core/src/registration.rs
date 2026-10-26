@@ -147,6 +147,7 @@ pub fn start(
         direct_candidates: Vec::new(),
     };
     let direct_addrs = config.relay.direct_addrs.clone();
+    let direct_default_port = config.relay.direct_default_port;
     let direct_status_file = config.relay.direct_status_file.clone();
     let direct_status_warned = Arc::new(AtomicBool::new(false));
     let token = std::env::var("FLUX_RELAY_TOKEN")
@@ -175,8 +176,11 @@ pub fn start(
         loop {
             let mut current = registration.clone();
             if !direct_addrs.is_empty() {
-                current.direct_candidates = match build_direct_candidates(&direct_addrs, direct_status_file.as_deref())
-                {
+                current.direct_candidates = match build_direct_candidates(
+                    &direct_addrs,
+                    direct_status_file.as_deref(),
+                    direct_default_port,
+                ) {
                     Ok(candidates) => candidates,
                     Err(error) => {
                         if !direct_status_warned.swap(true, Ordering::Relaxed) {
@@ -236,7 +240,11 @@ pub fn start(
     Some(RegistrationHandle { stop: stop_tx })
 }
 
-fn build_direct_candidates(addrs: &[String], status_file: Option<&Path>) -> Result<Vec<DirectCandidate>, String> {
+fn build_direct_candidates(
+    addrs: &[String],
+    status_file: Option<&Path>,
+    default_port: u16,
+) -> Result<Vec<DirectCandidate>, String> {
     if addrs.is_empty() {
         return Ok(Vec::new());
     }
@@ -248,7 +256,7 @@ fn build_direct_candidates(addrs: &[String], status_file: Option<&Path>) -> Resu
     let cert_hashes = status.cert_hashes;
     Ok(addrs
         .iter()
-        .filter_map(|addr| normalize_direct_addr(addr))
+        .filter_map(|addr| normalize_direct_addr(addr, default_port))
         .map(|addr| DirectCandidate {
             url: format!("https://{addr}/wt"),
             cert_hashes: cert_hashes.clone(),
@@ -256,20 +264,21 @@ fn build_direct_candidates(addrs: &[String], status_file: Option<&Path>) -> Resu
         .collect())
 }
 
-fn normalize_direct_addr(addr: &str) -> Option<String> {
+fn normalize_direct_addr(addr: &str, default_port: u16) -> Option<String> {
     let addr = addr.trim();
     if addr.is_empty() {
         return None;
     }
+    let default_port = if default_port == 0 { 8443 } else { default_port };
     if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
-        return Some(format!("[{ip}]:8443"));
+        return Some(format!("[{ip}]:{default_port}"));
     }
     if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
-        return Some(format!("{ip}:8443"));
+        return Some(format!("{ip}:{default_port}"));
     }
     if addr.starts_with('[') {
         if addr.ends_with(']') {
-            return Some(format!("{addr}:8443"));
+            return Some(format!("{addr}:{default_port}"));
         }
         if addr
             .rsplit_once("]:")
@@ -280,7 +289,7 @@ fn normalize_direct_addr(addr: &str) -> Option<String> {
         return None;
     }
     if addr.matches(':').count() == 0 {
-        return Some(format!("{addr}:8443"));
+        return Some(format!("{addr}:{default_port}"));
     }
     if addr.parse::<std::net::SocketAddr>().is_ok() {
         return Some(addr.to_string());
@@ -312,6 +321,7 @@ pub fn load_or_create_id(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{build_direct_candidates, Registration};
+    use crate::config::{RelayConfig, DEFAULT_DIRECT_PORT};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_dir() -> std::path::PathBuf {
@@ -322,27 +332,34 @@ mod tests {
     }
 
     #[test]
+    fn direct_default_port_defaults_to_8443() {
+        assert_eq!(RelayConfig::default().direct_default_port, DEFAULT_DIRECT_PORT);
+    }
+
+    #[test]
     fn direct_candidates_read_status_and_normalize_addresses() {
         let dir = test_dir();
         let status_file = dir.join("direct.json");
         std::fs::write(&status_file, r#"{"cert_hashes":["abc","def"]}"#).unwrap();
         let addrs = vec![
             "host.example.test".to_string(),
-            "192.0.2.10:9443".to_string(),
+            "192.0.2.10:9555".to_string(),
             "2001:db8::1".to_string(),
-            "[2001:db8::2]:9443".to_string(),
+            "[2001:db8::2]".to_string(),
+            "[2001:db8::3]:9444".to_string(),
         ];
-        let candidates = build_direct_candidates(&addrs, Some(&status_file)).unwrap();
+        let candidates = build_direct_candidates(&addrs, Some(&status_file), 9443).unwrap();
         assert_eq!(
             candidates
                 .iter()
                 .map(|candidate| candidate.url.as_str())
                 .collect::<Vec<_>>(),
             [
-                "https://host.example.test:8443/wt",
-                "https://192.0.2.10:9443/wt",
-                "https://[2001:db8::1]:8443/wt",
+                "https://host.example.test:9443/wt",
+                "https://192.0.2.10:9555/wt",
+                "https://[2001:db8::1]:9443/wt",
                 "https://[2001:db8::2]:9443/wt",
+                "https://[2001:db8::3]:9444/wt",
             ]
         );
         assert!(candidates
@@ -355,7 +372,9 @@ mod tests {
     fn missing_direct_status_omits_candidates_from_registration() {
         let dir = test_dir();
         let missing = dir.join("missing.json");
-        assert!(build_direct_candidates(&["host.example.test".into()], Some(missing.as_path())).is_err());
+        assert!(
+            build_direct_candidates(&["host.example.test".into()], Some(missing.as_path()), 8443).is_err()
+        );
         let registration = Registration::default();
         let value = serde_json::to_value(registration).unwrap();
         assert!(value.get("direct_candidates").is_none());

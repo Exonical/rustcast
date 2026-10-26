@@ -63,8 +63,8 @@ spec:
           value: "127.0.0.1"
         - name: FLUX_RELAY_TOKEN
           value: "%%FLUX_RELAY_TOKEN%%"
-        - name: FLUX_WT_ADDR
-          value: ":8445"
+        - name: FLUX_DIRECT_PORT
+          value: "8445"
         - name: FLUX_DIRECT_STATUS_FILE
           value: "/run/flux/direct.json"
         - name: FLUX_DEVUSER_PASSWORD

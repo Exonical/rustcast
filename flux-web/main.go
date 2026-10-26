@@ -32,6 +32,14 @@ func webTransportListenAddr() string {
 	return listenAddr
 }
 
+func webTransportDiscoveryPort() int {
+	addr, err := net.ResolveUDPAddr("udp", webTransportListenAddr())
+	if err != nil || addr.Port == 0 {
+		return webTransportPort
+	}
+	return addr.Port
+}
+
 func listenWebTransportUDP() (*net.UDPConn, error) {
 	listenAddr := webTransportListenAddr()
 	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
@@ -191,11 +199,16 @@ func newWebHandler(
 		if machineID == "" {
 			machineID = "default"
 		}
+		clipboardMode := defaultMachinePolicy().Mode
+		if clipboardStore != nil {
+			clipboardMode = clipboardStore.getPolicy(machineID).Mode
+		}
+		relayPort := webTransportDiscoveryPort()
 		candidates := make([]gin.H, 0)
 		if signer != nil {
 			if machine, err := registry.get(machineID); err == nil {
 				for _, direct := range machine.DirectCandidates {
-					ticket, err := signer.sign(user, machineID, machine.ClipboardPolicy)
+					ticket, err := signer.sign(user, machineID, clipboardMode)
 					if err != nil {
 						log.Printf("[ticket] sign direct candidate for %s: %v", machineID, err)
 						continue
@@ -208,12 +221,12 @@ func newWebHandler(
 		}
 		relayTicket := authService.issueTicket(user)
 		candidates = append(candidates, gin.H{
-			"path": "relay", "host": publicHost, "port": webTransportPort,
+			"path": "relay", "host": publicHost, "port": relayPort,
 			"certHashes": certificates.certificateHashes(), "ticket": relayTicket,
 		})
 		c.JSON(http.StatusOK, gin.H{
 			"host":       publicHost,
-			"port":       webTransportPort,
+			"port":       relayPort,
 			"certHashes": certificates.certificateHashes(),
 			"ticket":     relayTicket,
 			"candidates": candidates,

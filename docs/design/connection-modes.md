@@ -68,7 +68,7 @@ Run the existing relay binary on each host in a single-machine mode (`FLUX_MODE=
 
 Why reuse the Go relay instead of WebTransport in Rust: the rate control, login, and clipboard logic would otherwise exist in two languages. The extra process costs only a loopback hop (well under 1 ms). A native Rust endpoint remains a later option if a single host binary becomes a requirement.
 
-Packaging: the Linux host image builds `flux-web` without the UI and enables `flux-direct.service` after `flux-hostd`. Its wrapper exits successfully when `FLUX_DIRECT_ADDRS` is unset; otherwise it runs the endpoint with a separate `/var/lib/flux-direct` data directory and loopback upstream to hostd. The pod shares a network namespace with the relay, so the direct listener uses `FLUX_WT_ADDR=:8445` to avoid relay UDP :8443. The listener remains configurable and defaults to :8443 outside this pod setup.
+Packaging: the Linux host image builds `flux-web` without the UI and enables `flux-direct.service` after `flux-hostd`. Its wrapper exits successfully when `FLUX_DIRECT_ADDRS` is unset; otherwise it runs the endpoint with a separate `/var/lib/flux-direct` data directory and loopback upstream to hostd. The pod shares a network namespace with the relay, so it sets `FLUX_DIRECT_PORT=8445` to avoid relay UDP :8443; the wrapper uses that port for its default `FLUX_WT_ADDR`. The listener remains configurable and defaults to :8443 outside this pod setup.
 
 ### 3. Signed tickets
 

@@ -12,7 +12,7 @@ mod proto;
 mod rate;
 mod session;
 
-use flux_core::config::FluxConfig;
+use flux_core::config::{FluxConfig, DEFAULT_DIRECT_PORT};
 use flux_core::platform::PlatformInfo;
 use flux_core::registration::{self, RuntimeStatus};
 use osuser::OsUser;
@@ -125,6 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_default();
+    config.relay.direct_default_port = env("FLUX_DIRECT_PORT")
+        .and_then(|port| port.parse().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_DIRECT_PORT);
     config.relay.direct_status_file = Some(
         env("FLUX_DIRECT_STATUS_FILE")
             .map(PathBuf::from)

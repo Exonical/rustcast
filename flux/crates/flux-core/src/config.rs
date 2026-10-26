@@ -72,7 +72,7 @@ impl Default for FluxConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
     /// Base URL of the Flux web relay, for example http://relay:8080.
     #[serde(default)]
@@ -96,9 +96,33 @@ pub struct RelayConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_addrs: Vec<String>,
 
+    /// Port to append to direct addresses that do not specify one.
+    #[serde(default = "default_direct_port")]
+    pub direct_default_port: u16,
+
     /// File containing the direct endpoint's current certificate hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_status_file: Option<PathBuf>,
+}
+
+pub const DEFAULT_DIRECT_PORT: u16 = 8443;
+
+fn default_direct_port() -> u16 {
+    DEFAULT_DIRECT_PORT
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            advertise_host: None,
+            token: None,
+            host_dials_out: false,
+            direct_addrs: Vec::new(),
+            direct_default_port: DEFAULT_DIRECT_PORT,
+            direct_status_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
