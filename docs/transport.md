@@ -20,6 +20,14 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 | Prometheus scrape → standalone host agent | HTTP | TCP | `127.0.0.1:9102` by default | Loopback | Host metrics; not published by the pod. |
 | Prometheus scrape → direct endpoint | HTTP | TCP | `127.0.0.1:9103` by default (`FLUX_DIRECT_METRICS_ADDR`) | Loopback | Direct endpoint metrics; not published by the pod. |
 
+## Cryptographic defaults
+
+| TLS leg | Key-exchange preference | Provider and compatibility |
+| --- | --- | --- |
+| Host ↔ relay QUIC | `MLKEM1024` → `SECP256R1MLKEM768` → `X25519MLKEM768` → `SECP384R1` → `SECP256R1` → `X25519` | Rustls `aws-lc-rs`, without its `fips` feature; X25519 remains available as a classical fallback. |
+| Browser ↔ relay/direct WebTransport | `MLKEM1024` → `SecP384r1MLKEM1024` → `SecP256r1MLKEM768` → `X25519MLKEM768` → P-384 → P-256 → X25519 | Go `crypto/tls`; the server selects the first mutually supported group. |
+| Direct-session tickets | ML-DSA-87 | Signed by the central relay and verified by the direct endpoint. |
+
 The pod publishes `8080/TCP`, `8443/TCP+UDP`, `8445/UDP`, `9000/TCP`, and `9101/TCP`. Its containers share a network namespace: hostd's `8556` listener and the agent's `8557` listener are pod-internal. In the pod, the relay defaults to `127.0.0.1:8556`; the host advertises its frame endpoint using `FLUX_ADVERTISE_HOST`. Host dial-out is opt-in and the pod remains in relay-dial mode.
 
 For the OS-login deployment, `flux-hostd` owns the relay-facing frame endpoint on `8556`; the per-user `flux-server` agent binds only to loopback on `8557`, with `frame_quic=false`. Without hostd, standalone `flux-server` can serve TCP and optional QUIC on the same frame port, controlled by `server.frame_quic`.

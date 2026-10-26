@@ -60,10 +60,9 @@ byteorder = "1.5.0"
 ash = "0.38.0"
 
 # Crypto
-ring = "0.17.14"
-aes-gcm = "0.11"
-rcgen = "0.14"
-rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+aws-lc-rs = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 rustls-native-certs = "0.8"
 x509-parser = "0.18"
@@ -72,7 +71,7 @@ x509-parser = "0.18"
 time = { version = "0.3.55", features = ["formatting"] }
 
 # Networking
-quinn = "0.11.12"
+quinn = { version = "0.11.12", default-features = false, features = ["bloom", "log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 
 # Windows platform
