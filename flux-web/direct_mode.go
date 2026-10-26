@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,18 @@ func loadDirectTicketVerifier(ctx context.Context) (*ticketVerifier, error) {
 		return newTicketVerifier(key)
 	}
 	if encoded := strings.TrimSpace(os.Getenv("FLUX_TICKET_PUBLIC_KEY")); encoded != "" {
+		relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("FLUX_RELAY_URL")), "/")
+		if relayURL != "" && !ticketKeyURLAllowed(relayURL) {
+			log.Printf("[direct] refusing ticket-key fetch from disallowed FLUX_RELAY_URL")
+		}
 		return decode(encoded)
+	}
+	relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("FLUX_RELAY_URL")), "/")
+	relayURLAllowed := ticketKeyURLAllowed(relayURL)
+	unsafeURLLogged := false
+	if relayURL != "" && !relayURLAllowed {
+		log.Printf("[direct] refusing ticket-key fetch from disallowed FLUX_RELAY_URL")
+		unsafeURLLogged = true
 	}
 	cachePath := filepath.Join(storeDirFromEnv(), "ticket-key.pub")
 	var cached string
@@ -99,9 +111,8 @@ func loadDirectTicketVerifier(ctx context.Context) (*ticketVerifier, error) {
 	}
 	backoff := time.Second
 	for {
-		relayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("FLUX_RELAY_URL")), "/")
 		token := strings.TrimSpace(os.Getenv("FLUX_RELAY_TOKEN"))
-		if relayURL != "" && token != "" {
+		if relayURLAllowed && token != "" {
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, relayURL+"/api/relay/ticket-key", nil)
 			if err == nil {
 				request.Header.Set("Authorization", "Bearer "+token)
@@ -130,8 +141,11 @@ func loadDirectTicketVerifier(ctx context.Context) (*ticketVerifier, error) {
 				}
 			}
 			log.Printf("[direct] ticket key fetch failed: %v", err)
-		} else {
+		} else if relayURL == "" || relayURLAllowed {
 			log.Printf("[direct] FLUX_RELAY_URL and FLUX_RELAY_TOKEN are required to fetch the ticket key")
+		} else if !unsafeURLLogged {
+			log.Printf("[direct] refusing ticket-key fetch from disallowed FLUX_RELAY_URL")
+			unsafeURLLogged = true
 		}
 		if cached != "" {
 			return decode(cached)
@@ -144,6 +158,26 @@ func loadDirectTicketVerifier(ctx context.Context) (*ticketVerifier, error) {
 		case <-timer.C:
 		}
 		backoff = min(backoff*2, 30*time.Second)
+	}
+}
+
+func ticketKeyURLAllowed(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return true
+	case "http":
+		host := parsed.Hostname()
+		if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	default:
+		return false
 	}
 }
 

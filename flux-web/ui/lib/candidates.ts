@@ -47,6 +47,7 @@ export async function connectFirst<T extends CandidateTransport>(
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       opened = open(candidate);
+      opened.ready.catch(() => {});
       await Promise.race([
         opened.ready,
         new Promise<never>((_, reject) => {

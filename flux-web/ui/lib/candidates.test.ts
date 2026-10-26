@@ -30,6 +30,30 @@ test("a timed-out direct candidate is closed before relay is used", async () => 
   assert.equal(directClosed, true);
 });
 
+test("a late timeout rejection does not become unhandled", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const result = await connectFirst(
+      [direct, relay],
+      (candidate) => candidate.path === "direct"
+        ? {
+            transport: { close: () => {} },
+            ready: new Promise<void>((_, reject) => setTimeout(() => reject(new Error("late rejection")), 25)),
+          }
+        : { transport: { close: () => {} }, ready: Promise.resolve() },
+      { direct: 5, relay: 50 },
+    );
+    assert.equal(result.candidate.path, "relay");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
 test("a rejected direct candidate falls back to relay", async () => {
   const result = await connectFirst(
     [direct, relay],

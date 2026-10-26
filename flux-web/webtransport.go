@@ -77,11 +77,7 @@ type directWebTransportMode struct {
 	verifier  *ticketVerifier
 }
 
-func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, auth *authService, store *store, directModes ...*directWebTransportMode) *webtransport.Server {
-	var direct *directWebTransportMode
-	if len(directModes) > 0 {
-		direct = directModes[0]
-	}
+func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry, certificates *relayCertificateManager, auth *authService, store *store, direct *directWebTransportMode) *webtransport.Server {
 	mux := http.NewServeMux()
 	server := &webtransport.Server{
 		H3: &http3.Server{
@@ -105,7 +101,7 @@ func newWebTransportServer(registry *machineRegistry, sessions *sessionRegistry,
 	return server
 }
 
-func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry, auth *authService, store *store, directModes ...*directWebTransportMode) {
+func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtransport.Server, registry *machineRegistry, sessions *sessionRegistry, auth *authService, store *store, direct *directWebTransportMode) {
 	// WebTransport doesn't carry the session cookie; redeem a one-time
 	// ticket issued by /api/webtransport when auth is enabled.
 	machineID := r.URL.Query().Get("machine")
@@ -113,11 +109,10 @@ func handleWebTransport(w http.ResponseWriter, r *http.Request, server *webtrans
 		machineID = "default"
 	}
 	var user *identity
-	direct := len(directModes) > 0 && directModes[0] != nil
-	if direct {
+	if direct != nil {
 		machineID = "default"
 		var err error
-		user, err = directModes[0].verifier.verify(r.URL.Query().Get("ticket"), directModes[0].machineID)
+		user, err = direct.verifier.verify(r.URL.Query().Get("ticket"), direct.machineID)
 		if err != nil {
 			registry.metrics.reject(registry.metricMachineID(machineID), "unauthenticated")
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)

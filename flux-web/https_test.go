@@ -24,7 +24,7 @@ func TestWebHTTPSApiUsesTrustedRelayCertificate(t *testing.T) {
 		t.Fatal("relay certificate is missing")
 	}
 
-	handler := newWebHandler(newMachineRegistry(), newSessionRegistry(), certificates, "localhost", disabledAuth(t), nil)
+	handler := newWebHandler(newMachineRegistry(), newSessionRegistry(), certificates, "localhost", disabledAuth(t), nil, nil)
 	server := httptest.NewUnstartedServer(withAltSvc(handler))
 	server.TLS = webHTTPSTLSConfig(certificates)
 	server.TLS.Certificates = []tls.Certificate{*certificate}

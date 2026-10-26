@@ -133,7 +133,7 @@ func TestLoopbackWebTransportVideoAndKeyframeRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -376,7 +376,7 @@ func TestLoopbackWebTransportAudioStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -490,7 +490,7 @@ func TestLoopbackWebTransportClientCloseRemovesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newWebTransportServer(registry, sessions, certificates, nil, nil)
+	server := newWebTransportServer(registry, sessions, certificates, nil, nil, nil)
 	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

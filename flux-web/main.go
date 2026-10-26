@@ -107,7 +107,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load direct ticket signer: %v", err)
 	}
-	wtServer := newWebTransportServer(registry, sessions, certificates, authService, clipboardStore)
+	wtServer := newWebTransportServer(registry, sessions, certificates, authService, clipboardStore, nil)
 	_, err = startWebTransport(wtServer)
 	if err != nil {
 		log.Fatalf("listen for WebTransport: %v", err)
@@ -150,12 +150,8 @@ func newWebHandler(
 	publicHost string,
 	authService *authService,
 	clipboardStore *store,
-	ticketSigners ...*ticketSigner,
+	signer *ticketSigner,
 ) *gin.Engine {
-	var signer *ticketSigner
-	if len(ticketSigners) > 0 {
-		signer = ticketSigners[0]
-	}
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	r.Use(cors.Default())
