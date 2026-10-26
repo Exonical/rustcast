@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/quic-go/quic-go"
 )
 
 var errMachineInUse = &machineError{"machine already in use"}
@@ -37,6 +38,7 @@ type machineInfo struct {
 	LoggedInUser    string    `json:"logged_in_user"`
 	LoginState      string    `json:"login_state"`
 	QuicCertSHA256  string    `json:"quic_cert_sha256,omitempty"`
+	HostDialsOut    bool      `json:"host_dials_out,omitempty"`
 	SupportsLogin   bool      `json:"supports_login"`
 	LastSeen        time.Time `json:"last_seen"`
 	Status          string    `json:"status"`
@@ -61,6 +63,7 @@ type machineRegistration struct {
 	LoginState     string `json:"login_state"`
 	LoggedInUser   string `json:"logged_in_user"`
 	QuicCertSHA256 string `json:"quic_cert_sha256"`
+	HostDialsOut   bool   `json:"host_dials_out"`
 }
 
 type machineRecord struct {
@@ -78,10 +81,11 @@ type relayDeps struct {
 }
 
 type machineRegistry struct {
-	mu       sync.Mutex
-	machines map[string]*machineRecord
-	metrics  *relayMetrics
-	deps     *relayDeps
+	mu        sync.Mutex
+	machines  map[string]*machineRecord
+	metrics   *relayMetrics
+	deps      *relayDeps
+	hostLinks *hostLinkHub
 }
 
 // attachDeps wires clipboard persistence/fan-out dependencies; called once
@@ -93,7 +97,12 @@ func (r *machineRegistry) attachDeps(d *relayDeps) {
 }
 
 func newMachineRegistry() *machineRegistry {
-	return &machineRegistry{machines: make(map[string]*machineRecord), metrics: newRelayMetrics()}
+	metrics := newRelayMetrics()
+	return &machineRegistry{
+		machines:  make(map[string]*machineRecord),
+		metrics:   metrics,
+		hostLinks: newHostLinkHub(metrics.hostLinks),
+	}
 }
 
 func (r *machineRegistry) metricMachineID(id string) string {
@@ -123,12 +132,16 @@ func (r *machineRegistry) seedStatic(id, name, endpoint string) {
 
 func (r *machineRegistry) upsert(input machineRegistration, static bool) *machineRecord {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := time.Now()
 	m := r.machines[input.ID]
 	if m == nil {
 		m = &machineRecord{}
 		r.machines[input.ID] = m
+	}
+	dropHostLink := m.HostDialsOut && !input.HostDialsOut
+	var removedHostLink *quic.Conn
+	if dropHostLink && r.hostLinks != nil {
+		removedHostLink = r.hostLinks.remove(input.ID)
 	}
 	upstreamStatus := m.UpstreamStatus
 	if upstreamStatus == "" {
@@ -143,6 +156,7 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		UpstreamStatus: upstreamStatus,
 		SupportsLogin:  input.SupportsLogin, LoginState: input.LoginState,
 		LoggedInUser: input.LoggedInUser, QuicCertSHA256: input.QuicCertSHA256,
+		HostDialsOut: input.HostDialsOut,
 	}
 	m.static = static
 	if m.upstream != nil {
@@ -150,6 +164,10 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 	}
 	if m.upstream != nil && input.TargetBitrate != 0 {
 		m.upstream.abr.setSenderTarget(input.TargetBitrate)
+	}
+	r.mu.Unlock()
+	if removedHostLink != nil {
+		_ = removedHostLink.CloseWithError(0, "machine removed")
 	}
 	return m
 }
@@ -161,16 +179,24 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 		r.mu.Unlock()
 		return nil, errMachineNotFound
 	}
+	expired := !m.static && time.Since(m.LastSeen) > machineExpiry
 	var stale *machineUpstream
-	if !m.static && time.Since(m.LastSeen) > machineExpiry {
+	var removedHostLink *quic.Conn
+	if expired {
 		m.Status = "offline"
 		stale = m.upstream
 		if stale != nil {
 			m.upstream = nil
 		}
+		if r.hostLinks != nil {
+			removedHostLink = r.hostLinks.remove(id)
+		}
 	}
 	if m.Status != "online" {
 		r.mu.Unlock()
+		if removedHostLink != nil {
+			_ = removedHostLink.CloseWithError(0, "machine removed")
+		}
 		if stale != nil {
 			stale.stop()
 		}
@@ -184,12 +210,18 @@ func (r *machineRegistry) list() []machineInfo {
 	r.mu.Lock()
 	result := make([]machineInfo, 0, len(r.machines))
 	var stale []*machineUpstream
+	var removedHostLinks []*quic.Conn
 	for _, m := range r.machines {
 		if !m.static && time.Since(m.LastSeen) > machineExpiry {
 			m.Status = "offline"
 			if m.upstream != nil {
 				stale = append(stale, m.upstream)
 				m.upstream = nil
+			}
+			if r.hostLinks != nil {
+				if conn := r.hostLinks.remove(m.ID); conn != nil {
+					removedHostLinks = append(removedHostLinks, conn)
+				}
 			}
 		}
 		info := m.machineInfo
@@ -217,6 +249,9 @@ func (r *machineRegistry) list() []machineInfo {
 	for _, upstream := range stale {
 		upstream.stop()
 	}
+	for _, conn := range removedHostLinks {
+		_ = conn.CloseWithError(0, "machine removed")
+	}
 	return result
 }
 
@@ -241,12 +276,34 @@ func (r *machineRegistry) deregister(id string) bool {
 		return false
 	}
 	upstream := m.upstream
+	var removedHostLink *quic.Conn
+	if r.hostLinks != nil {
+		removedHostLink = r.hostLinks.remove(id)
+	}
 	delete(r.machines, id)
 	r.mu.Unlock()
+	if removedHostLink != nil {
+		_ = removedHostLink.CloseWithError(0, "machine removed")
+	}
 	if upstream != nil {
 		upstream.stop()
 	} else {
 		r.metrics.deleteMachine(id)
+	}
+	return true
+}
+
+func (r *machineRegistry) parkHostLink(id string, conn *quic.Conn) bool {
+	r.mu.Lock()
+	m := r.machines[id]
+	if m == nil || m.static || !m.HostDialsOut || time.Since(m.LastSeen) > machineExpiry || r.hostLinks == nil {
+		r.mu.Unlock()
+		return false
+	}
+	replaced := r.hostLinks.park(id, conn)
+	r.mu.Unlock()
+	if replaced != nil {
+		_ = replaced.CloseWithError(0, "replaced")
 	}
 	return true
 }
@@ -268,6 +325,9 @@ func (r *machineRegistry) acquire(id string) (*machineUpstream, error) {
 		}, machineMetrics)
 		m.upstream.supportsLogin = m.SupportsLogin
 		m.upstream.quicCertSHA256 = m.QuicCertSHA256
+		if m.HostDialsOut {
+			m.upstream.hostLinks = r.hostLinks
+		}
 		if m.TargetBitrate != 0 {
 			m.upstream.abr.setSenderTarget(m.TargetBitrate)
 		}

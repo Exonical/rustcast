@@ -10,6 +10,7 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 | --- | --- | --- | --- | --- | --- |
 | Host registration → relay | HTTP(S) POST | TCP | `FLUX_RELAY_URL` (pod: `127.0.0.1:8080`) | Bearer `FLUX_RELAY_TOKEN` when configured | `POST /api/machines/register`, `/api/machines/:id/heartbeat`, and `/api/machines/:id/deregister`; host metadata, frame endpoint, login state, and QUIC certificate fingerprint. |
 | Relay ↔ `flux-hostd` | QUIC preferred; TCP fallback | UDP and TCP | `FLUX_FRAME_PORT`, default `8556` (same port number) | QUIC uses ALPN `flux-frames` and the registered certificate SHA-256 pin; relay hello token when configured; host OS login is PAM-authenticated. Plaintext TCP accepts loopback peers unless `FLUX_FRAME_ALLOW_PLAINTEXT=true`. | Binary commands toward the host; H.264, cursor, resolution status, Opus, clipboard, and login messages toward the relay. |
+| Host dial-out link → relay | QUIC | UDP | `FLUX_HOST_LINK_ADDR`, default `:8444` | TLS 1.3 with a CA-trusted relay certificate; link hello carries `FLUX_RELAY_TOKEN`, and the relay requires `host_dials_out=true` registration. | Host opens QUIC and sends a length-prefixed JSON link hello; the relay parks the authenticated connection and later opens the existing command stream. |
 | `flux-hostd` ↔ per-user `flux-server` | Framed byte stream | TCP | `127.0.0.1:8557` | Loopback-only agent; session is started after hostd's PAM login. | Hostd proxies agent frames and relay commands for the logged-in desktop. |
 | Browser ↔ relay UI/API and discovery | HTTP; optional HTTPS | TCP | `:8080`; HTTPS defaults to `:8443` when relay TLS certificates are configured (`FLUX_HTTPS_ADDR`) | Relay OIDC session cookie when OIDC is enabled | UI, REST API, and `GET /api/webtransport`; HTTPS responses advertise `Alt-Svc: h3=":8443"`. |
 | Browser ↔ relay media session | WebTransport over HTTP/3/QUIC | UDP | `:8443` | WebTransport TLS; browser pins discovered `certHashes` when the relay uses a self-signed certificate. With OIDC enabled, `/api/webtransport` issues a single-use, 60-second ticket for `/wt`. | One bidirectional JSON control stream and unidirectional video, cursor, resolution-status, and audio streams. DSCP is set to AF41. |
@@ -17,7 +18,7 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 | Prometheus scrape → relay | HTTP | TCP | `:9101` by default | Deployment/network policy | Relay metrics; pod publishes this port. |
 | Prometheus scrape → standalone host agent | HTTP | TCP | `127.0.0.1:9102` by default | Loopback | Host metrics; not published by the pod. |
 
-The pod publishes `8080/TCP`, `8443/TCP+UDP`, `9000/TCP`, and `9101/TCP`. Its containers share a network namespace: hostd's `8556` listener and the agent's `8557` listener are pod-internal. In the pod, the relay defaults to `127.0.0.1:8556`; the host advertises its frame endpoint using `FLUX_ADVERTISE_HOST`.
+The pod publishes `8080/TCP`, `8443/TCP+UDP`, `9000/TCP`, and `9101/TCP`. Its containers share a network namespace: hostd's `8556` listener and the agent's `8557` listener are pod-internal. In the pod, the relay defaults to `127.0.0.1:8556`; the host advertises its frame endpoint using `FLUX_ADVERTISE_HOST`. Host dial-out is opt-in and the pod remains in relay-dial mode.
 
 For the OS-login deployment, `flux-hostd` owns the relay-facing frame endpoint on `8556`; the per-user `flux-server` agent binds only to loopback on `8557`, with `frame_quic=false`. Without hostd, standalone `flux-server` can serve TCP and optional QUIC on the same frame port, controlled by `server.frame_quic`.
 
@@ -48,6 +49,25 @@ flowchart LR
 ```
 
 The relay initiates the host frame connection; arrows on that link show bidirectional application data. In QUIC mode hostd uses ALPN `flux-frames`, a persistent self-signed certificate at `/var/lib/flux/quic-cert.pem` (key at `/var/lib/flux/quic-key.pem`), a 15-second idle timeout, and a 3-second keepalive. The certificate SHA-256 is registered as `quic_cert_sha256` and pinned by the relay. In standalone server mode, stale P-frame streams can be reset so newer frames are not blocked behind them.
+
+## Host dial-out link
+
+```mermaid
+sequenceDiagram
+    participant H as flux-hostd
+    participant R as flux-web relay
+    H->>R: Open QUIC to FLUX_HOST_LINK_ADDR, UDP :8444
+    Note over H,R: TLS 1.3, ALPN flux-frames
+    H->>R: Open bidi link-hello stream
+    H->>R: [2-byte length][JSON machine_id, token]
+    R->>R: Constant-time token check and host_dials_out registration check
+    R-->>H: 0x00 acknowledgement, finish hello stream
+    Note over H,R: Relay parks the connection until an upstream is acquired.
+    R->>H: Open bidi command stream, send cmdHello + relay token
+    H-->>R: Each frame on its own unidirectional stream
+```
+
+Host dial-out verifies the relay certificate using the system CA store or `FLUX_RELAY_CA_FILE`. The relay's rotating self-signed WebTransport certificate is not trusted by the host; configure `FLUX_TLS_CERT` and `FLUX_TLS_KEY` with a certificate issued by a CA the host trusts (or provide that CA with `FLUX_RELAY_CA_FILE`).
 
 ## Viewer connection sequence
 

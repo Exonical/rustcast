@@ -155,7 +155,9 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
 
 ## Phased plan (one PR each)
 
-1. **Host dial-out** — outbound QUIC from `flux-hostd` to the relay, relay accepts host-initiated connections; keep relay-initiated dialing as an option. Unblocks relay mode for NAT'd hosts.
+1. **Host dial-out — implemented.** `flux-hostd` opens an authenticated outbound QUIC link; the relay parks it and reuses the existing frame/command streams. Relay-dial mode remains the default.
+   - Relay: `FLUX_HOST_LINK_ADDR` (default `:8444`, `off` disables); host: `FLUX_RELAY_QUIC_ADDR` and optional `FLUX_RELAY_CA_FILE`.
+   - The relay's rotating self-signed WebTransport certificate is not trusted by the host; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA trusted by the host, or supply the CA via `FLUX_RELAY_CA_FILE`.
 2. **Direct endpoint + signed tickets + discovery/fallback** — `FLUX_MODE=direct`, ML-DSA-87 tickets, FIPS-approved, PQ-preferred TLS groups on every leg, heartbeat-reported direct addresses and cert hash, candidate list, browser fallback, `path` metric label, per-machine path policy.
 3. **Standalone direct (optional)** — direct endpoint serves its own UI with local auth for isolated LANs.
 

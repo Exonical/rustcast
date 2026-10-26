@@ -88,6 +88,10 @@ pub struct RelayConfig {
     /// Overridden by the FLUX_RELAY_TOKEN environment variable.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Whether the host establishes an outbound QUIC link to the relay.
+    #[serde(default)]
+    pub host_dials_out: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -54,6 +54,8 @@ struct Registration {
     logged_in_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quic_cert_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    host_dials_out: bool,
 }
 
 pub fn start(
@@ -125,6 +127,7 @@ pub fn start(
         login_state: String::new(),
         logged_in_user: None,
         quic_cert_sha256: None,
+        host_dials_out: config.relay.host_dials_out,
     };
     let token = std::env::var("FLUX_RELAY_TOKEN")
         .ok()
@@ -201,7 +204,7 @@ pub fn start(
     Some(RegistrationHandle { stop: stop_tx })
 }
 
-fn load_or_create_id(path: &Path) -> std::io::Result<String> {
+pub fn load_or_create_id(path: &Path) -> std::io::Result<String> {
     if let Ok(id) = std::fs::read_to_string(path) {
         let id = id.trim();
         if !id.is_empty() {

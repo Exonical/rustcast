@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -66,6 +68,29 @@ func main() {
 	)
 	if err != nil {
 		log.Fatalf("load WebTransport TLS certificate: %v", err)
+	}
+	hostLinkAddr := strings.TrimSpace(os.Getenv("FLUX_HOST_LINK_ADDR"))
+	if hostLinkAddr == "" {
+		hostLinkAddr = ":8444"
+	}
+	if !strings.EqualFold(hostLinkAddr, "off") {
+		relayToken := os.Getenv("FLUX_RELAY_TOKEN")
+		if relayToken == "" {
+			log.Printf("[host-link] WARN: FLUX_RELAY_TOKEN unset; host-link listener disabled")
+		} else {
+			tlsConfig := certificates.tlsConfig().Clone()
+			tlsConfig.NextProtos = []string{"flux-frames"}
+			listener, err := quic.ListenAddr(hostLinkAddr, tlsConfig, &quic.Config{
+				MaxIdleTimeout:  15 * time.Second,
+				KeepAlivePeriod: 3 * time.Second,
+			})
+			if err != nil {
+				log.Printf("[host-link] listen on %s failed: %v", hostLinkAddr, err)
+			} else {
+				log.Printf("[host-link] listening on %s", hostLinkAddr)
+				go serveHostLinks(listener, registry, relayToken)
+			}
+		}
 	}
 	authService, err := newAuthService(context.Background(), authConfigFromEnv())
 	if err != nil {

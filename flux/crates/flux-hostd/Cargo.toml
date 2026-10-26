@@ -21,4 +21,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 pam-client = { version = "0.5", default-features = false }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
 nix = { version = "0.30", features = ["user", "process", "fs"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }
