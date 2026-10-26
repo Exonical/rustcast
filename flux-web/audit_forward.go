@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -146,7 +147,11 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 		}
 		machineName := registry.displayName(batch.MachineID)
 		captureContent := store != nil && store.getPolicy(batch.MachineID).CaptureContent
-		sink := storeAuditSink{store: store}
+		type stagedAuditRow struct {
+			login     *hostLogin
+			clipboard *auditEvent
+		}
+		rows := make([]stagedAuditRow, 0, len(batch.Events))
 		for _, event := range batch.Events {
 			if len(event.EventID) != 32 {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid audit event ID"})
@@ -158,14 +163,19 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 			}
 			switch event.Kind {
 			case "login":
-				sink.recordLogin(hostLogin{
+				row := hostLogin{
 					MachineID: batch.MachineID, MachineName: machineName,
 					EventID: event.EventID, Timestamp: event.Timestamp,
 					SessionID: event.SessionID, UserSub: event.UserSub, UserName: event.UserName,
 					ClientIP: event.ClientIP, OSUser: event.OSUser, Result: event.Result,
-				})
+				}
+				rows = append(rows, stagedAuditRow{login: &row})
 			case "clipboard":
-				if event.Size < 0 || event.SHA256 == "" {
+				if event.Size < 0 || len(event.SHA256) != sha256.Size*2 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid clipboard audit metadata"})
+					return
+				}
+				if digest, err := hex.DecodeString(event.SHA256); err != nil || len(digest) != sha256.Size {
 					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid clipboard audit metadata"})
 					return
 				}
@@ -185,17 +195,26 @@ func registerRelayAuditRoute(machineAPI *gin.RouterGroup, registry *machineRegis
 				if !captureContent {
 					data = nil
 				}
-				sink.recordClipboard(auditEvent{
+				row := auditEvent{
 					MachineID: batch.MachineID, MachineName: machineName,
 					EventID: event.EventID, Timestamp: event.Timestamp,
 					SessionID: event.SessionID, UserSub: event.UserSub, UserName: event.UserName,
 					ClientIP: event.ClientIP, OSUser: event.OSUser, Direction: event.Direction,
 					Mime: event.Mime, Result: event.Result, Data: data,
 					Size: event.Size, SHA256: event.SHA256,
-				}, captureContent)
+				}
+				rows = append(rows, stagedAuditRow{clipboard: &row})
 			default:
 				c.JSON(http.StatusBadRequest, gin.H{"error": "unknown audit event kind"})
 				return
+			}
+		}
+		sink := storeAuditSink{store: store}
+		for _, row := range rows {
+			if row.login != nil {
+				sink.recordLogin(*row.login)
+			} else if row.clipboard != nil {
+				sink.recordClipboard(*row.clipboard, captureContent)
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"accepted": len(batch.Events)})
@@ -381,9 +400,20 @@ func (f *auditForwarder) postBatch(ctx context.Context, events []forwardedAuditE
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.StatusCode == http.StatusBadRequest || response.StatusCode == http.StatusRequestEntityTooLarge {
+			return &auditForwardPermanentError{status: response.Status}
+		}
 		return fmt.Errorf("audit endpoint returned %s", response.Status)
 	}
 	return nil
+}
+
+type auditForwardPermanentError struct {
+	status string
+}
+
+func (e *auditForwardPermanentError) Error() string {
+	return fmt.Sprintf("audit endpoint permanently rejected batch: %s", e.status)
 }
 
 func (f *auditForwarder) run(ctx context.Context) {
@@ -399,6 +429,16 @@ func (f *auditForwarder) run(ctx context.Context) {
 			continue
 		}
 		if err := f.postBatch(ctx, batch); err != nil {
+			var permanent *auditForwardPermanentError
+			if errors.As(err, &permanent) {
+				f.completeBatch(len(batch))
+				if f.metrics != nil {
+					f.metrics.auditForwardDropped.Add(float64(len(batch)))
+				}
+				log.Printf("[audit] dropping permanently rejected batch events=%d status=%s", len(batch), permanent.status)
+				backoff = f.backoffStart
+				continue
+			}
 			f.retryBatch(batch)
 			timer := time.NewTimer(backoff)
 			select {

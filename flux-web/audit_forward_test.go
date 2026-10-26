@@ -82,7 +82,74 @@ func TestAuditForwarderDropsOldestAtCapacity(t *testing.T) {
 	}
 }
 
-func TestAuditForwarderRetriesFailedBatch(t *testing.T) {
+func TestAuditForwarderDropsPermanentBatchAndContinues(t *testing.T) {
+	metrics := newRelayMetrics()
+	var mu sync.Mutex
+	var batchSizes []int
+	var batchIDs [][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch forwardedAuditBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		ids := make([]string, len(batch.Events))
+		for i, event := range batch.Events {
+			ids[i] = event.EventID
+		}
+		mu.Lock()
+		batchSizes = append(batchSizes, len(batch.Events))
+		batchIDs = append(batchIDs, ids)
+		attempt := len(batchSizes)
+		mu.Unlock()
+		if attempt == 1 {
+			http.Error(w, "invalid batch", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	forwarder := newAuditForwarder("m", server.URL, "token", metrics)
+	forwarder.backoffStart = time.Minute
+	for i := 0; i < auditForwardBatchLimit+1; i++ {
+		forwarder.enqueue(forwardedAuditEvent{EventID: fmt.Sprintf("%032x", i+1), Kind: "login", Result: "ok"})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		forwarder.run(ctx)
+		close(done)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		twoBatchesSent := len(batchSizes) == 2
+		mu.Unlock()
+		forwarder.mu.Lock()
+		queueEmpty := len(forwarder.queue) == 0 && forwarder.inflightSize == 0
+		forwarder.mu.Unlock()
+		if twoBatchesSent && queueEmpty {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if len(batchSizes) != 2 || batchSizes[0] != auditForwardBatchLimit || batchSizes[1] != 1 {
+		t.Fatalf("batch sizes = %v, want [%d 1]", batchSizes, auditForwardBatchLimit)
+	}
+	if len(batchIDs[1]) != 1 || batchIDs[1][0] != fmt.Sprintf("%032x", auditForwardBatchLimit+1) {
+		t.Fatalf("batch after permanent rejection = %v, want the next event", batchIDs[1])
+	}
+	body := scrapeMetrics(metrics)
+	if !bytes.Contains([]byte(body), []byte("flux_relay_audit_forward_dropped_total{path=\"relay\"} 50")) ||
+		!bytes.Contains([]byte(body), []byte("flux_relay_audit_forward_queue{path=\"relay\"} 0")) {
+		t.Fatalf("permanent rejection drop/gauge metrics missing: %s", body)
+	}
+}
+
+func TestAuditForwarderRetriesNotFoundResponse(t *testing.T) {
 	var mu sync.Mutex
 	var attempts int
 	var eventIDs []string
@@ -97,7 +164,7 @@ func TestAuditForwarderRetriesFailedBatch(t *testing.T) {
 		current := attempts
 		mu.Unlock()
 		if current == 1 {
-			http.Error(w, "retry", http.StatusServiceUnavailable)
+			http.Error(w, "machine may register later", http.StatusNotFound)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -224,6 +291,52 @@ func TestRelayAuditEndpointAuthMachineDedupAndCapturePolicy(t *testing.T) {
 	}
 	if string(content) != "hello" {
 		t.Fatalf("captured content = %q, want hello", content)
+	}
+}
+
+func TestRelayAuditEndpointValidatesBatchBeforeInserting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	st := testStore(t)
+	registry := newMachineRegistry()
+	registry.seedStatic("machine-1", "Test Machine", "127.0.0.1:8556")
+	router := gin.New()
+	api := router.Group("/api", (&authService{cfg: authConfig{relayToken: "relay-token"}}).requireMachineToken())
+	registerRelayAuditRoute(api, registry, st)
+
+	invalidContent := "not-base64"
+	batch := forwardedAuditBatch{
+		MachineID: "machine-1",
+		Events: []forwardedAuditEvent{
+			{
+				EventID: "00000000000000000000000000000011", Kind: "login",
+				Timestamp: "2025-01-02T03:04:05Z", Result: "ok",
+			},
+			{
+				EventID: "00000000000000000000000000000012", Kind: "clipboard",
+				Timestamp: "2025-01-02T03:04:05Z", Size: 5,
+				SHA256: sha256Hex([]byte("hello")), Data: &invalidContent,
+				Direction: clipDirClientToHost, Result: clipResultOK,
+			},
+		},
+	}
+	body, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/relay/audit", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer relay-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid batch status = %d, want 400: %s", response.Code, response.Body)
+	}
+	var inserted int
+	if err := st.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM host_logins) + (SELECT COUNT(*) FROM clipboard_events)`).Scan(&inserted); err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 0 {
+		t.Fatalf("invalid batch inserted %d events, want none", inserted)
 	}
 }
 
