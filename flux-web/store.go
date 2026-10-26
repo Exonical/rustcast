@@ -324,11 +324,11 @@ func (s *store) migrate() error {
 		if _, err := s.db.Exec(`ALTER TABLE audit_forward_queue ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
-		if _, err := s.db.Exec(`UPDATE audit_forward_queue
-			SET created_at = CAST(strftime('%s','now') AS INTEGER)
-			WHERE created_at = 0`); err != nil {
-			return err
-		}
+	}
+	if _, err := s.db.Exec(`UPDATE audit_forward_queue
+		SET created_at = CAST(strftime('%s','now') AS INTEGER)
+		WHERE created_at = 0`); err != nil {
+		return err
 	}
 	has, err = s.hasColumn("clipboard_events", "os_user")
 	if err != nil {

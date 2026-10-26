@@ -42,6 +42,20 @@ func TestMigrateBackfillsLegacyAuditForwardQueueTimestamps(t *testing.T) {
 	if len(events) != 1 || events[0].EventID != "legacy-event" || dropped != 0 {
 		t.Fatalf("migrated queue = %+v, dropped=%d", events, dropped)
 	}
+	if _, err := st.db.Exec(`UPDATE audit_forward_queue SET created_at = 0 WHERE event_id = ?`,
+		"legacy-event"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	events, dropped, err = st.loadAuditForwardQueue(auditForwardQueueLimit, 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].EventID != "legacy-event" || dropped != 0 {
+		t.Fatalf("backfilled existing queue = %+v, dropped=%d", events, dropped)
+	}
 }
 
 func TestStoreDefaultPolicy(t *testing.T) {
