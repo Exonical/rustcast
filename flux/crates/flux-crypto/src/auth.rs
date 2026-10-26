@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use flux_core::error::{FluxError, Result};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -128,7 +128,7 @@ impl PinAuthenticator {
 
 /// Compute the SHA-256 fingerprint of a DER-encoded certificate.
 pub fn cert_fingerprint(cert_der: &[u8]) -> String {
-    use ring::digest;
+    use aws_lc_rs::digest;
     let hash = digest::digest(&digest::SHA256, cert_der);
     hash.as_ref()
         .iter()

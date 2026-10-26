@@ -19,7 +19,7 @@ RUN dnf -y install dnf-plugins-core epel-release \
 
 FROM repos AS builder
 RUN dnf -y --setopt=install_weak_deps=False install \
-      gcc gcc-c++ make clang clang-devel llvm-devel pkgconf-pkg-config curl \
+      gcc gcc-c++ make cmake clang clang-devel llvm-devel pkgconf-pkg-config curl \
       pipewire-devel ffmpeg-devel x264-devel opus-devel pam-devel \
  && dnf clean all
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH

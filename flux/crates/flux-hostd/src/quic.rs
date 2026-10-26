@@ -41,7 +41,8 @@ pub fn make_endpoint(
     let fingerprint = flux_crypto::auth::cert_fingerprint(chain[0].as_ref())
         .to_lowercase()
         .replace(':', "");
-    let mut tls = rustls::ServerConfig::builder()
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(flux_crypto::crypto_provider()))
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(chain, certs.rustls_private_key()?)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -185,7 +186,8 @@ fn make_client_config() -> Result<quinn::ClientConfig, LinkError> {
             roots.add(cert)?;
         }
     }
-    let mut tls = rustls::ClientConfig::builder()
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(flux_crypto::crypto_provider()))
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -309,11 +311,13 @@ mod dial_out_tests {
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
     fn test_endpoints() -> (quinn::Endpoint, quinn::Endpoint, SocketAddr) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        flux_crypto::install_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let mut tls = rustls::ServerConfig::builder()
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(flux_crypto::crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key)
             .unwrap();
@@ -329,7 +333,9 @@ mod dial_out_tests {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert_der).unwrap();
-        let mut client_tls = rustls::ClientConfig::builder()
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(flux_crypto::crypto_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
         client_tls.alpn_protocols = vec![ALPN.to_vec()];

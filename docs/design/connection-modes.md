@@ -136,7 +136,7 @@ Goal: **FIPS-compatible, not FIPS-validated.** By default every leg uses FIPS-ap
 | Use | Default (FIPS-approved) | Standard | Notes |
 | --- | --- | --- | --- |
 | Ticket signatures (relay → direct endpoint) | ML-DSA-87 | FIPS 204 | Go `crypto/mldsa`. Signature 4,627 B, public key 2,592 B; ticket ≈ 6.4 KB base64url. |
-| Host ↔ relay QUIC key exchange | `MLKEM1024`, `SECP256R1MLKEM768`, `X25519MLKEM768`, `SECP384R1`, `SECP256R1`, `X25519` | FIPS 203 for ML-KEM; SP 800-56A for P-256/P-384 | Rust `aws-lc-rs` provider order; Go `crypto/tls` uses its own supported ordering. |
+| Host ↔ relay QUIC key exchange | `MLKEM1024` (0x0202), `SECP256R1MLKEM768`, `X25519MLKEM768`, `SECP384R1`, `SECP256R1`, `X25519` | FIPS 203 (+ SP 800-56A for P-256/P-384) | rustls `aws-lc-rs` host preference, exactly in this order (`kx_group::*`); the classical X25519 fallback remains enabled. |
 | Browser ↔ relay / direct endpoint key exchange | Server preference: `MLKEM1024`, `SecP384r1MLKEM1024`, `SecP256r1MLKEM768`, `X25519MLKEM768`, `CurveP256`, `CurveP384` | FIPS 203; SP 800-56A | The browser gets the first group it supports. Firefox 154+ can do `MLKEM1024` when `security.tls.enable_mlkem1024` / enterprise policy `CNSA2KeyAgreementEnabled` is on (it's sent last and only after a HelloRetryRequest, so it costs one extra setup round trip). Current browsers otherwise use `X25519MLKEM768`, whose ML-KEM component is approved. X25519 alone is left out of the server preference. |
 | TLS certificates / handshake signatures | ECDSA P-256 (relay's rotating self-signed cert, as today) or P-384 | FIPS 186-5 | Browsers don't accept ML-DSA certificates yet. |
 | Symmetric / hashes | AES-128/256-GCM, SHA-256/384 | FIPS 197, SP 800-38D, FIPS 180-4 | Prefer AES-GCM over ChaCha20-Poly1305 where the stack allows ordering. |
@@ -146,7 +146,7 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
 ### Implementation consequences
 
 - **Go relay / direct endpoint:** set `tls.Config.CurvePreferences` to the orders above (quic-go uses `crypto/tls`, so this covers QUIC and WebTransport). Go 1.27 implements every group listed. Go doesn't let you order TLS 1.3 cipher suites, and it already picks AES-GCM on hardware with AES acceleration.
-- **Rust host:** switch rustls from the `ring` provider (no ML-KEM) to the `aws-lc-rs` provider, without the `fips` feature, with `MLKEM1024` first and AES-GCM suites ahead of ChaCha20. This affects `flux-hostd` (QUIC to the relay), `flux-server`, and registration (`reqwest`).
+- **Rust host — implemented:** `flux-crypto::crypto_provider()` shares rustls's `aws-lc-rs` provider (without the `fips` feature) across `flux-hostd`, `flux-server`, and registration (`reqwest`). Its host↔relay key-exchange order is `MLKEM1024`, `SECP256R1MLKEM768`, `X25519MLKEM768`, `SECP384R1`, `SECP256R1`, `X25519`; the provider retains its AES-GCM-first cipher-suite defaults.
 - **Not required:** FIPS-validated modules, `GODEBUG=fips140=on`, or rejecting browsers that lack a given group.
 
 ## Security considerations

@@ -29,7 +29,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev libgtk-3-dev libxdo-dev libva-dev \
+          sudo apt-get install -y cmake clang libclang-dev libgtk-3-dev libxdo-dev libva-dev \
             libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev \
             libpostproc-dev libswscale-dev libswresample-dev \
             libdrm-dev libpipewire-0.3-dev libspa-0.2-dev libpam0g-dev
@@ -57,7 +57,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm lld libclang-dev
+          sudo apt-get install -y cmake clang llvm lld libclang-dev
           cargo install cargo-xwin --locked
           rustup target add x86_64-pc-windows-msvc
           llvm_bindir="$(llvm-config --bindir 2>/dev/null || true)"

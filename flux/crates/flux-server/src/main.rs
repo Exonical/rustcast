@@ -52,9 +52,7 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // reqwest is built with `rustls-no-provider` so it can share the workspace's
-    // ring provider rather than selecting an additional TLS backend.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    flux_crypto::install_crypto_provider();
 
     // Initialize logging.
     tracing_subscriber::registry()

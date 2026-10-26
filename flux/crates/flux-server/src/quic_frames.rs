@@ -153,7 +153,8 @@ pub fn make_endpoint(
     let cert_chain = cert_manager.rustls_cert_chain()?;
     let key = cert_manager.rustls_private_key()?;
 
-    let mut tls = rustls::ServerConfig::builder()
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(flux_crypto::crypto_provider()))
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
