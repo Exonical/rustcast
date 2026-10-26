@@ -1,6 +1,6 @@
 # Design: Relay and Direct connection modes
 
-Status: **proposal** — nothing here is implemented yet. Current behaviour is documented in [../transport.md](../transport.md).
+Status: **phase 2a implemented**; phase 2b and standalone direct remain planned. Current behaviour is documented in [../transport.md](../transport.md).
 
 ## Goal
 
@@ -123,6 +123,7 @@ WebTransport requires a secure page context. In hybrid deployments:
 
 - The page is served by the central relay over normally trusted HTTPS.
 - The direct endpoint uses a short-lived self-signed ECDSA P-256 certificate (the same scheme the relay already uses: 13-day lifetime, 6-day rotation in `flux-web/certificate.go`). The host reports the current hash in its heartbeat, and the browser pins it via `serverCertificateHashes`. **Hosts need no publicly trusted certificate.**
+- The relay's rotating self-signed WebTransport certificate is not trusted by the host for host dial-out; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA the host trusts, or provide that CA through `FLUX_RELAY_CA_FILE`.
 
 For standalone direct mode (phase 3), the host serves the page itself, so it needs a browser-trusted certificate: mkcert for development, an internal CA, or ACME when the host has a DNS name.
 
@@ -158,13 +159,14 @@ The negotiated TLS group is logged per session and exposed as a label on a low-c
 1. **Host dial-out — implemented.** `flux-hostd` opens an authenticated outbound QUIC link; the relay parks it and reuses the existing frame/command streams. Relay-dial mode remains the default.
    - Relay: `FLUX_HOST_LINK_ADDR` (default `:8444`, `off` disables); host: `FLUX_RELAY_QUIC_ADDR` and optional `FLUX_RELAY_CA_FILE`.
    - The relay's rotating self-signed WebTransport certificate is not trusted by the host; configure `FLUX_TLS_CERT`/`FLUX_TLS_KEY` from a CA trusted by the host, or supply the CA via `FLUX_RELAY_CA_FILE`.
-2. **Direct endpoint + signed tickets + discovery/fallback** — `FLUX_MODE=direct`, ML-DSA-87 tickets, FIPS-approved, PQ-preferred TLS groups on every leg, heartbeat-reported direct addresses and cert hash, candidate list, browser fallback, `path` metric label, per-machine path policy.
+2a. **Direct endpoint + signed tickets + discovery/fallback — implemented in this PR.** Includes `FLUX_MODE=direct`, ML-DSA-87 tickets, PQ-preferred Go TLS groups, heartbeat-reported direct addresses and cert hashes, browser fallback, and active-path reporting.
+2b. **Remaining direct-mode work.** Add `aws-lc-rs`/ML-KEM on the Rust host, per-machine path policy, a `path` metric label, background direct retry, and audit forwarding to the central relay.
 3. **Standalone direct (optional)** — direct endpoint serves its own UI with local auth for isolated LANs.
 
 ## Open questions
 
 - Per-host credentials instead of the shared `FLUX_RELAY_TOKEN` for host dial-out (enrollment tokens, mTLS)?
-- Which addresses should a host advertise for direct mode — all interfaces, an admin-configured list, or only RFC 1918 + configured public address?
+- Direct addresses are admin-configured via `FLUX_DIRECT_ADDRS`.
 - Should standalone direct (phase 3) use OIDC, or only host PAM login?
 - Windows hosts: ship the direct endpoint as a separate service, or embed it in `flux-server`?
 - Which browsers besides Firefox 154+ offer ML-KEM-1024 (0x0202)? (Not yet checked for Chrome, Edge, or Safari.)

@@ -14,6 +14,7 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 | `flux-hostd` ↔ per-user `flux-server` | Framed byte stream | TCP | `127.0.0.1:8557` | Loopback-only agent; session is started after hostd's PAM login. | Hostd proxies agent frames and relay commands for the logged-in desktop. |
 | Browser ↔ relay UI/API and discovery | HTTP; optional HTTPS | TCP | `:8080`; HTTPS defaults to `:8443` when relay TLS certificates are configured (`FLUX_HTTPS_ADDR`) | Relay OIDC session cookie when OIDC is enabled | UI, REST API, and `GET /api/webtransport`; HTTPS responses advertise `Alt-Svc: h3=":8443"`. |
 | Browser ↔ relay media session | WebTransport over HTTP/3/QUIC | UDP | `:8443` | WebTransport TLS; browser pins discovered `certHashes` when the relay uses a self-signed certificate. With OIDC enabled, `/api/webtransport` issues a single-use, 60-second ticket for `/wt`. | One bidirectional JSON control stream and unidirectional video, cursor, resolution-status, and audio streams. DSCP is set to AF41. |
+| Browser ↔ host direct endpoint | WebTransport over HTTP/3/QUIC | UDP | `:8443` | Central-relay ML-DSA-87 signed ticket; browser pins the host certificate hash from discovery. | Direct media/control path; falls back to the relay candidate if connection setup fails. |
 | Browser/relay ↔ Authentik OIDC | HTTP | TCP | `:9000` in the pod | OIDC | Browser login redirects and relay OIDC requests. |
 | Prometheus scrape → relay | HTTP | TCP | `:9101` by default | Deployment/network policy | Relay metrics; pod publishes this port. |
 | Prometheus scrape → standalone host agent | HTTP | TCP | `127.0.0.1:9102` by default | Loopback | Host metrics; not published by the pod. |
@@ -21,6 +22,8 @@ Proposed Relay/Direct connection modes: [design/connection-modes.md](design/conn
 The pod publishes `8080/TCP`, `8443/TCP+UDP`, `9000/TCP`, and `9101/TCP`. Its containers share a network namespace: hostd's `8556` listener and the agent's `8557` listener are pod-internal. In the pod, the relay defaults to `127.0.0.1:8556`; the host advertises its frame endpoint using `FLUX_ADVERTISE_HOST`. Host dial-out is opt-in and the pod remains in relay-dial mode.
 
 For the OS-login deployment, `flux-hostd` owns the relay-facing frame endpoint on `8556`; the per-user `flux-server` agent binds only to loopback on `8557`, with `frame_quic=false`. Without hostd, standalone `flux-server` can serve TCP and optional QUIC on the same frame port, controlled by `server.frame_quic`.
+
+Direct-mode configuration: administrators set `FLUX_DIRECT_ADDRS` (comma-separated public host addresses) and `FLUX_DIRECT_STATUS_FILE` on hostd (default `/run/flux/direct.json`). The direct endpoint uses `FLUX_MODE=direct`, `FLUX_MACHINE_ID_FILE`, and either `FLUX_TICKET_PUBLIC_KEY` or `FLUX_RELAY_URL` plus `FLUX_RELAY_TOKEN` to obtain the relay key.
 
 The HTTPS UI/API listener and the WebTransport HTTP/3 listener are separate: the web handler runs on the TCP listeners, while the HTTP/3 mux handles `/wt` on UDP. HTTPS responses advertise `Alt-Svc: h3=":8443"`. When relay TLS files are not configured, WebTransport uses a rotating self-signed certificate and `/api/webtransport` returns its hash; with configured TLS files, the relay uses those for HTTPS and WebTransport and does not return certificate hashes.
 

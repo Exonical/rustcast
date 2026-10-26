@@ -227,7 +227,7 @@ func (m *relayMetrics) machine(id string) *machineMetrics {
 		metrics.idrGranted[reason] = m.idrRequests.WithLabelValues(id, string(reason), "granted")
 		metrics.idrSuppressed[reason] = m.idrRequests.WithLabelValues(id, string(reason), "suppressed")
 	}
-	for _, reason := range []string{"machine_in_use", "not_found", "offline", "bad_request", "no_control_stream"} {
+	for _, reason := range []string{"machine_in_use", "not_found", "offline", "bad_request", "no_control_stream", "unauthenticated"} {
 		metrics.rejections[reason] = m.sessionRejections.WithLabelValues(id, reason)
 	}
 	return metrics

@@ -114,10 +114,23 @@ func (m *relayCertificateManager) certificateHashes() []string {
 
 func (m *relayCertificateManager) tlsConfig() *tls.Config {
 	return &tls.Config{
-		MinVersion:     tls.VersionTLS13,
-		MaxVersion:     tls.VersionTLS13,
-		NextProtos:     []string{"h3"},
-		GetCertificate: m.getCertificate,
+		MinVersion:       tls.VersionTLS13,
+		MaxVersion:       tls.VersionTLS13,
+		NextProtos:       []string{"h3"},
+		CurvePreferences: pqCurvePreferences(),
+		GetCertificate:   m.getCertificate,
+	}
+}
+
+func pqCurvePreferences() []tls.CurveID {
+	return []tls.CurveID{
+		tls.MLKEM1024,
+		tls.SecP384r1MLKEM1024,
+		tls.SecP256r1MLKEM768,
+		tls.X25519MLKEM768,
+		tls.CurveP384,
+		tls.CurveP256,
+		tls.X25519,
 	}
 }
 

@@ -47,8 +47,7 @@ impl FluxConfig {
 
     /// Write configuration to a TOML file.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let contents =
-            toml::to_string_pretty(self).map_err(|e| FluxError::Config(format!("serialize error: {e}")))?;
+        let contents = toml::to_string_pretty(self).map_err(|e| FluxError::Config(format!("serialize error: {e}")))?;
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -92,6 +91,14 @@ pub struct RelayConfig {
     /// Whether the host establishes an outbound QUIC link to the relay.
     #[serde(default)]
     pub host_dials_out: bool,
+
+    /// Public addresses for a direct WebTransport endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addrs: Vec<String>,
+
+    /// File containing the direct endpoint's current certificate hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_status_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
