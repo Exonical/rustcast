@@ -173,7 +173,11 @@ func TestHostLinkHubReplaceClosesOlderLink(t *testing.T) {
 
 	hub := newHostLinkHub(nil)
 	hub.park("machine-1", oldServer)
-	hub.park("machine-1", newServer)
+	replaced := hub.park("machine-1", newServer)
+	if replaced != oldServer {
+		t.Fatalf("replaced link = %p, want %p", replaced, oldServer)
+	}
+	_ = replaced.CloseWithError(0, "replaced")
 	select {
 	case <-oldServer.Context().Done():
 	case <-time.After(5 * time.Second):
@@ -185,31 +189,59 @@ func TestHostLinkHubReplaceClosesOlderLink(t *testing.T) {
 	}
 }
 
-func TestHostLinkHubDropIfDoesNotDropReplacement(t *testing.T) {
+func TestMachineRegistryParkHostLinkRejectsAfterDeregister(t *testing.T) {
 	registry := newMachineRegistry()
-	listener := newHostLinkTestListener(t)
-	oldClient, oldServer := dialHostLinkTestConn(t, listener)
-	newClient, newServer := dialHostLinkTestConn(t, listener)
-	defer oldClient.CloseWithError(0, "test done")
-	defer newClient.CloseWithError(0, "test done")
-	defer newServer.CloseWithError(0, "test done")
-
-	hub := registry.hostLinks
-	hub.park("machine-1", oldServer)
-	snapshot := hub.peek("machine-1")
-	if snapshot != oldServer {
-		t.Fatalf("peek = %p, want old link %p", snapshot, oldServer)
+	registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+	machine, err := registry.get("machine-1")
+	if err != nil || !machine.HostDialsOut || machine.static {
+		t.Fatalf("machine validation = (%v, %v), want registered dial-out machine", machine, err)
 	}
-	hub.park("machine-1", newServer)
-	waitForApplicationError(t, oldServer, 0)
 
-	hub.dropIf("machine-1", snapshot)
-	if conn := hub.peek("machine-1"); conn != newServer {
-		t.Fatalf("replacement link = %p, want %p", conn, newServer)
+	listener := newHostLinkTestListener(t)
+	client, conn := dialHostLinkTestConn(t, listener)
+	defer client.CloseWithError(0, "test done")
+	defer conn.CloseWithError(0, "test done")
+
+	if !registry.deregister("machine-1") {
+		t.Fatal("machine was not deregistered")
+	}
+	if registry.parkHostLink("machine-1", conn) {
+		t.Fatal("parkHostLink accepted a deregistered machine")
+	}
+	registry.hostLinks.mu.Lock()
+	parked := registry.hostLinks.links["machine-1"]
+	registry.hostLinks.mu.Unlock()
+	if parked != nil {
+		t.Fatalf("deregistered machine has parked link %p", parked)
+	}
+	assertHostLinkGauge(t, registry, "0")
+}
+
+func TestMachineRegistryParkHostLinkAfterReregister(t *testing.T) {
+	registry := newMachineRegistry()
+	registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+	if !registry.deregister("machine-1") {
+		t.Fatal("machine was not deregistered")
+	}
+	registry.upsert(machineRegistration{ID: "machine-1", HostDialsOut: true}, false)
+
+	listener := newHostLinkTestListener(t)
+	client, conn := dialHostLinkTestConn(t, listener)
+	defer client.CloseWithError(0, "test done")
+	defer conn.CloseWithError(0, "test done")
+	if !registry.parkHostLink("machine-1", conn) {
+		t.Fatal("parkHostLink rejected a re-registered machine")
+	}
+
+	registry.hostLinks.mu.Lock()
+	parked := registry.hostLinks.links["machine-1"]
+	registry.hostLinks.mu.Unlock()
+	if parked != conn {
+		t.Fatalf("parked link = %p, want %p", parked, conn)
 	}
 	select {
-	case <-newServer.Context().Done():
-		t.Fatalf("replacement link was closed: %v", context.Cause(newServer.Context()))
+	case <-conn.Context().Done():
+		t.Fatalf("new link was closed: %v", context.Cause(conn.Context()))
 	default:
 	}
 	assertHostLinkGauge(t, registry, "1")

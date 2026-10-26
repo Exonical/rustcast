@@ -36,7 +36,7 @@ func newHostLinkHub(parked prometheus.Gauge) *hostLinkHub {
 	}
 }
 
-func (h *hostLinkHub) park(id string, conn *quic.Conn) {
+func (h *hostLinkHub) park(id string, conn *quic.Conn) (replaced *quic.Conn) {
 	h.mu.Lock()
 	old := h.links[id]
 	h.links[id] = conn
@@ -46,8 +46,8 @@ func (h *hostLinkHub) park(id string, conn *quic.Conn) {
 	h.signalLocked(id)
 	h.mu.Unlock()
 
-	if old != nil && old != conn {
-		_ = old.CloseWithError(0, "replaced")
+	if old != conn {
+		replaced = old
 	}
 	go func() {
 		<-conn.Context().Done()
@@ -61,32 +61,21 @@ func (h *hostLinkHub) park(id string, conn *quic.Conn) {
 		}
 		h.mu.Unlock()
 	}()
+	return replaced
 }
 
-func (h *hostLinkHub) peek(id string) *quic.Conn {
+func (h *hostLinkHub) remove(id string) *quic.Conn {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.links[id]
-}
-
-func (h *hostLinkHub) dropIf(id string, conn *quic.Conn) {
-	if conn == nil {
-		return
-	}
-	h.mu.Lock()
-	if h.links[id] == conn {
+	conn := h.links[id]
+	if conn != nil {
 		delete(h.links, id)
 		if h.parked != nil {
 			h.parked.Dec()
 		}
 		h.signalLocked(id)
-	} else {
-		conn = nil
 	}
 	h.mu.Unlock()
-	if conn != nil {
-		_ = conn.CloseWithError(0, "machine removed")
-	}
+	return conn
 }
 
 func (h *hostLinkHub) take(id string, stop <-chan struct{}) (*quic.Conn, bool) {
@@ -220,7 +209,9 @@ func handleHostLink(conn *quic.Conn, registry *machineRegistry, token string) {
 		reject(hostLinkUnauthorized, "hello acknowledgement failed")
 		return
 	}
-	registry.hostLinks.park(hello.MachineID, conn)
+	if !registry.parkHostLink(hello.MachineID, conn) {
+		reject(hostLinkUnknown, "machine removed")
+	}
 }
 
 func encodeHostLinkHello(machineID, token string) ([]byte, error) {

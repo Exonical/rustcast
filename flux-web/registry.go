@@ -139,9 +139,9 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		r.machines[input.ID] = m
 	}
 	dropHostLink := m.HostDialsOut && !input.HostDialsOut
-	var hostLink *quic.Conn
+	var removedHostLink *quic.Conn
 	if dropHostLink && r.hostLinks != nil {
-		hostLink = r.hostLinks.peek(input.ID)
+		removedHostLink = r.hostLinks.remove(input.ID)
 	}
 	upstreamStatus := m.UpstreamStatus
 	if upstreamStatus == "" {
@@ -166,8 +166,8 @@ func (r *machineRegistry) upsert(input machineRegistration, static bool) *machin
 		m.upstream.abr.setSenderTarget(input.TargetBitrate)
 	}
 	r.mu.Unlock()
-	if dropHostLink && r.hostLinks != nil {
-		r.hostLinks.dropIf(input.ID, hostLink)
+	if removedHostLink != nil {
+		_ = removedHostLink.CloseWithError(0, "machine removed")
 	}
 	return m
 }
@@ -181,7 +181,7 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 	}
 	expired := !m.static && time.Since(m.LastSeen) > machineExpiry
 	var stale *machineUpstream
-	var hostLink *quic.Conn
+	var removedHostLink *quic.Conn
 	if expired {
 		m.Status = "offline"
 		stale = m.upstream
@@ -189,16 +189,16 @@ func (r *machineRegistry) get(id string) (*machineRecord, error) {
 			m.upstream = nil
 		}
 		if r.hostLinks != nil {
-			hostLink = r.hostLinks.peek(id)
+			removedHostLink = r.hostLinks.remove(id)
 		}
 	}
 	if m.Status != "online" {
 		r.mu.Unlock()
+		if removedHostLink != nil {
+			_ = removedHostLink.CloseWithError(0, "machine removed")
+		}
 		if stale != nil {
 			stale.stop()
-		}
-		if expired && r.hostLinks != nil {
-			r.hostLinks.dropIf(id, hostLink)
 		}
 		return nil, errMachineOffline
 	}
@@ -210,7 +210,7 @@ func (r *machineRegistry) list() []machineInfo {
 	r.mu.Lock()
 	result := make([]machineInfo, 0, len(r.machines))
 	var stale []*machineUpstream
-	expiredHostLinks := make(map[string]*quic.Conn)
+	var removedHostLinks []*quic.Conn
 	for _, m := range r.machines {
 		if !m.static && time.Since(m.LastSeen) > machineExpiry {
 			m.Status = "offline"
@@ -219,7 +219,9 @@ func (r *machineRegistry) list() []machineInfo {
 				m.upstream = nil
 			}
 			if r.hostLinks != nil {
-				expiredHostLinks[m.ID] = r.hostLinks.peek(m.ID)
+				if conn := r.hostLinks.remove(m.ID); conn != nil {
+					removedHostLinks = append(removedHostLinks, conn)
+				}
 			}
 		}
 		info := m.machineInfo
@@ -247,10 +249,8 @@ func (r *machineRegistry) list() []machineInfo {
 	for _, upstream := range stale {
 		upstream.stop()
 	}
-	if r.hostLinks != nil {
-		for id, conn := range expiredHostLinks {
-			r.hostLinks.dropIf(id, conn)
-		}
+	for _, conn := range removedHostLinks {
+		_ = conn.CloseWithError(0, "machine removed")
 	}
 	return result
 }
@@ -276,19 +276,34 @@ func (r *machineRegistry) deregister(id string) bool {
 		return false
 	}
 	upstream := m.upstream
-	var hostLink *quic.Conn
+	var removedHostLink *quic.Conn
 	if r.hostLinks != nil {
-		hostLink = r.hostLinks.peek(id)
+		removedHostLink = r.hostLinks.remove(id)
 	}
 	delete(r.machines, id)
 	r.mu.Unlock()
-	if r.hostLinks != nil {
-		r.hostLinks.dropIf(id, hostLink)
+	if removedHostLink != nil {
+		_ = removedHostLink.CloseWithError(0, "machine removed")
 	}
 	if upstream != nil {
 		upstream.stop()
 	} else {
 		r.metrics.deleteMachine(id)
+	}
+	return true
+}
+
+func (r *machineRegistry) parkHostLink(id string, conn *quic.Conn) bool {
+	r.mu.Lock()
+	m := r.machines[id]
+	if m == nil || m.static || !m.HostDialsOut || time.Since(m.LastSeen) > machineExpiry || r.hostLinks == nil {
+		r.mu.Unlock()
+		return false
+	}
+	replaced := r.hostLinks.park(id, conn)
+	r.mu.Unlock()
+	if replaced != nil {
+		_ = replaced.CloseWithError(0, "replaced")
 	}
 	return true
 }
