@@ -2,6 +2,6 @@
 **/node_modules
 **/.next
 **/out
-flux-web
+flux-web/ui
 .git
 flux/flux_capture_test.h264
